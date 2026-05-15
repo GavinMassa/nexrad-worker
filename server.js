@@ -574,6 +574,91 @@ const server = http.createServer(async (req, res) => {
       return sendPng(res, png);
     }
 
+    // GET /image/:station/:product.png?time=...&elevation=0.5&size=2048
+    m = path.match(/^\/image\/([A-Z]{3,4})\/([A-Z0-9]+)\.png$/i);
+    if (m) {
+      const station = m[1].toUpperCase();
+      const product = m[2].toUpperCase();
+      const imgSize = Math.min(parseInt(url.searchParams.get('size') || '2048'), 4096);
+      let time = url.searchParams.get('time');
+      const elevation = parseFloat(url.searchParams.get('elevation') || '0.5');
+
+      if (!time || time === 'latest') {
+        const today = new Date().toISOString().slice(0, 10);
+        let scans = await listScans(station, today);
+        if (scans.length === 0) {
+          const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+          scans = await listScans(station, yesterday);
+        }
+        if (scans.length === 0) return sendJson(res, { error: 'No scans found' }, 404);
+        time = scans[scans.length - 1].time;
+      }
+
+      const vol = await fetchVolumeFile(station, time);
+      if (!vol) return sendJson(res, { error: 'No data' }, 404);
+
+      const parsed = parseLevel2(vol);
+      const sweeps = parsed.sweeps.filter(s => s.product === product);
+      if (sweeps.length === 0) return sendJson(res, { error: `No ${product} data` }, 404);
+
+      const sweep = sweeps.reduce((a, b) =>
+        Math.abs(a.elevation - elevation) <= Math.abs(b.elevation - elevation) ? a : b
+      );
+
+      const maxRange = sweep.firstGateRange + sweep.numGates * sweep.gateSizeMeters;
+      const rangeDeg = (maxRange / EARTH_R) / DEG2RAD;
+      const lonScale = rangeDeg / Math.cos(sweep.stationLat * DEG2RAD);
+
+      const minLat = sweep.stationLat - rangeDeg;
+      const maxLat = sweep.stationLat + rangeDeg;
+      const minLon = sweep.stationLon - lonScale;
+      const maxLon = sweep.stationLon + lonScale;
+
+      const rgba = new Uint8Array(imgSize * imgSize * 4);
+      const numRadials = sweep.radials.length;
+      if (numRadials > 0) {
+        const azimuths = sweep.radials.map(r => r.azimuth);
+        for (let py = 0; py < imgSize; py++) {
+          const lat = maxLat - (py / imgSize) * (maxLat - minLat);
+          for (let px = 0; px < imgSize; px++) {
+            const lon = minLon + (px / imgSize) * (maxLon - minLon);
+            const dist = haversine(sweep.stationLat, sweep.stationLon, lat, lon);
+            if (dist < sweep.firstGateRange || dist > maxRange) continue;
+            const az = bearing(sweep.stationLat, sweep.stationLon, lat, lon);
+            let lo = 0, hi = numRadials - 1;
+            while (lo < hi) { const mid = (lo + hi) >> 1; azimuths[mid] < az ? lo = mid + 1 : hi = mid; }
+            let best = lo;
+            let bestDiff = Math.min(Math.abs(azimuths[lo] - az), 360 - Math.abs(azimuths[lo] - az));
+            for (const idx of [lo - 1, lo + 1, 0, numRadials - 1]) {
+              if (idx >= 0 && idx < numRadials) {
+                const d = Math.min(Math.abs(azimuths[idx] - az), 360 - Math.abs(azimuths[idx] - az));
+                if (d < bestDiff) { bestDiff = d; best = idx; }
+              }
+            }
+            const radial = sweep.radials[best];
+            const gateIdx = Math.floor((dist - sweep.firstGateRange) / sweep.gateSizeMeters);
+            if (gateIdx < 0 || gateIdx >= radial.gates.length) continue;
+            const raw = radial.gates[gateIdx];
+            if (raw <= 1) continue;
+            const phys = (raw - sweep.offset) / sweep.scale;
+            const [r, g, b, a] = getColor(sweep.product, phys);
+            if (a === 0) continue;
+            const idx = (py * imgSize + px) * 4;
+            rgba[idx] = r; rgba[idx + 1] = g; rgba[idx + 2] = b; rgba[idx + 3] = a;
+          }
+        }
+      }
+
+      const png = encodePNG(imgSize, imgSize, rgba);
+      res.writeHead(200, {
+        'Content-Type': 'image/png',
+        'Cache-Control': 'public, max-age=120',
+        'Access-Control-Allow-Origin': '*',
+        'X-Radar-Bbox': `${minLat},${minLon},${maxLat},${maxLon}`,
+      });
+      return res.end(png);
+    }
+
     // GET /debug/parse/:station — test download + parse without tile rendering
     m = path.match(/^\/debug\/parse\/([A-Z]{3,4})$/i);
     if (m) {
