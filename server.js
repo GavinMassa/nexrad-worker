@@ -1,9 +1,13 @@
 const http = require('http');
 const zlib = require('zlib');
 const { URL } = require('url');
-const { execFileSync } = require('child_process');
+const seekBzip = require('seek-bzip');
 
 const PORT = process.env.PORT || 3000;
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+});
 
 // ============================================================
 // IN-MEMORY CACHE
@@ -30,177 +34,11 @@ function cacheSet(key, value, ttl) {
 }
 
 // ============================================================
-// BZIP2 DECODER (pure JS, no dependencies)
+// BZIP2 DECODER (seek-bzip npm package)
 // ============================================================
 
-class BitReader {
-  constructor(data) {
-    this.data = data;
-    this.bytePos = 0;
-    this.bitPos = 0;
-  }
-  read(n) {
-    let val = 0;
-    for (let i = 0; i < n; i++) {
-      if (this.bytePos >= this.data.length) return val;
-      val = (val << 1) | ((this.data[this.bytePos] >> (7 - this.bitPos)) & 1);
-      if (++this.bitPos === 8) { this.bitPos = 0; this.bytePos++; }
-    }
-    return val;
-  }
-}
-
 function bzip2Decode(input) {
-  const r = new BitReader(input);
-  if (r.read(8) !== 0x42 || r.read(8) !== 0x5A || r.read(8) !== 0x68) {
-    throw new Error('Not bzip2');
-  }
-  r.read(8);
-
-  const allOutput = [];
-
-  while (true) {
-    const hi = r.read(24), lo = r.read(24);
-    if (hi === 0x177245 && lo === 0x385090) break;
-    if (hi !== 0x314159 || lo !== 0x265359) throw new Error('Bad bzip2 block');
-
-    r.read(32);
-    if (r.read(1)) throw new Error('Randomized bzip2 not supported');
-    const origPtr = r.read(24);
-
-    const inUse16 = r.read(16);
-    const inUse = [];
-    for (let i = 0; i < 16; i++) {
-      if (inUse16 & (1 << (15 - i))) {
-        const sub = r.read(16);
-        for (let j = 0; j < 16; j++) {
-          if (sub & (1 << (15 - j))) inUse.push(i * 16 + j);
-        }
-      }
-    }
-    const nInUse = inUse.length;
-    if (nInUse === 0) continue;
-    const alphaSize = nInUse + 2;
-
-    const nGroups = r.read(3);
-    const nSelectors = r.read(15);
-    const selectorMtf = new Array(nSelectors);
-    for (let i = 0; i < nSelectors; i++) { let j = 0; while (r.read(1)) j++; selectorMtf[i] = j; }
-
-    const spos = Array.from({ length: nGroups }, (_, i) => i);
-    const selectors = new Array(nSelectors);
-    for (let i = 0; i < nSelectors; i++) {
-      let v = selectorMtf[i];
-      const val = spos[v];
-      while (v > 0) { spos[v] = spos[v - 1]; v--; }
-      spos[0] = val;
-      selectors[i] = val;
-    }
-
-    const groupLens = [];
-    for (let g = 0; g < nGroups; g++) {
-      const lens = new Array(alphaSize);
-      let cur = r.read(5);
-      for (let i = 0; i < alphaSize; i++) {
-        while (r.read(1)) { cur += r.read(1) ? -1 : 1; }
-        lens[i] = cur;
-      }
-      groupLens.push(lens);
-    }
-
-    const tables = groupLens.map(lens => {
-      let minLen = 23, maxLen = 0;
-      for (const l of lens) { if (l < minLen) minLen = l; if (l > maxLen) maxLen = l; }
-      const base = new Int32Array(maxLen + 2);
-      const limit = new Int32Array(maxLen + 2);
-      const perm = new Int32Array(alphaSize);
-      let pp = 0;
-      for (let i = minLen; i <= maxLen; i++) {
-        for (let j = 0; j < alphaSize; j++) { if (lens[j] === i) perm[pp++] = j; }
-      }
-      let vec = 0; pp = 0;
-      for (let i = minLen; i <= maxLen; i++) {
-        base[i] = vec - pp;
-        let cnt = 0;
-        for (let j = 0; j < alphaSize; j++) { if (lens[j] === i) cnt++; }
-        pp += cnt;
-        limit[i] = vec + cnt - 1;
-        vec = (vec + cnt) << 1;
-      }
-      return { minLen, maxLen, base, limit, perm };
-    });
-
-    function decSym(table) {
-      let code = 0;
-      for (let n = table.minLen; n <= table.maxLen; n++) {
-        code = (code << 1) | r.read(1);
-        if (code <= table.limit[n]) return table.perm[code - table.base[n]];
-      }
-      return 0;
-    }
-
-    const mtf = Array.from({ length: nInUse }, (_, i) => i);
-    const freq = new Int32Array(256);
-    const blockData = [];
-    let sIdx = 0, gCnt = 0, table = tables[selectors[0]];
-
-    while (true) {
-      if (gCnt === 50) { gCnt = 0; table = tables[selectors[++sIdx]]; }
-      let sym = decSym(table); gCnt++;
-
-      if (sym === nInUse + 1) break;
-
-      if (sym < 2) {
-        let run = 0, pow = 1;
-        while (sym < 2) {
-          run += (sym + 1) * pow;
-          pow <<= 1;
-          if (gCnt === 50) { gCnt = 0; table = tables[selectors[++sIdx]]; }
-          sym = decSym(table); gCnt++;
-        }
-        const ch = inUse[mtf[0]];
-        for (let i = 0; i < run; i++) { blockData.push(ch); freq[ch]++; }
-        if (sym === nInUse + 1) break;
-      }
-
-      const mtfIdx = sym - 1;
-      const ch = mtf[mtfIdx];
-      for (let i = mtfIdx; i > 0; i--) mtf[i] = mtf[i - 1];
-      mtf[0] = ch;
-      const byte = inUse[ch];
-      blockData.push(byte);
-      freq[byte]++;
-    }
-
-    const n = blockData.length;
-    if (n === 0) continue;
-
-    const cftab = new Int32Array(257);
-    for (let i = 0; i < 256; i++) cftab[i + 1] = freq[i];
-    for (let i = 1; i < 257; i++) cftab[i] += cftab[i - 1];
-
-    const T = new Int32Array(n);
-    for (let i = 0; i < n; i++) T[cftab[blockData[i]]++] = i;
-
-    let idx = T[origPtr];
-    const decoded = new Uint8Array(n);
-    for (let i = 0; i < n; i++) { decoded[i] = blockData[idx]; idx = T[idx]; }
-
-    let i = 0;
-    while (i < n) {
-      const ch = decoded[i];
-      if (i + 3 < n && decoded[i+1] === ch && decoded[i+2] === ch && decoded[i+3] === ch) {
-        const extra = i + 4 < n ? decoded[i + 4] : 0;
-        for (let j = 0; j < 4 + extra; j++) allOutput.push(ch);
-        i += 5;
-      } else {
-        allOutput.push(ch);
-        i++;
-      }
-    }
-  }
-
-  return new Uint8Array(allOutput);
+  return new Uint8Array(seekBzip.decode(Buffer.from(input)));
 }
 
 // ============================================================
@@ -217,39 +55,6 @@ function zlibDecompress(data) {
 
 function deflateCompress(data) {
   return new Uint8Array(zlib.deflateSync(Buffer.from(data)));
-}
-
-// ============================================================
-// NATIVE BZIP2 DECODE (shells out to bunzip2, falls back to pure JS)
-// ============================================================
-
-let hasNativeBzip2 = null;
-
-function nativeBzip2Decode(input) {
-  if (hasNativeBzip2 === null) {
-    try {
-      execFileSync('which', ['bunzip2'], { stdio: 'ignore' });
-      hasNativeBzip2 = true;
-      console.log('Using native bunzip2');
-    } catch {
-      hasNativeBzip2 = false;
-      console.log('bunzip2 not found, using pure JS bzip2 decoder');
-    }
-  }
-
-  if (hasNativeBzip2) {
-    try {
-      const result = execFileSync('bunzip2', ['-c'], {
-        input: Buffer.from(input),
-        maxBuffer: 50 * 1024 * 1024,
-        stdio: ['pipe', 'pipe', 'ignore'],
-      });
-      return new Uint8Array(result);
-    } catch {
-      return bzip2Decode(input);
-    }
-  }
-  return bzip2Decode(input);
 }
 
 // ============================================================
@@ -297,7 +102,7 @@ const STATION_COORDS = {
 
 function decompressBlock(compressed) {
   if (compressed[0] === 0x42 && compressed[1] === 0x5A) {
-    return nativeBzip2Decode(compressed);
+    return bzip2Decode(compressed);
   }
   return zlibDecompress(compressed);
 }
