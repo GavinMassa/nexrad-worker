@@ -6,7 +6,10 @@ const seekBzip = require('seek-bzip');
 const PORT = process.env.PORT || 3000;
 
 process.on('uncaughtException', (err) => {
-  console.error('Uncaught exception:', err);
+  console.error('Uncaught exception:', err.stack || err);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err.stack || err);
 });
 
 // ============================================================
@@ -571,6 +574,38 @@ const server = http.createServer(async (req, res) => {
       return sendPng(res, png);
     }
 
+    // GET /debug/parse/:station — test download + parse without tile rendering
+    m = path.match(/^\/debug\/parse\/([A-Z]{3,4})$/i);
+    if (m) {
+      const station = m[1].toUpperCase();
+      const t0 = Date.now();
+      try {
+        const today = new Date().toISOString().slice(0, 10);
+        let scans = await listScans(station, today);
+        const listMs = Date.now() - t0;
+        if (scans.length === 0) return sendJson(res, { error: 'No scans', listMs });
+
+        const latest = scans[scans.length - 1];
+        const t1 = Date.now();
+        const vol = await fetchVolumeFile(station, latest.time);
+        const fetchMs = Date.now() - t1;
+        if (!vol) return sendJson(res, { error: 'Fetch failed', listMs, fetchMs });
+
+        const t2 = Date.now();
+        const parsed = parseLevel2(vol);
+        const parseMs = Date.now() - t2;
+
+        const products = [...new Set(parsed.sweeps.map(s => s.product))];
+        return sendJson(res, {
+          station, scan: latest.time, fileSize: vol.byteLength,
+          sweeps: parsed.sweeps.length, products,
+          timing: { listMs, fetchMs, parseMs, totalMs: Date.now() - t0 }
+        });
+      } catch (err) {
+        return sendJson(res, { error: err.message, stack: err.stack, timing: { totalMs: Date.now() - t0 } }, 500);
+      }
+    }
+
     // GET / — health check
     if (path === '/' || path === '/health') {
       return sendJson(res, { status: 'ok', endpoints: [
@@ -578,13 +613,14 @@ const server = http.createServer(async (req, res) => {
         'GET /api/scans/{STATION}/latest',
         'GET /api/products/{STATION}?time=YYYYMMDD_HHMMSS',
         'GET /tiles/{STATION}/{PRODUCT}/{z}/{x}/{y}.png?time=YYYYMMDD_HHMMSS&elevation=0.5',
+        'GET /debug/parse/{STATION}',
       ]});
     }
 
     sendJson(res, { error: 'Not found' }, 404);
   } catch (err) {
-    console.error('Request error:', err);
-    sendJson(res, { error: 'Internal server error' }, 500);
+    console.error('Request error:', err.stack || err);
+    sendJson(res, { error: err.message, stack: err.stack }, 500);
   }
 });
 
