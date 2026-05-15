@@ -1,6 +1,7 @@
 const http = require('http');
 const zlib = require('zlib');
 const { URL } = require('url');
+const { execFileSync } = require('child_process');
 
 const PORT = process.env.PORT || 3000;
 
@@ -219,6 +220,39 @@ function deflateCompress(data) {
 }
 
 // ============================================================
+// NATIVE BZIP2 DECODE (shells out to bunzip2, falls back to pure JS)
+// ============================================================
+
+let hasNativeBzip2 = null;
+
+function nativeBzip2Decode(input) {
+  if (hasNativeBzip2 === null) {
+    try {
+      execFileSync('which', ['bunzip2'], { stdio: 'ignore' });
+      hasNativeBzip2 = true;
+      console.log('Using native bunzip2');
+    } catch {
+      hasNativeBzip2 = false;
+      console.log('bunzip2 not found, using pure JS bzip2 decoder');
+    }
+  }
+
+  if (hasNativeBzip2) {
+    try {
+      const result = execFileSync('bunzip2', ['-c'], {
+        input: Buffer.from(input),
+        maxBuffer: 50 * 1024 * 1024,
+        stdio: ['pipe', 'pipe', 'ignore'],
+      });
+      return new Uint8Array(result);
+    } catch {
+      return bzip2Decode(input);
+    }
+  }
+  return bzip2Decode(input);
+}
+
+// ============================================================
 // NEXRAD LEVEL II PARSER
 // ============================================================
 
@@ -263,7 +297,7 @@ const STATION_COORDS = {
 
 function decompressBlock(compressed) {
   if (compressed[0] === 0x42 && compressed[1] === 0x5A) {
-    return bzip2Decode(compressed);
+    return nativeBzip2Decode(compressed);
   }
   return zlibDecompress(compressed);
 }
@@ -749,6 +783,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+server.timeout = 120000;
 server.listen(PORT, () => {
   console.log(`NEXRAD Level II server listening on port ${PORT}`);
 });
