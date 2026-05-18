@@ -615,6 +615,70 @@ const server = http.createServer(async (req, res) => {
       return sendPng(res, png);
     }
 
+    // GET /volume/:station/:product.json?time=...&elevation=0.5
+    m = path.match(/^\/volume\/([A-Z]{3,4})\/([A-Z0-9]+)\.json$/i);
+    if (m) {
+      const station = m[1].toUpperCase();
+      const product = m[2].toUpperCase();
+      let time = url.searchParams.get('time');
+      const elevation = parseFloat(url.searchParams.get('elevation') || '0.5');
+
+      if (!time || time === 'latest') {
+        const today = new Date().toISOString().slice(0, 10);
+        let scans = await listScans(station, today);
+        if (scans.length === 0) {
+          const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+          scans = await listScans(station, yesterday);
+        }
+        if (scans.length === 0) return sendJson(res, { error: 'No scans found' }, 404);
+        time = scans[scans.length - 1].time;
+      }
+
+      const vol = await fetchVolumeFile(station, time);
+      if (!vol) return sendJson(res, { error: 'No data' }, 404);
+
+      const parsed = parseLevel2(vol);
+      const sweeps = parsed.sweeps.filter(s => s.product === product);
+      if (sweeps.length === 0) return sendJson(res, { error: `No ${product} data` }, 404);
+
+      const sweep = sweeps.reduce((a, b) =>
+        Math.abs(a.elevation - elevation) <= Math.abs(b.elevation - elevation) ? a : b
+      );
+
+      const body = JSON.stringify({
+        site: station,
+        product: sweep.product,
+        timestamp: time,
+        elevation: sweep.elevation,
+        station_lat: sweep.stationLat,
+        station_lon: sweep.stationLon,
+        gate_size_m: sweep.gateSizeMeters,
+        first_gate_m: sweep.firstGateRange,
+        scale: sweep.scale,
+        offset: sweep.offset,
+        num_gates: sweep.numGates,
+        radials: sweep.radials,
+      });
+
+      const acceptEncoding = req.headers['accept-encoding'] || '';
+      if (acceptEncoding.includes('gzip')) {
+        const compressed = zlib.gzipSync(body);
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Content-Encoding': 'gzip',
+          'Cache-Control': 'public, max-age=120',
+          'Access-Control-Allow-Origin': '*',
+        });
+        return res.end(compressed);
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'public, max-age=120',
+        'Access-Control-Allow-Origin': '*',
+      });
+      return res.end(body);
+    }
+
     // GET /image/:station/:product.png?time=...&elevation=0.5&size=2048
     m = path.match(/^\/image\/([A-Z]{3,4})\/([A-Z0-9]+)\.png$/i);
     if (m) {
