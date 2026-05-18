@@ -152,6 +152,51 @@ function parseMessage31(data, offset, length) {
   return { azimuth, elevation, elevationNumber, moments };
 }
 
+// Walks the entire volume file emitting one message-31 record at a time via callback.
+// Never accumulates records — each record becomes GC-able after the callback returns.
+// Callback may return false to stop iteration early.
+async function iterateMessage31Records(buffer, callback) {
+  const data = new Uint8Array(buffer);
+  const view = new DataView(buffer);
+  let pos = 24;
+  while (pos + 4 < data.length) {
+    const blockSize = view.getInt32(pos, false);
+    pos += 4;
+    if (blockSize === 0) break;
+    const absSize = Math.abs(blockSize);
+    if (pos + absSize > data.length) break;
+
+    const compressed = data.slice(pos, pos + absSize);
+    pos += absSize;
+
+    let decompressed;
+    try { decompressed = decompressBlock(compressed); } catch { continue; }
+
+    let mPos = 0;
+    while (mPos + 28 <= decompressed.length) {
+      const ctmEnd = mPos + 12;
+      if (ctmEnd + 16 > decompressed.length) break;
+      const hv = new DataView(decompressed.buffer, decompressed.byteOffset + ctmEnd, 16);
+      const msgSize = hv.getUint16(0, false) * 2;
+      const msgType = hv.getUint8(3);
+
+      if (msgType === 31) {
+        const start = ctmEnd + 16;
+        const len = msgSize > 16 ? msgSize - 16 : decompressed.length - start;
+        const rec = parseMessage31(decompressed, start, Math.min(len, decompressed.length - start));
+        if (rec && rec.moments.length > 0) {
+          const cont = await callback(rec);
+          if (cont === false) return;
+        }
+      }
+
+      const total = 12 + Math.max(msgSize, 16);
+      mPos += total;
+      if (mPos <= ctmEnd) mPos = ctmEnd + 18;
+    }
+  }
+}
+
 function parseMessagesFromBlock(data) {
   const records = [];
   let pos = 0;
@@ -220,11 +265,13 @@ function parseLevel2(buffer) {
     const { moment, records, elevation } = group;
     const radials = records.map(rec => {
       const m = rec.moments.find(x => x.name === moment.name);
-      const gates = [];
+      let gates;
       if (m.wordSize === 16) {
-        for (let i = 0; i < m.data.length - 1; i += 2) gates.push((m.data[i] << 8) | m.data[i + 1]);
+        const n = (m.data.length >> 1);
+        gates = new Uint16Array(n);
+        for (let i = 0; i < n; i++) gates[i] = (m.data[i*2] << 8) | m.data[i*2 + 1];
       } else {
-        for (let i = 0; i < m.data.length; i++) gates.push(m.data[i]);
+        gates = new Uint8Array(m.data); // copy
       }
       return { azimuth: rec.azimuth, gates };
     }).sort((a, b) => a.azimuth - b.azimuth);
@@ -615,13 +662,13 @@ const server = http.createServer(async (req, res) => {
       return sendPng(res, png);
     }
 
-    // GET /volume/:station/:product.json?time=...&elevation=0.5
+    // GET /volume/:station/:product.json?time=...
+    // Streams NDJSON. One radial per line. Server memory stays flat: one record at a time.
     m = path.match(/^\/volume\/([A-Z]{3,4})\/([A-Z0-9]+)\.json$/i);
     if (m) {
       const station = m[1].toUpperCase();
       const product = m[2].toUpperCase();
       let time = url.searchParams.get('time');
-      const elevation = parseFloat(url.searchParams.get('elevation') || '0.5');
 
       if (!time || time === 'latest') {
         const today = new Date().toISOString().slice(0, 10);
@@ -634,49 +681,93 @@ const server = http.createServer(async (req, res) => {
         time = scans[scans.length - 1].time;
       }
 
-      const vol = await fetchVolumeFile(station, time);
+      let vol = await fetchVolumeFile(station, time);
       if (!vol) return sendJson(res, { error: 'No data' }, 404);
 
-      const parsed = parseLevel2(vol);
-      const sweeps = parsed.sweeps.filter(s => s.product === product);
-      if (sweeps.length === 0) return sendJson(res, { error: `No ${product} data` }, 404);
-
-      const sweep = sweeps.reduce((a, b) =>
-        Math.abs(a.elevation - elevation) <= Math.abs(b.elevation - elevation) ? a : b
-      );
-
-      const body = JSON.stringify({
-        site: station,
-        product: sweep.product,
-        timestamp: time,
-        elevation: sweep.elevation,
-        station_lat: sweep.stationLat,
-        station_lon: sweep.stationLon,
-        gate_size_m: sweep.gateSizeMeters,
-        first_gate_m: sweep.firstGateRange,
-        scale: sweep.scale,
-        offset: sweep.offset,
-        num_gates: sweep.numGates,
-        radials: sweep.radials,
-      });
+      const stationKey = station.replace(/^K/, '');
+      const coords = STATION_COORDS[stationKey] || [0, 0];
 
       const acceptEncoding = req.headers['accept-encoding'] || '';
-      if (acceptEncoding.includes('gzip')) {
-        const compressed = zlib.gzipSync(body);
-        res.writeHead(200, {
-          'Content-Type': 'application/json',
-          'Content-Encoding': 'gzip',
-          'Cache-Control': 'public, max-age=120',
-          'Access-Control-Allow-Origin': '*',
-        });
-        return res.end(compressed);
-      }
-      res.writeHead(200, {
-        'Content-Type': 'application/json',
+      const useGzip = acceptEncoding.includes('gzip');
+
+      const headers = {
+        'Content-Type': 'application/x-ndjson',
         'Cache-Control': 'public, max-age=120',
         'Access-Control-Allow-Origin': '*',
+      };
+      if (useGzip) headers['Content-Encoding'] = 'gzip';
+      res.writeHead(200, headers);
+
+      const gzip = useGzip ? zlib.createGzip({ level: 6 }) : null;
+      if (useGzip) gzip.pipe(res);
+      const sink = useGzip ? gzip : res;
+
+      const write = (chunk) => new Promise(resolve => {
+        if (sink.write(chunk)) resolve();
+        else sink.once('drain', resolve);
       });
-      return res.end(body);
+
+      const MAX_GATES = 1000;
+      let targetElevNum = -1;
+      let metaWritten = false;
+
+      try {
+        await iterateMessage31Records(vol, async (rec) => {
+          // Lock onto the first elevation that contains the requested product
+          if (targetElevNum === -1) {
+            if (rec.moments.find(mo => mo.name === product)) {
+              targetElevNum = rec.elevationNumber;
+            } else {
+              return; // keep scanning
+            }
+          }
+          if (rec.elevationNumber !== targetElevNum) {
+            return false; // past our sweep — stop iteration
+          }
+
+          const moment = rec.moments.find(mo => mo.name === product);
+          if (!moment) return;
+
+          if (!metaWritten) {
+            await write(JSON.stringify({
+              type: 'meta',
+              site: station,
+              product,
+              timestamp: time,
+              elevation: rec.elevation,
+              station_lat: coords[0],
+              station_lon: coords[1],
+              gate_size_m: moment.gateSizeMeters,
+              first_gate_m: moment.firstGateRange,
+              scale: moment.scale,
+              offset: moment.offset,
+              num_gates: Math.min(moment.numGates, MAX_GATES),
+            }) + '\n');
+            metaWritten = true;
+          }
+
+          const numGates = Math.min(moment.numGates, MAX_GATES);
+          const gates = new Array(numGates);
+          if (moment.wordSize === 16) {
+            for (let i = 0; i < numGates; i++) {
+              gates[i] = (moment.data[i * 2] << 8) | moment.data[i * 2 + 1];
+            }
+          } else {
+            for (let i = 0; i < numGates; i++) gates[i] = moment.data[i];
+          }
+
+          await write(JSON.stringify({ type: 'radial', azimuth: rec.azimuth, gates }) + '\n');
+        });
+
+        await write(JSON.stringify({ type: 'end' }) + '\n');
+      } catch (err) {
+        console.error('[/volume] stream error:', err.stack || err);
+      } finally {
+        vol = null;
+        if (useGzip) gzip.end();
+        else res.end();
+      }
+      return;
     }
 
     // GET /image/:station/:product.png?time=...&elevation=0.5&size=2048
