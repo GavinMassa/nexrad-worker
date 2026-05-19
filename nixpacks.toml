@@ -1,6 +1,11 @@
 # Railway / Nixpacks build config.
-# Adds python3 and eccodes (provides the grib_get_data CLI used by rap-worker.js)
-# on top of Nixpacks' auto-detected Node.js layer.
+#
+# Adds python3 (nix) and eccodes via the Debian apt package. We use apt for
+# eccodes rather than nix because Nixpacks doesn't reliably propagate
+# binaries from `nixPkgs` onto the runtime PATH — `eccodes` from nix installs
+# but `which grib_get_data` returns nothing at runtime. The apt package
+# `libeccodes-tools` puts `grib_get_data` in /usr/bin, always on PATH.
 
 [phases.setup]
-nixPkgs = ["python3", "eccodes"]
+nixPkgs = ["python3"]
+aptPkgs = ["libeccodes-tools"]
