@@ -48,6 +48,9 @@ const cache = {
     cin: null,
     shear: null,
     loading: false,
+    lastError: null,        // string — last refresh failure reason
+    lastAttempt: null,      // ISO8601 — when refresh last ran
+    refreshCount: 0,
 };
 
 function pad(n) { return String(n).padStart(2, '0'); }
@@ -56,8 +59,12 @@ function rapURLForHour(date) {
     const yyyy = date.getUTCFullYear();
     const ymd  = `${yyyy}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}`;
     const hh   = pad(date.getUTCHours());
+    // The user's original spec said `awp13f00.grib2` — that file does not exist
+    // on NOMADS (returns HTTP 500 from filter_rap.pl). The real 13km RAP
+    // pressure-grid file at f000 is `awp130pgrbf00.grib2`, which contains CAPE,
+    // CIN, and UGRD/VGRD at 500mb + the 10m winds we need.
     const params = new URLSearchParams({
-        file: `rap.t${hh}z.awp13f00.grib2`,
+        file: `rap.t${hh}z.awp130pgrbf00.grib2`,
         lev_surface: 'on',
         lev_500_mb: 'on',
         lev_10_m_above_ground: 'on',
@@ -130,6 +137,8 @@ function inferGridMeta(points) {
 async function refresh() {
     if (cache.loading) return;
     cache.loading = true;
+    cache.lastAttempt = new Date().toISOString();
+    cache.refreshCount++;
     try {
         // Try the most recent 4 hours in descending order — NOMADS publishes
         // ~30-45 min after the run hour; the current hour may not yet exist.
@@ -193,7 +202,9 @@ async function refresh() {
         cache.cin       = byTag.cin;
         cache.shear     = shearPts;
         console.log(`[rap] cache refreshed validTime=${cache.validTime} nx=${meta && meta.nx} ny=${meta && meta.ny} cape=${cache.cape.length} cin=${cache.cin.length} shear=${cache.shear.length}`);
+        cache.lastError = null;
     } catch (e) {
+        cache.lastError = e.message;
         console.error(`[rap] refresh failed: ${e.message}`);
     } finally {
         cache.loading = false;
@@ -204,8 +215,14 @@ function streamParam(res, param) {
     const data = cache[param];
     const meta = cache.meta;
     if (!data || !meta) {
-        res.writeHead(503, { 'Content-Type': 'text/plain' });
-        res.end('rap not ready');
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            error: 'rap not ready',
+            loading: cache.loading,
+            lastAttempt: cache.lastAttempt,
+            lastError: cache.lastError,
+            refreshCount: cache.refreshCount,
+        }));
         return;
     }
     res.writeHead(200, {
@@ -242,6 +259,23 @@ function handle(req, res) {
     if (p === '/cape')  { streamParam(res, 'cape');  return true; }
     if (p === '/cin')   { streamParam(res, 'cin');   return true; }
     if (p === '/shear') { streamParam(res, 'shear'); return true; }
+    if (p === '/status') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            ready: !!(cache.meta && cache.cape),
+            validTime: cache.validTime,
+            loading: cache.loading,
+            lastAttempt: cache.lastAttempt,
+            lastError: cache.lastError,
+            refreshCount: cache.refreshCount,
+            counts: {
+                cape:  cache.cape  ? cache.cape.length  : 0,
+                cin:   cache.cin   ? cache.cin.length   : 0,
+                shear: cache.shear ? cache.shear.length : 0,
+            },
+        }));
+        return true;
+    }
     return false;
 }
 
