@@ -167,20 +167,47 @@ async function refresh() {
             return;
         }
 
-        // 6 parallel field extractions (CAPE sfc, CIN sfc, U/V at 500mb, U/V at 10m).
-        // Spec called for 8 workers — pool size is 8 but this refresh uses 6.
+        // 6 parallel field extractions. Each task provides multiple `candidates`
+        // — the worker tries them in order until one matches a real GRIB2 message.
+        // RAP eccodes tables vary: 10m winds may be `10u`/`10v` directly, or `u`/`v`
+        // with typeOfLevel=heightAboveGround, depending on the eccodes version.
         const tasks = [
-            { tag: 'cape',  shortName: 'cape', typeOfLevel: 'surface',           level: 0   },
-            { tag: 'cin',   shortName: 'cin',  typeOfLevel: 'surface',           level: 0   },
-            { tag: 'u500',  shortName: 'u',    typeOfLevel: 'isobaricInhPa',     level: 500 },
-            { tag: 'v500',  shortName: 'v',    typeOfLevel: 'isobaricInhPa',     level: 500 },
-            { tag: 'u10',   shortName: 'u',    typeOfLevel: 'heightAboveGround', level: 10  },
-            { tag: 'v10',   shortName: 'v',    typeOfLevel: 'heightAboveGround', level: 10  },
+            { tag: 'cape',  candidates: [
+                { shortName: 'cape',   typeOfLevel: 'surface', level: 0 },
+            ]},
+            { tag: 'cin',   candidates: [
+                { shortName: 'cin',    typeOfLevel: 'surface', level: 0 },
+            ]},
+            { tag: 'u500',  candidates: [
+                { shortName: 'u',      typeOfLevel: 'isobaricInhPa', level: 500 },
+                { shortName: 'UGRD',   typeOfLevel: 'isobaricInhPa', level: 500 },
+            ]},
+            { tag: 'v500',  candidates: [
+                { shortName: 'v',      typeOfLevel: 'isobaricInhPa', level: 500 },
+                { shortName: 'VGRD',   typeOfLevel: 'isobaricInhPa', level: 500 },
+            ]},
+            { tag: 'u10',   candidates: [
+                { shortName: '10u' },
+                { shortName: 'u',      typeOfLevel: 'heightAboveGround', level: 10 },
+                { shortName: 'UGRD',   typeOfLevel: 'heightAboveGround', level: 10 },
+            ]},
+            { tag: 'v10',   candidates: [
+                { shortName: '10v' },
+                { shortName: 'v',      typeOfLevel: 'heightAboveGround', level: 10 },
+                { shortName: 'VGRD',   typeOfLevel: 'heightAboveGround', level: 10 },
+            ]},
         ];
         const results = await Promise.all(tasks.map(t =>
-            runExtraction({ gribPath: downloaded.path, ...t })));
+            runExtraction({ gribPath: downloaded.path, tag: t.tag, candidates: t.candidates })));
         const byTag = {};
-        results.forEach((r, i) => { byTag[tasks[i].tag] = r.points || []; });
+        results.forEach((r, i) => {
+            byTag[tasks[i].tag] = r.points || [];
+            if ((r.points || []).length === 0) {
+                console.warn(`[rap] tag=${tasks[i].tag} 0 points; tried=${JSON.stringify(r.triedCandidates)} debug=${(r.debug || '').slice(0, 600)}`);
+            } else if (r.matched) {
+                console.log(`[rap] tag=${tasks[i].tag} matched=${JSON.stringify(r.matched)} points=${r.points.length}`);
+            }
+        });
 
         // Compute 0-6km bulk shear from V500mb - V10m magnitude.
         // eccodes preserves grid scan order across messages from the same GRIB2,
