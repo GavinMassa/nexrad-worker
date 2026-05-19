@@ -227,17 +227,41 @@ function streamParam(res, param) {
     res.end();
 }
 
-const server = http.createServer((req, res) => {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    if (url.pathname === '/rap/cape')  return streamParam(res, 'cape');
-    if (url.pathname === '/rap/cin')   return streamParam(res, 'cin');
-    if (url.pathname === '/rap/shear') return streamParam(res, 'shear');
-    if (url.pathname === '/healthz')   { res.writeHead(200); return res.end('ok'); }
-    res.writeHead(404); res.end('not found');
-});
+// Public handler — mountable into another http server (e.g. server.js).
+// Returns true if the request was handled, false otherwise (so the parent
+// router can fall through to its own routes).
+//
+// Recognized paths (with or without a `/rap` prefix):
+//   /rap/cape   /cape
+//   /rap/cin    /cin
+//   /rap/shear  /shear
+function handle(req, res) {
+    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    let p = url.pathname;
+    if (p.startsWith('/rap')) p = p.slice(4) || '/';
+    if (p === '/cape')  { streamParam(res, 'cape');  return true; }
+    if (p === '/cin')   { streamParam(res, 'cin');   return true; }
+    if (p === '/shear') { streamParam(res, 'shear'); return true; }
+    return false;
+}
 
-server.listen(PORT, () => {
-    console.log(`[rap] listening on ${PORT} (workers=${NUM_WORKERS})`);
-    refresh();
-    setInterval(refresh, REFRESH_MS);
-});
+// Kick off the refresh cycle as soon as this module is required.
+refresh();
+const refreshTimer = setInterval(refresh, REFRESH_MS);
+refreshTimer.unref && refreshTimer.unref();
+console.log(`[rap] module loaded (workers=${NUM_WORKERS})`);
+
+module.exports = { handle, refresh };
+
+// Stand-alone mode — only runs when invoked directly (`node rap.js`), not
+// when required from server.js.
+if (require.main === module) {
+    const server = http.createServer((req, res) => {
+        if (handle(req, res)) return;
+        if (new URL(req.url, `http://${req.headers.host}`).pathname === '/healthz') {
+            res.writeHead(200); res.end('ok'); return;
+        }
+        res.writeHead(404); res.end('not found');
+    });
+    server.listen(PORT, () => console.log(`[rap] standalone listening on ${PORT}`));
+}

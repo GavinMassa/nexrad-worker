@@ -2,6 +2,7 @@ const http = require('http');
 const zlib = require('zlib');
 const { URL } = require('url');
 const seekBzip = require('seek-bzip');
+const rap = require('./rap');
 
 const PORT = process.env.PORT || 3000;
 
@@ -587,6 +588,10 @@ const server = http.createServer(async (req, res) => {
     });
     return res.end();
   }
+
+  // Mounted RAP mesoanalysis router — handles /rap/cape, /rap/cin, /rap/shear.
+  // If it returns true the request is fully handled; otherwise fall through.
+  if (path.startsWith('/rap/') && rap.handle(req, res)) return;
 
   try {
     // GET /api/scans/:station?date=YYYY-MM-DD
