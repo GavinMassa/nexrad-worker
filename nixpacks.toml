@@ -1,0 +1,6 @@
+# Railway / Nixpacks build config.
+# Adds python3 and eccodes (provides the grib_get_data CLI used by rap-worker.js)
+# on top of Nixpacks' auto-detected Node.js layer.
+
+[phases.setup]
+nixPkgs = ["python3", "eccodes"]
