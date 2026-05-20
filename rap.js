@@ -39,30 +39,48 @@ const REFRESH_MS  = 10 * 60 * 1000;
 const TMP_DIR     = path.join(os.tmpdir(), 'rap-cache');
 fs.mkdirSync(TMP_DIR, { recursive: true });
 
-const SUBREGION = { leftlon: -135, rightlon: -60, toplat: 55, bottomlat: 20 };
-
-const cache = {
-    validTime: null,    // ISO8601
-    meta: null,         // { nx, ny, lat_min, lat_max, lon_min, lon_max }
-    cape: null,         // [{lat,lon,value}]
-    cin: null,
-    shear: null,
-    loading: false,
-    lastError: null,        // string — last refresh failure reason
-    lastAttempt: null,      // ISO8601 — when refresh last ran
-    refreshCount: 0,
+// Sector definitions. The `id` matches the iOS RAPSector.id values; the bbox
+// is passed straight into the NOMADS filter_rap.pl subregion params so each
+// sector downloads only the GRIB2 bytes inside its window — small sectors
+// shrink the per-sector fetch + parse dramatically.
+const SECTORS = {
+    "s19":     { name: "CONUS",            latMin: 20, latMax: 55, lonMin: -135, lonMax: -60 },
+    "ne":      { name: "Northeast",        latMin: 36, latMax: 48, lonMin: -82,  lonMax: -66 },
+    "midatl":  { name: "Mid-Atlantic",     latMin: 33, latMax: 43, lonMin: -86,  lonMax: -72 },
+    "se":      { name: "Southeast",        latMin: 26, latMax: 38, lonMin: -92,  lonMax: -76 },
+    "fl":      { name: "Florida",          latMin: 23, latMax: 32, lonMin: -88,  lonMax: -78 },
+    "gl":      { name: "Great Lakes",      latMin: 38, latMax: 48, lonMin: -94,  lonMax: -76 },
+    "nplains": { name: "Northern Plains",  latMin: 38, latMax: 50, lonMin: -107, lonMax: -91 },
+    "cplains": { name: "Central Plains",   latMin: 33, latMax: 45, lonMin: -103, lonMax: -89 },
+    "splains": { name: "Southern Plains",  latMin: 28, latMax: 40, lonMin: -106, lonMax: -90 },
+    "tx":      { name: "Texas",            latMin: 25, latMax: 37, lonMin: -107, lonMax: -91 },
+    "nw":      { name: "Northwest",        latMin: 38, latMax: 50, lonMin: -125, lonMax: -103 },
+    "sw":      { name: "Southwest",        latMin: 28, latMax: 40, lonMin: -120, lonMax: -100 },
 };
+
+function newCacheEntry() {
+    return {
+        validTime: null,
+        meta: null,
+        cape: null, cin: null, shear: null,
+        loading: false,
+        lastError: null,
+        lastAttempt: null,
+        refreshCount: 0,
+    };
+}
+// One cache per sector. Populated lazily on first request.
+const sectorCache = {};
+// Tracks most-recently-requested sectors so the background refresh loop
+// keeps them warm. CONUS is always primed.
+const activeSectors = new Set(["s19"]);
 
 function pad(n) { return String(n).padStart(2, '0'); }
 
-function rapURLForHour(date) {
+function rapURLForHour(date, sector) {
     const yyyy = date.getUTCFullYear();
     const ymd  = `${yyyy}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}`;
     const hh   = pad(date.getUTCHours());
-    // The user's original spec said `awp13f00.grib2` — that file does not exist
-    // on NOMADS (returns HTTP 500 from filter_rap.pl). The real 13km RAP
-    // pressure-grid file at f000 is `awp130pgrbf00.grib2`, which contains CAPE,
-    // CIN, and UGRD/VGRD at 500mb + the 10m winds we need.
     const params = new URLSearchParams({
         file: `rap.t${hh}z.awp130pgrbf00.grib2`,
         lev_surface: 'on',
@@ -73,10 +91,10 @@ function rapURLForHour(date) {
         var_UGRD: 'on',
         var_VGRD: 'on',
         subregion: '',
-        leftlon:   String(SUBREGION.leftlon),
-        rightlon:  String(SUBREGION.rightlon),
-        toplat:    String(SUBREGION.toplat),
-        bottomlat: String(SUBREGION.bottomlat),
+        leftlon:   String(sector.lonMin),
+        rightlon:  String(sector.lonMax),
+        toplat:    String(sector.latMax),
+        bottomlat: String(sector.latMin),
         dir: `/rap.${ymd}`,
     });
     return `https://nomads.ncep.noaa.gov/cgi-bin/filter_rap.pl?${params.toString()}`;
@@ -134,7 +152,11 @@ function inferGridMeta(points) {
     return { nx: lons.size, ny: lats.size, lat_min, lat_max, lon_min, lon_max };
 }
 
-async function refresh() {
+async function refreshSector(sectorId) {
+    const sector = SECTORS[sectorId];
+    if (!sector) return;
+    if (!sectorCache[sectorId]) sectorCache[sectorId] = newCacheEntry();
+    const cache = sectorCache[sectorId];
     if (cache.loading) return;
     cache.loading = true;
     cache.lastAttempt = new Date().toISOString();
@@ -147,9 +169,10 @@ async function refresh() {
         let downloaded = null;
         for (let i = 0; i < 4; i++) {
             const t = new Date(now.getTime() - i * 3600 * 1000);
-            const url = rapURLForHour(t);
+            const url = rapURLForHour(t, sector);
             const stamp = t.toISOString().replace(/[:.]/g, '_');
-            const dest = path.join(TMP_DIR, `rap_${stamp}.grib2`);
+            // File names include the sector so different bbox downloads don't collide.
+            const dest = path.join(TMP_DIR, `rap_${sectorId}_${stamp}.grib2`);
             try {
                 if (!fs.existsSync(dest) || fs.statSync(dest).size < 1000) {
                     await downloadToFile(url, dest);
@@ -159,11 +182,11 @@ async function refresh() {
                     break;
                 }
             } catch (e) {
-                console.warn(`[rap] fetch ${t.toISOString()} failed: ${e.message}`);
+                console.warn(`[rap:${sectorId}] fetch ${t.toISOString()} failed: ${e.message}`);
             }
         }
         if (!downloaded) {
-            console.warn('[rap] no run available yet');
+            console.warn(`[rap:${sectorId}] no run available yet`);
             return;
         }
 
@@ -203,9 +226,9 @@ async function refresh() {
         results.forEach((r, i) => {
             byTag[tasks[i].tag] = r.points || [];
             if ((r.points || []).length === 0) {
-                console.warn(`[rap] tag=${tasks[i].tag} 0 points; tried=${JSON.stringify(r.triedCandidates)} debug=${(r.debug || '').slice(0, 600)}`);
+                console.warn(`[rap:${sectorId}] tag=${tasks[i].tag} 0 points; tried=${JSON.stringify(r.triedCandidates)} debug=${(r.debug || '').slice(0, 600)}`);
             } else if (r.matched) {
-                console.log(`[rap] tag=${tasks[i].tag} matched=${JSON.stringify(r.matched)} points=${r.points.length}`);
+                console.log(`[rap:${sectorId}] tag=${tasks[i].tag} matched=${JSON.stringify(r.matched)} points=${r.points.length}`);
             }
         });
 
@@ -228,42 +251,57 @@ async function refresh() {
         cache.cape      = byTag.cape;
         cache.cin       = byTag.cin;
         cache.shear     = shearPts;
-        console.log(`[rap] cache refreshed validTime=${cache.validTime} nx=${meta && meta.nx} ny=${meta && meta.ny} cape=${cache.cape.length} cin=${cache.cin.length} shear=${cache.shear.length}`);
+        console.log(`[rap:${sectorId}] cache refreshed validTime=${cache.validTime} nx=${meta && meta.nx} ny=${meta && meta.ny} cape=${cache.cape.length} cin=${cache.cin.length} shear=${cache.shear.length}`);
         cache.lastError = null;
     } catch (e) {
         cache.lastError = e.message;
-        console.error(`[rap] refresh failed: ${e.message}`);
+        console.error(`[rap:${sectorId}] refresh failed: ${e.message}`);
     } finally {
         cache.loading = false;
     }
 }
 
-function streamParam(res, param) {
-    const data = cache[param];
-    const meta = cache.meta;
-    if (!data || !meta) {
+// Background loop — refreshes every sector that has been requested at least
+// once. CONUS is primed at startup.
+async function refreshAllActive() {
+    for (const sectorId of activeSectors) {
+        await refreshSector(sectorId);
+    }
+}
+
+function streamParam(res, param, sectorId) {
+    if (!SECTORS[sectorId]) sectorId = "s19";
+    activeSectors.add(sectorId);
+    const cache = sectorCache[sectorId];
+    if (!cache || !cache.meta || !cache[param]) {
+        // Kick off a fetch async; tell the client we're not ready yet so it can
+        // poll. On first request for a new sector this takes ~30-60s.
+        if (!cache || !cache.loading) refreshSector(sectorId);
+        const c = sectorCache[sectorId] || {};
         res.writeHead(503, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
             error: 'rap not ready',
-            loading: cache.loading,
-            lastAttempt: cache.lastAttempt,
-            lastError: cache.lastError,
-            refreshCount: cache.refreshCount,
+            sector: sectorId,
+            loading: !!c.loading,
+            lastAttempt: c.lastAttempt || null,
+            lastError: c.lastError || null,
+            refreshCount: c.refreshCount || 0,
         }));
         return;
     }
+    const data = cache[param];
+    const meta = cache.meta;
     res.writeHead(200, {
         'Content-Type': 'application/x-ndjson',
         'Cache-Control': 'no-store',
     });
     res.write(JSON.stringify({
-        type: 'meta', param,
+        type: 'meta', param, sector: sectorId,
         nx: meta.nx, ny: meta.ny,
         lat_min: meta.lat_min, lat_max: meta.lat_max,
         lon_min: meta.lon_min, lon_max: meta.lon_max,
         valid_time: cache.validTime,
     }) + '\n');
-    // Bulk-stream rows. For ~260k points each JSON.stringify is fine; total ~10 MB.
     for (let i = 0; i < data.length; i++) {
         res.write(JSON.stringify(data[i]) + '\n');
     }
@@ -283,36 +321,54 @@ function handle(req, res) {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     let p = url.pathname;
     if (p.startsWith('/rap')) p = p.slice(4) || '/';
-    if (p === '/cape')  { streamParam(res, 'cape');  return true; }
-    if (p === '/cin')   { streamParam(res, 'cin');   return true; }
-    if (p === '/shear') { streamParam(res, 'shear'); return true; }
+    const sectorId = url.searchParams.get('sector') || 's19';
+    if (p === '/cape')  { streamParam(res, 'cape',  sectorId); return true; }
+    if (p === '/cin')   { streamParam(res, 'cin',   sectorId); return true; }
+    if (p === '/shear') { streamParam(res, 'shear', sectorId); return true; }
     if (p === '/status') {
+        // Per-sector status. Defaults to the one in ?sector= or all-sectors summary.
+        const onlyId = url.searchParams.get('sector');
+        const ids = onlyId ? [onlyId] : Object.keys(sectorCache);
+        const sectors = {};
+        for (const id of ids) {
+            const c = sectorCache[id] || {};
+            sectors[id] = {
+                ready: !!(c.meta && c.cape),
+                validTime: c.validTime || null,
+                loading: !!c.loading,
+                lastAttempt: c.lastAttempt || null,
+                lastError: c.lastError || null,
+                refreshCount: c.refreshCount || 0,
+                counts: {
+                    cape:  c.cape  ? c.cape.length  : 0,
+                    cin:   c.cin   ? c.cin.length   : 0,
+                    shear: c.shear ? c.shear.length : 0,
+                },
+            };
+        }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
-            ready: !!(cache.meta && cache.cape),
-            validTime: cache.validTime,
-            loading: cache.loading,
-            lastAttempt: cache.lastAttempt,
-            lastError: cache.lastError,
-            refreshCount: cache.refreshCount,
-            counts: {
-                cape:  cache.cape  ? cache.cape.length  : 0,
-                cin:   cache.cin   ? cache.cin.length   : 0,
-                shear: cache.shear ? cache.shear.length : 0,
-            },
+            activeSectors: Array.from(activeSectors),
+            availableSectors: Object.keys(SECTORS),
+            sectors,
         }));
+        return true;
+    }
+    if (p === '/sectors') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(SECTORS));
         return true;
     }
     return false;
 }
 
 // Kick off the refresh cycle as soon as this module is required.
-refresh();
-const refreshTimer = setInterval(refresh, REFRESH_MS);
+refreshSector("s19");
+const refreshTimer = setInterval(refreshAllActive, REFRESH_MS);
 refreshTimer.unref && refreshTimer.unref();
-console.log(`[rap] module loaded (workers=${NUM_WORKERS})`);
+console.log(`[rap] module loaded (workers=${NUM_WORKERS}, sectors=${Object.keys(SECTORS).length})`);
 
-module.exports = { handle, refresh };
+module.exports = { handle, refresh: refreshAllActive, refreshSector };
 
 // Stand-alone mode — only runs when invoked directly (`node rap.js`), not
 // when required from server.js.
