@@ -43,19 +43,27 @@ fs.mkdirSync(TMP_DIR, { recursive: true });
 // is passed straight into the NOMADS filter_rap.pl subregion params so each
 // sector downloads only the GRIB2 bytes inside its window — small sectors
 // shrink the per-sector fetch + parse dramatically.
+// Sector IDs and bboxes match the real NESDIS GOES-East ABI sub-sector
+// definitions used by NOAA STAR (https://www.star.nesdis.noaa.gov/GOES/).
+// The iOS client sends ?sector=<id> from the same list so RAP data is
+// clipped to the exact bbox of the satellite imagery displayed alongside it.
 const SECTORS = {
-    "s19":     { name: "CONUS",            latMin: 20, latMax: 55, lonMin: -135, lonMax: -60 },
-    "ne":      { name: "Northeast",        latMin: 36, latMax: 48, lonMin: -82,  lonMax: -66 },
-    "midatl":  { name: "Mid-Atlantic",     latMin: 33, latMax: 43, lonMin: -86,  lonMax: -72 },
-    "se":      { name: "Southeast",        latMin: 26, latMax: 38, lonMin: -92,  lonMax: -76 },
-    "fl":      { name: "Florida",          latMin: 23, latMax: 32, lonMin: -88,  lonMax: -78 },
-    "gl":      { name: "Great Lakes",      latMin: 38, latMax: 48, lonMin: -94,  lonMax: -76 },
-    "nplains": { name: "Northern Plains",  latMin: 38, latMax: 50, lonMin: -107, lonMax: -91 },
-    "cplains": { name: "Central Plains",   latMin: 33, latMax: 45, lonMin: -103, lonMax: -89 },
-    "splains": { name: "Southern Plains",  latMin: 28, latMax: 40, lonMin: -106, lonMax: -90 },
-    "tx":      { name: "Texas",            latMin: 25, latMax: 37, lonMin: -107, lonMax: -91 },
-    "nw":      { name: "Northwest",        latMin: 38, latMax: 50, lonMin: -125, lonMax: -103 },
-    "sw":      { name: "Southwest",        latMin: 28, latMax: 40, lonMin: -120, lonMax: -100 },
+    "CONUS":   { name: "CONUS",                latMin: 23.5, latMax: 50.0, lonMin: -125.0, lonMax: -66.5 },
+    "ne":      { name: "Northeast",            latMin: 36.0, latMax: 50.0, lonMin: -82.0,  lonMax: -65.0 },
+    "eus":     { name: "U.S. Atlantic Coast",  latMin: 28.0, latMax: 47.0, lonMin: -85.0,  lonMax: -65.0 },
+    "se":      { name: "Southeast",            latMin: 26.0, latMax: 38.0, lonMin: -94.0,  lonMax: -75.0 },
+    "gm":      { name: "Gulf of Mexico",       latMin: 18.0, latMax: 31.5, lonMin: -97.5,  lonMax: -80.0 },
+    "car":     { name: "Caribbean",            latMin: 10.0, latMax: 25.0, lonMin: -90.0,  lonMax: -60.0 },
+    "cgl":     { name: "Central Great Lakes",  latMin: 38.0, latMax: 50.0, lonMin: -94.0,  lonMax: -76.0 },
+    "umv":     { name: "Upper Mississippi",    latMin: 36.0, latMax: 49.0, lonMin: -99.5,  lonMax: -82.5 },
+    "smv":     { name: "Southern Mississippi", latMin: 28.0, latMax: 41.0, lonMin: -98.0,  lonMax: -82.0 },
+    "mids":    { name: "Mid-Mississippi",      latMin: 33.0, latMax: 45.0, lonMin: -98.0,  lonMax: -82.0 },
+    "nplains": { name: "Northern Plains",      latMin: 38.0, latMax: 50.0, lonMin: -107.0, lonMax: -91.0 },
+    "sp":      { name: "Southern Plains",      latMin: 26.5, latMax: 39.5, lonMin: -107.0, lonMax: -91.0 },
+    "nr":      { name: "Northern Rockies",     latMin: 38.0, latMax: 51.0, lonMin: -120.0, lonMax: -100.0 },
+    "sr":      { name: "Southern Rockies",     latMin: 27.0, latMax: 42.0, lonMin: -116.0, lonMax: -96.0 },
+    "pnw":     { name: "Pacific Northwest",    latMin: 40.0, latMax: 52.0, lonMin: -131.0, lonMax: -111.0 },
+    "psw":     { name: "Pacific Southwest",    latMin: 28.0, latMax: 42.0, lonMin: -126.0, lonMax: -106.0 },
 };
 
 function newCacheEntry() {
@@ -73,7 +81,7 @@ function newCacheEntry() {
 const sectorCache = {};
 // Tracks most-recently-requested sectors so the background refresh loop
 // keeps them warm. CONUS is always primed.
-const activeSectors = new Set(["s19"]);
+const activeSectors = new Set(["CONUS"]);
 
 function pad(n) { return String(n).padStart(2, '0'); }
 
@@ -270,7 +278,7 @@ async function refreshAllActive() {
 }
 
 function streamParam(res, param, sectorId) {
-    if (!SECTORS[sectorId]) sectorId = "s19";
+    if (!SECTORS[sectorId]) sectorId = "CONUS";
     activeSectors.add(sectorId);
     const cache = sectorCache[sectorId];
     if (!cache || !cache.meta || !cache[param]) {
@@ -321,7 +329,7 @@ function handle(req, res) {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     let p = url.pathname;
     if (p.startsWith('/rap')) p = p.slice(4) || '/';
-    const sectorId = url.searchParams.get('sector') || 's19';
+    const sectorId = url.searchParams.get('sector') || 'CONUS';
     if (p === '/cape')  { streamParam(res, 'cape',  sectorId); return true; }
     if (p === '/cin')   { streamParam(res, 'cin',   sectorId); return true; }
     if (p === '/shear') { streamParam(res, 'shear', sectorId); return true; }
@@ -363,7 +371,7 @@ function handle(req, res) {
 }
 
 // Kick off the refresh cycle as soon as this module is required.
-refreshSector("s19");
+refreshSector("CONUS");
 const refreshTimer = setInterval(refreshAllActive, REFRESH_MS);
 refreshTimer.unref && refreshTimer.unref();
 console.log(`[rap] module loaded (workers=${NUM_WORKERS}, sectors=${Object.keys(SECTORS).length})`);
