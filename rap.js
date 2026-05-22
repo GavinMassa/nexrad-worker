@@ -91,6 +91,12 @@ const activeSectors = new Set(["CONUS"]);
 
 function pad(n) { return String(n).padStart(2, '0'); }
 
+// Main fields: CAPE, CIN, 500mb+10m winds, 500mb ABSV.
+// HLCY is intentionally excluded here — NOMADS level filters (lev_surface,
+// lev_500_mb, lev_10_m_above_ground) only pass messages whose typeOfLevel
+// matches one of those level selectors.  HLCY uses typeOfLevel=heightAboveGroundLayer
+// which matches NONE of them, so it would be silently dropped.  It is fetched
+// separately via hlcyURLForHour() with no level filter.
 function rapURLForHour(date, sector) {
     const yyyy = date.getUTCFullYear();
     const ymd  = `${yyyy}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}`;
@@ -100,17 +106,30 @@ function rapURLForHour(date, sector) {
         lev_surface: 'on',
         lev_500_mb: 'on',
         lev_10_m_above_ground: 'on',
-        // NOTE: HLCY is encoded as heightAboveGroundLayer in GRIB2.
-        // NOMADS level filters (lev_0-3000_m_above_ground etc.) return 0 bytes
-        // for layer-type fields — so we request var_HLCY with NO level filter
-        // and extract the correct layer in the worker via typeOfLevel+level.
-        // ABSV only exists at 500 mb in awp130 (lev_500_mb already requested).
         var_CAPE: 'on',
         var_CIN: 'on',
         var_UGRD: 'on',
         var_VGRD: 'on',
-        var_HLCY: 'on',
         var_ABSV: 'on',
+        subregion: '',
+        leftlon:   String(sector.lonMin),
+        rightlon:  String(sector.lonMax),
+        toplat:    String(sector.latMax),
+        bottomlat: String(sector.latMin),
+        dir: `/rap.${ymd}`,
+    });
+    return `https://nomads.ncep.noaa.gov/cgi-bin/filter_rap.pl?${params.toString()}`;
+}
+
+// Separate small download for HLCY only — no level filter so NOMADS passes
+// all heightAboveGroundLayer HLCY messages (0-1km and 0-3km).
+function hlcyURLForHour(date, sector) {
+    const yyyy = date.getUTCFullYear();
+    const ymd  = `${yyyy}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}`;
+    const hh   = pad(date.getUTCHours());
+    const params = new URLSearchParams({
+        file: `rap.t${hh}z.awp130pgrbf00.grib2`,
+        var_HLCY: 'on',
         subregion: '',
         leftlon:   String(sector.lonMin),
         rightlon:  String(sector.lonMax),
@@ -187,21 +206,27 @@ async function refreshSector(sectorId) {
     try {
         // Try the most recent 4 hours in descending order — NOMADS publishes
         // ~30-45 min after the run hour; the current hour may not yet exist.
+        // Two downloads per run: main (CAPE/CIN/winds/ABSV) + hlcy (SRH only).
         const now = new Date();
         now.setUTCMinutes(0, 0, 0);
         let downloaded = null;
         for (let i = 0; i < 4; i++) {
-            const t = new Date(now.getTime() - i * 3600 * 1000);
-            const url = rapURLForHour(t, sector);
-            const stamp = t.toISOString().replace(/[:.]/g, '_');
-            // File names include the sector so different bbox downloads don't collide.
-            const dest = path.join(TMP_DIR, `rap_${sectorId}_${stamp}.grib2`);
+            const t      = new Date(now.getTime() - i * 3600 * 1000);
+            const stamp  = t.toISOString().replace(/[:.]/g, '_');
+            const mainDest = path.join(TMP_DIR, `rap_${sectorId}_${stamp}.grib2`);
+            const hlcyDest = path.join(TMP_DIR, `rap_hlcy_${sectorId}_${stamp}.grib2`);
             try {
-                if (!fs.existsSync(dest) || fs.statSync(dest).size < 1000) {
-                    await downloadToFile(url, dest);
-                }
-                if (fs.statSync(dest).size > 1000) {
-                    downloaded = { date: t, path: dest };
+                // Download both files concurrently; skip if already cached on disk.
+                await Promise.all([
+                    (fs.existsSync(mainDest) && fs.statSync(mainDest).size > 1000)
+                        ? Promise.resolve()
+                        : downloadToFile(rapURLForHour(t, sector), mainDest),
+                    (fs.existsSync(hlcyDest) && fs.statSync(hlcyDest).size > 1000)
+                        ? Promise.resolve()
+                        : downloadToFile(hlcyURLForHour(t, sector), hlcyDest),
+                ]);
+                if (fs.statSync(mainDest).size > 1000) {
+                    downloaded = { date: t, path: mainDest, hlcyPath: hlcyDest };
                     break;
                 }
             } catch (e) {
@@ -213,52 +238,52 @@ async function refreshSector(sectorId) {
             return;
         }
 
-        // 8 parallel field extractions. Each task provides multiple `candidates`
-        // — the worker tries them in order until one matches a real GRIB2 message.
-        // RAP eccodes tables vary: 10m winds may be `10u`/`10v` directly, or `u`/`v`
-        // with typeOfLevel=heightAboveGround, depending on the eccodes version.
+        // 9 parallel field extractions split across two GRIB2 files:
+        //   mainPath  — CAPE, CIN, winds, ABSV  (lev_surface/500mb/10m filters)
+        //   hlcyPath  — HLCY only               (no level filter; needed because
+        //               heightAboveGroundLayer messages are silently dropped when
+        //               any lev_* filter is active in the NOMADS request)
+        const mainPath = downloaded.path;
+        const hlcyPath = downloaded.hlcyPath;
         const tasks = [
-            { tag: 'cape',     candidates: [
-                { shortName: 'cape',   typeOfLevel: 'surface', level: 0 },
+            { gribPath: mainPath, tag: 'cape',    candidates: [
+                { shortName: 'cape', typeOfLevel: 'surface', level: 0 },
             ]},
-            { tag: 'cin',      candidates: [
-                { shortName: 'cin',    typeOfLevel: 'surface', level: 0 },
+            { gribPath: mainPath, tag: 'cin',     candidates: [
+                { shortName: 'cin',  typeOfLevel: 'surface', level: 0 },
             ]},
-            { tag: 'u500',     candidates: [
-                { shortName: 'u',      typeOfLevel: 'isobaricInhPa', level: 500 },
-                { shortName: 'UGRD',   typeOfLevel: 'isobaricInhPa', level: 500 },
+            { gribPath: mainPath, tag: 'u500',    candidates: [
+                { shortName: 'u',    typeOfLevel: 'isobaricInhPa', level: 500 },
+                { shortName: 'UGRD', typeOfLevel: 'isobaricInhPa', level: 500 },
             ]},
-            { tag: 'v500',     candidates: [
-                { shortName: 'v',      typeOfLevel: 'isobaricInhPa', level: 500 },
-                { shortName: 'VGRD',   typeOfLevel: 'isobaricInhPa', level: 500 },
+            { gribPath: mainPath, tag: 'v500',    candidates: [
+                { shortName: 'v',    typeOfLevel: 'isobaricInhPa', level: 500 },
+                { shortName: 'VGRD', typeOfLevel: 'isobaricInhPa', level: 500 },
             ]},
-            { tag: 'u10',      candidates: [
+            { gribPath: mainPath, tag: 'u10',     candidates: [
                 { shortName: '10u' },
-                { shortName: 'u',      typeOfLevel: 'heightAboveGround', level: 10 },
-                { shortName: 'UGRD',   typeOfLevel: 'heightAboveGround', level: 10 },
+                { shortName: 'u',    typeOfLevel: 'heightAboveGround', level: 10 },
+                { shortName: 'UGRD', typeOfLevel: 'heightAboveGround', level: 10 },
             ]},
-            { tag: 'v10',      candidates: [
+            { gribPath: mainPath, tag: 'v10',     candidates: [
                 { shortName: '10v' },
-                { shortName: 'v',      typeOfLevel: 'heightAboveGround', level: 10 },
-                { shortName: 'VGRD',   typeOfLevel: 'heightAboveGround', level: 10 },
+                { shortName: 'v',    typeOfLevel: 'heightAboveGround', level: 10 },
+                { shortName: 'VGRD', typeOfLevel: 'heightAboveGround', level: 10 },
             ]},
-            // 0-3km SRH for display. HLCY is encoded as heightAboveGroundLayer
-            // in GRIB2; the `level` key in eccodes = topLevel = 3000 for 0-3km.
-            { tag: 'srh3',    candidates: [
+            // SRH tasks read from the dedicated HLCY-only file.
+            { gribPath: hlcyPath, tag: 'srh3',   candidates: [
                 { shortName: 'hlcy', typeOfLevel: 'heightAboveGroundLayer', level: 3000 },
             ]},
-            // 0-1km SRH for SigTor formula. topLevel=1000 in the same layer type.
-            { tag: 'srh1',    candidates: [
+            { gribPath: hlcyPath, tag: 'srh1',   candidates: [
                 { shortName: 'hlcy', typeOfLevel: 'heightAboveGroundLayer', level: 1000 },
             ]},
-            // 500mb absolute vorticity (ABSV only exists at 500mb in awp130;
-            // 1000mb ABSV is not present). Multiply ×1e5 → ×10⁻⁵ s⁻¹ for display.
-            { tag: 'absv500', candidates: [
+            // 500mb ABSV — included in mainPath via lev_500_mb filter.
+            { gribPath: mainPath, tag: 'absv500', candidates: [
                 { shortName: 'absv', typeOfLevel: 'isobaricInhPa', level: 500 },
             ]},
         ];
         const results = await Promise.all(tasks.map(t =>
-            runExtraction({ gribPath: downloaded.path, tag: t.tag, candidates: t.candidates })));
+            runExtraction({ gribPath: t.gribPath, tag: t.tag, candidates: t.candidates })));
         const byTag = {};
         results.forEach((r, i) => {
             byTag[tasks[i].tag] = r.points || [];
