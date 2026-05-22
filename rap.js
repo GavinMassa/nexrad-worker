@@ -239,15 +239,27 @@ async function refreshSector(sectorId) {
                 { shortName: 'v',      typeOfLevel: 'heightAboveGround', level: 10 },
                 { shortName: 'VGRD',   typeOfLevel: 'heightAboveGround', level: 10 },
             ]},
-            // 0-3km SRH (for display and as SigTor input; 0-1km not in awp130)
+            // 0-3km SRH (for display and as SigTor input; 0-1km not in awp130).
+            // HLCY in GRIB2 is encoded as a layer (0–3000 m), so eccodes exposes
+            // it with typeOfLevel=heightAboveGroundLayer, not heightAboveGround.
+            // The `level` key is the TOP of the layer (3000) in most eccodes builds;
+            // some older builds report the BOTTOM (0) — try both.
             { tag: 'srh3',     candidates: [
+                { shortName: 'hlcy',   typeOfLevel: 'heightAboveGroundLayer', level: 3000 },
+                { shortName: 'HLCY',   typeOfLevel: 'heightAboveGroundLayer', level: 3000 },
+                { shortName: 'hlcy',   typeOfLevel: 'heightAboveGroundLayer', level: 0 },
+                { shortName: 'HLCY',   typeOfLevel: 'heightAboveGroundLayer', level: 0 },
+                // Fallback: single-level form (older RAP GRIB2 tables)
                 { shortName: 'hlcy',   typeOfLevel: 'heightAboveGround', level: 3000 },
                 { shortName: 'HLCY',   typeOfLevel: 'heightAboveGround', level: 3000 },
             ]},
-            // 1000mb absolute vorticity for surface vorticity display
+            // 1000mb absolute vorticity for surface vorticity display.
+            // Some eccodes builds list ABSV as `absv` (lowercase) or `ABSV`.
             { tag: 'absv1000', candidates: [
                 { shortName: 'absv',   typeOfLevel: 'isobaricInhPa', level: 1000 },
                 { shortName: 'ABSV',   typeOfLevel: 'isobaricInhPa', level: 1000 },
+                { shortName: 'absv',   typeOfLevel: 'isobaricInHPa', level: 1000 },
+                { shortName: 'ABSV',   typeOfLevel: 'isobaricInHPa', level: 1000 },
             ]},
         ];
         const results = await Promise.all(tasks.map(t =>
