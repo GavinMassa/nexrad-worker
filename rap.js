@@ -151,9 +151,11 @@ function inferGridMeta(points) {
         if (p.lat > lat_max) lat_max = p.lat;
         if (p.lon < lon_min) lon_min = p.lon;
         if (p.lon > lon_max) lon_max = p.lon;
-        // bin to nearest 0.01° for set counting (RAP is ~0.13°)
-        lats.add(Math.round(p.lat * 100));
-        lons.add(Math.round(p.lon * 100));
+        // Bin to nearest 0.125° (multiply by 8) so the set count approximates
+        // the native RAP-130 grid spacing (~0.13°). Using 0.01° bins produced
+        // nx/ny ~13× too large (22M cells), causing iOS to OOM and freeze.
+        lats.add(Math.round(p.lat * 8));
+        lons.add(Math.round(p.lon * 8));
     }
     return { nx: lons.size, ny: lats.size, lat_min, lat_max, lon_min, lon_max };
 }
