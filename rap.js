@@ -10,7 +10,7 @@
 //   3. Compute derived fields:
 //      - shear:   0-6km bulk shear from |V500mb - V10m|
 //      - srh:     0-3km storm-relative helicity (HLCY, heightAboveGround=3000)
-//      - sigtor:  simplified STP = (CAPE/1500)×(0-1km SRH/150)×(BWD/20), each ∈[0,4]
+//      - sigtor:  simplified STP = (CAPE/1500)×(0-3km SRH/150)×(BWD/20), each ∈[0,4]
 //      - sfcvort: 1000mb absolute vorticity × 1e5 (s⁻¹ → ×10⁻⁵ s⁻¹)
 //   4. Cache fields in memory keyed by run time; serve via NDJSON endpoints.
 //
@@ -41,7 +41,7 @@ const os    = require('os');
 const { Worker } = require('worker_threads');
 
 const PORT        = parseInt(process.env.PORT || '3000', 10);
-const NUM_WORKERS = 8;  // pool size; current refresh uses 9 tasks (runs in two batches)
+const NUM_WORKERS = 8;  // pool size; current refresh uses 8 tasks
 const REFRESH_MS  = 10 * 60 * 1000;
 const TMP_DIR     = path.join(os.tmpdir(), 'rap-cache');
 fs.mkdirSync(TMP_DIR, { recursive: true });
@@ -101,7 +101,6 @@ function rapURLForHour(date, sector) {
         lev_500_mb: 'on',
         lev_1000_mb: 'on',
         lev_10_m_above_ground: 'on',
-        'lev_0-1000_m_above_ground': 'on',
         'lev_0-3000_m_above_ground': 'on',
         var_CAPE: 'on',
         var_CIN: 'on',
@@ -211,7 +210,7 @@ async function refreshSector(sectorId) {
             return;
         }
 
-        // 9 parallel field extractions. Each task provides multiple `candidates`
+        // 8 parallel field extractions. Each task provides multiple `candidates`
         // — the worker tries them in order until one matches a real GRIB2 message.
         // RAP eccodes tables vary: 10m winds may be `10u`/`10v` directly, or `u`/`v`
         // with typeOfLevel=heightAboveGround, depending on the eccodes version.
@@ -240,14 +239,10 @@ async function refreshSector(sectorId) {
                 { shortName: 'v',      typeOfLevel: 'heightAboveGround', level: 10 },
                 { shortName: 'VGRD',   typeOfLevel: 'heightAboveGround', level: 10 },
             ]},
-            // 0-3km SRH (for display) and 0-1km SRH (for SigTor)
+            // 0-3km SRH (for display and as SigTor input; 0-1km not in awp130)
             { tag: 'srh3',     candidates: [
                 { shortName: 'hlcy',   typeOfLevel: 'heightAboveGround', level: 3000 },
                 { shortName: 'HLCY',   typeOfLevel: 'heightAboveGround', level: 3000 },
-            ]},
-            { tag: 'srh1',     candidates: [
-                { shortName: 'hlcy',   typeOfLevel: 'heightAboveGround', level: 1000 },
-                { shortName: 'HLCY',   typeOfLevel: 'heightAboveGround', level: 1000 },
             ]},
             // 1000mb absolute vorticity for surface vorticity display
             { tag: 'absv1000', candidates: [
@@ -284,15 +279,16 @@ async function refreshSector(sectorId) {
         const srhPts = byTag.srh3;
 
         // Simplified Significant Tornado Parameter (STP):
-        //   STP = clamp(CAPE/1500,0,4) × clamp(SRH1km/150,0,4) × clamp(BWD/20,0,4)
-        // Uses 0-1km SRH (srh1) and 0-6km BWD (shear). Grid-aligned via index.
+        //   STP = clamp(CAPE/1500,0,4) × clamp(SRH3km/150,0,4) × clamp(BWD/20,0,4)
+        // awp130 does not carry a 0-1km HLCY level, so we use 0-3km SRH / 150
+        // (a well-accepted alternative used when 0-1km is unavailable).
         const capePts  = byTag.cape;
-        const srh1Pts  = byTag.srh1;
-        const nSig = Math.min(capePts.length, srh1Pts.length, shearPts.length);
+        const srh3Pts  = byTag.srh3;
+        const nSig = Math.min(capePts.length, srh3Pts.length, shearPts.length);
         const sigtorPts = new Array(nSig);
         for (let i = 0; i < nSig; i++) {
             const capeFac = Math.min(Math.max(capePts[i].value / 1500, 0), 4);
-            const srhFac  = Math.min(Math.max(srh1Pts[i].value / 150,  0), 4);
+            const srhFac  = Math.min(Math.max(srh3Pts[i].value / 150,  0), 4);
             const bwdFac  = Math.min(Math.max(shearPts[i].value / 20,  0), 4);
             sigtorPts[i]  = { lat: capePts[i].lat, lon: capePts[i].lon, value: capeFac * srhFac * bwdFac };
         }
