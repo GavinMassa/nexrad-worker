@@ -48,22 +48,20 @@ fs.mkdirSync(TMP_DIR, { recursive: true });
 // The iOS client sends ?sector=<id> from the same list so RAP data is
 // clipped to the exact bbox of the satellite imagery displayed alongside it.
 const SECTORS = {
-    "CONUS":   { name: "CONUS",                latMin: 23.5, latMax: 50.0, lonMin: -125.0, lonMax: -66.5 },
-    "ne":      { name: "Northeast",            latMin: 36.0, latMax: 50.0, lonMin: -82.0,  lonMax: -65.0 },
-    "eus":     { name: "U.S. Atlantic Coast",  latMin: 28.0, latMax: 47.0, lonMin: -85.0,  lonMax: -65.0 },
-    "se":      { name: "Southeast",            latMin: 26.0, latMax: 38.0, lonMin: -94.0,  lonMax: -75.0 },
-    "gm":      { name: "Gulf of Mexico",       latMin: 18.0, latMax: 31.5, lonMin: -97.5,  lonMax: -80.0 },
-    "car":     { name: "Caribbean",            latMin: 10.0, latMax: 25.0, lonMin: -90.0,  lonMax: -60.0 },
-    "cgl":     { name: "Central Great Lakes",  latMin: 38.0, latMax: 50.0, lonMin: -94.0,  lonMax: -76.0 },
-    "umv":     { name: "Upper Mississippi",    latMin: 36.0, latMax: 49.0, lonMin: -99.5,  lonMax: -82.5 },
-    "smv":     { name: "Southern Mississippi", latMin: 28.0, latMax: 41.0, lonMin: -98.0,  lonMax: -82.0 },
-    "mids":    { name: "Mid-Mississippi",      latMin: 33.0, latMax: 45.0, lonMin: -98.0,  lonMax: -82.0 },
-    "nplains": { name: "Northern Plains",      latMin: 38.0, latMax: 50.0, lonMin: -107.0, lonMax: -91.0 },
-    "sp":      { name: "Southern Plains",      latMin: 26.5, latMax: 39.5, lonMin: -107.0, lonMax: -91.0 },
-    "nr":      { name: "Northern Rockies",     latMin: 38.0, latMax: 51.0, lonMin: -120.0, lonMax: -100.0 },
-    "sr":      { name: "Southern Rockies",     latMin: 27.0, latMax: 42.0, lonMin: -116.0, lonMax: -96.0 },
-    "pnw":     { name: "Pacific Northwest",    latMin: 40.0, latMax: 52.0, lonMin: -131.0, lonMax: -111.0 },
-    "psw":     { name: "Pacific Southwest",    latMin: 28.0, latMax: 42.0, lonMin: -126.0, lonMax: -106.0 },
+    "CONUS": { name: "CONUS",                latMin: 23.5, latMax: 50.0, lonMin: -125.0, lonMax: -66.5 },
+    "ne":    { name: "Northeast",            latMin: 36.0, latMax: 50.0, lonMin: -82.0,  lonMax: -65.0 },
+    "eus":   { name: "U.S. Atlantic Coast",  latMin: 28.0, latMax: 47.0, lonMin: -85.0,  lonMax: -65.0 },
+    "se":    { name: "Southeast",            latMin: 26.0, latMax: 38.0, lonMin: -94.0,  lonMax: -75.0 },
+    "mex":   { name: "Mexico / Gulf",        latMin: 14.0, latMax: 33.0, lonMin: -118.0, lonMax: -86.0 },
+    "car":   { name: "Caribbean",            latMin: 10.0, latMax: 25.0, lonMin: -90.0,  lonMax: -60.0 },
+    "cgl":   { name: "Central Great Lakes",  latMin: 38.0, latMax: 50.0, lonMin: -94.0,  lonMax: -76.0 },
+    "umv":   { name: "Upper Mississippi",    latMin: 36.0, latMax: 49.0, lonMin: -99.5,  lonMax: -82.5 },
+    "smv":   { name: "Southern Mississippi", latMin: 28.0, latMax: 41.0, lonMin: -98.0,  lonMax: -82.0 },
+    "sp":    { name: "Southern Plains",      latMin: 26.5, latMax: 39.5, lonMin: -107.0, lonMax: -91.0 },
+    "nr":    { name: "Northern Rockies",     latMin: 38.0, latMax: 51.0, lonMin: -120.0, lonMax: -100.0 },
+    "sr":    { name: "Southern Rockies",     latMin: 27.0, latMax: 42.0, lonMin: -116.0, lonMax: -96.0 },
+    "pnw":   { name: "Pacific Northwest",    latMin: 40.0, latMax: 52.0, lonMin: -131.0, lonMax: -111.0 },
+    "psw":   { name: "Pacific Southwest",    latMin: 28.0, latMax: 42.0, lonMin: -126.0, lonMax: -106.0 },
 };
 
 function newCacheEntry() {
