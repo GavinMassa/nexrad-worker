@@ -1,4 +1,4 @@
-// rap.js — RAP mesoanalysis HTTP server (CAPE, CIN, 0-6km bulk shear, SRH, SigTor, SfcVort)
+// rap.js — RAP mesoanalysis HTTP server (CAPE, CIN, 0-6km bulk shear, 0-1km SRH, Fixed SigTor)
 //
 // Pipeline:
 //   1. Every 10 min, fetch the latest available RAP awp13f00.grib2 from NOMADS,
@@ -8,10 +8,9 @@
 //      lat/lon/value rows. Up to 8 workers run in parallel across the
 //      8-vCPU Railway instance.
 //   3. Compute derived fields:
-//      - shear:   0-6km bulk shear from |V500mb - V10m|
-//      - srh:     0-3km storm-relative helicity (HLCY, heightAboveGround=3000)
-//      - sigtor:  simplified STP = (CAPE/1500)×(0-3km SRH/150)×(BWD/20), each ∈[0,4]
-//      - sfcvort: 500mb absolute vorticity × 1e5 (s⁻¹ → ×10⁻⁵ s⁻¹)
+//      - shear:  0-6km bulk shear from |V500mb - V10m|
+//      - srh:    0-1km storm-relative helicity (HLCY, heightAboveGroundLayer level=1000)
+//      - sigtor: simplified STP = (CAPE/1500)×(0-1km SRH/150)×(BWD/20), each ∈[0,4]
 //   4. Cache fields in memory keyed by run time; serve via NDJSON endpoints.
 //
 // NOTE: deviates from the user's NDJSON spec by emitting a leading
@@ -19,13 +18,12 @@
 //   upload — the meta tells it (nx, ny, lat/lon bbox, valid_time).
 //
 // Endpoints:
-//   GET /rap/cape    → NDJSON: meta line + {lat,lon,value} rows + {type:"end"}
-//   GET /rap/cin     → same
-//   GET /rap/shear   → same
-//   GET /rap/srh     → same
-//   GET /rap/sigtor  → same
-//   GET /rap/sfcvort → same
-//   GET /healthz     → "ok"
+//   GET /rap/cape   → NDJSON: meta line + {lat,lon,value} rows + {type:"end"}
+//   GET /rap/cin    → same
+//   GET /rap/shear  → same
+//   GET /rap/srh    → same
+//   GET /rap/sigtor → same
+//   GET /healthz    → "ok"
 //
 // Deployment: Railway runtime image needs the eccodes binary on PATH. On a
 // Debian-based image:    apt-get install -y libeccodes-tools
@@ -41,7 +39,7 @@ const os    = require('os');
 const { Worker } = require('worker_threads');
 
 const PORT        = parseInt(process.env.PORT || '3000', 10);
-const NUM_WORKERS = 8;  // pool size; current refresh uses 9 tasks
+const NUM_WORKERS = 8;  // pool size; current refresh uses 7 tasks
 const REFRESH_MS  = 10 * 60 * 1000;
 const TMP_DIR     = path.join(os.tmpdir(), 'rap-cache');
 fs.mkdirSync(TMP_DIR, { recursive: true });
@@ -76,7 +74,7 @@ function newCacheEntry() {
         validTime: null,
         meta: null,
         cape: null, cin: null, shear: null,
-        srh: null, sigtor: null, sfcvort: null,
+        srh: null, sigtor: null,
         loading: false,
         lastError: null,
         lastAttempt: null,
@@ -110,7 +108,6 @@ function rapURLForHour(date, sector) {
         var_CIN: 'on',
         var_UGRD: 'on',
         var_VGRD: 'on',
-        var_ABSV: 'on',
         subregion: '',
         leftlon:   String(sector.lonMin),
         rightlon:  String(sector.lonMax),
@@ -238,48 +235,41 @@ async function refreshSector(sectorId) {
             return;
         }
 
-        // 9 parallel field extractions split across two GRIB2 files:
-        //   mainPath  — CAPE, CIN, winds, ABSV  (lev_surface/500mb/10m filters)
-        //   hlcyPath  — HLCY only               (no level filter; needed because
+        // 7 parallel field extractions split across two GRIB2 files:
+        //   mainPath  — CAPE, CIN, winds  (lev_surface/500mb/10m filters)
+        //   hlcyPath  — HLCY only         (no level filter; needed because
         //               heightAboveGroundLayer messages are silently dropped when
         //               any lev_* filter is active in the NOMADS request)
         const mainPath = downloaded.path;
         const hlcyPath = downloaded.hlcyPath;
         const tasks = [
-            { gribPath: mainPath, tag: 'cape',    candidates: [
+            { gribPath: mainPath, tag: 'cape',  candidates: [
                 { shortName: 'cape', typeOfLevel: 'surface', level: 0 },
             ]},
-            { gribPath: mainPath, tag: 'cin',     candidates: [
+            { gribPath: mainPath, tag: 'cin',   candidates: [
                 { shortName: 'cin',  typeOfLevel: 'surface', level: 0 },
             ]},
-            { gribPath: mainPath, tag: 'u500',    candidates: [
+            { gribPath: mainPath, tag: 'u500',  candidates: [
                 { shortName: 'u',    typeOfLevel: 'isobaricInhPa', level: 500 },
                 { shortName: 'UGRD', typeOfLevel: 'isobaricInhPa', level: 500 },
             ]},
-            { gribPath: mainPath, tag: 'v500',    candidates: [
+            { gribPath: mainPath, tag: 'v500',  candidates: [
                 { shortName: 'v',    typeOfLevel: 'isobaricInhPa', level: 500 },
                 { shortName: 'VGRD', typeOfLevel: 'isobaricInhPa', level: 500 },
             ]},
-            { gribPath: mainPath, tag: 'u10',     candidates: [
+            { gribPath: mainPath, tag: 'u10',   candidates: [
                 { shortName: '10u' },
                 { shortName: 'u',    typeOfLevel: 'heightAboveGround', level: 10 },
                 { shortName: 'UGRD', typeOfLevel: 'heightAboveGround', level: 10 },
             ]},
-            { gribPath: mainPath, tag: 'v10',     candidates: [
+            { gribPath: mainPath, tag: 'v10',   candidates: [
                 { shortName: '10v' },
                 { shortName: 'v',    typeOfLevel: 'heightAboveGround', level: 10 },
                 { shortName: 'VGRD', typeOfLevel: 'heightAboveGround', level: 10 },
             ]},
-            // SRH tasks read from the dedicated HLCY-only file.
-            { gribPath: hlcyPath, tag: 'srh3',   candidates: [
-                { shortName: 'hlcy', typeOfLevel: 'heightAboveGroundLayer', level: 3000 },
-            ]},
-            { gribPath: hlcyPath, tag: 'srh1',   candidates: [
+            // 0-1km SRH read from the dedicated HLCY-only file.
+            { gribPath: hlcyPath, tag: 'srh1',  candidates: [
                 { shortName: 'hlcy', typeOfLevel: 'heightAboveGroundLayer', level: 1000 },
-            ]},
-            // 500mb ABSV — included in mainPath via lev_500_mb filter.
-            { gribPath: mainPath, tag: 'absv500', candidates: [
-                { shortName: 'absv', typeOfLevel: 'isobaricInhPa', level: 500 },
             ]},
         ];
         const results = await Promise.all(tasks.map(t =>
@@ -307,12 +297,11 @@ async function refreshSector(sectorId) {
             shearPts[i] = { lat: u500[i].lat, lon: u500[i].lon, value: Math.sqrt(du * du + dv * dv) };
         }
 
-        // SRH: 0-3km storm-relative helicity, m²/s² (raw from eccodes, no scaling).
-        const srhPts = byTag.srh3;
+        // SRH: 0-1km storm-relative helicity, m²/s² (raw from eccodes, no scaling).
+        const srhPts = byTag.srh1;
 
         // Significant Tornado Parameter (simplified):
-        //   STP = clamp(CAPE/1500,0,4) × clamp(SRH1km/150,0,4) × clamp(BWD/20,0,4)
-        // 0-1km SRH IS available in awp130 (heightAboveGroundLayer, topLevel=1000).
+        //   STP = clamp(CAPE/1500,0,4) × clamp(0-1km SRH/150,0,4) × clamp(BWD/20,0,4)
         const capePts = byTag.cape;
         const srh1Pts = byTag.srh1;
         const nSig = Math.min(capePts.length, srh1Pts.length, shearPts.length);
@@ -324,11 +313,6 @@ async function refreshSector(sectorId) {
             sigtorPts[i]  = { lat: capePts[i].lat, lon: capePts[i].lon, value: capeFac * srhFac * bwdFac };
         }
 
-        // 500mb absolute vorticity × 1e5 (s⁻¹ → ×10⁻⁵ s⁻¹).
-        // awp130 carries ABSV at 500mb only; 1000mb ABSV is absent from this product.
-        const absvPts = byTag.absv500;
-        const sfcvortPts = absvPts.map(p => ({ lat: p.lat, lon: p.lon, value: p.value * 1e5 }));
-
         const meta = inferGridMeta(byTag.cape);
         cache.validTime = downloaded.date.toISOString();
         cache.meta      = meta;
@@ -337,8 +321,7 @@ async function refreshSector(sectorId) {
         cache.shear     = shearPts;
         cache.srh       = srhPts;
         cache.sigtor    = sigtorPts;
-        cache.sfcvort   = sfcvortPts;
-        console.log(`[rap:${sectorId}] cache refreshed validTime=${cache.validTime} nx=${meta && meta.nx} ny=${meta && meta.ny} cape=${cache.cape.length} cin=${cache.cin.length} shear=${cache.shear.length} srh=${cache.srh.length} sigtor=${cache.sigtor.length} sfcvort=${cache.sfcvort.length}`);
+        console.log(`[rap:${sectorId}] cache refreshed validTime=${cache.validTime} nx=${meta && meta.nx} ny=${meta && meta.ny} cape=${cache.cape.length} cin=${cache.cin.length} shear=${cache.shear.length} srh=${cache.srh.length} sigtor=${cache.sigtor.length}`);
         cache.lastError = null;
     } catch (e) {
         cache.lastError = e.message;
@@ -401,9 +384,11 @@ function streamParam(res, param, sectorId) {
 // router can fall through to its own routes).
 //
 // Recognized paths (with or without a `/rap` prefix):
-//   /rap/cape   /cape
-//   /rap/cin    /cin
-//   /rap/shear  /shear
+//   /rap/cape    /cape
+//   /rap/cin     /cin
+//   /rap/shear   /shear
+//   /rap/srh     /srh
+//   /rap/sigtor  /sigtor
 function handle(req, res) {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     let p = url.pathname;
@@ -412,9 +397,8 @@ function handle(req, res) {
     if (p === '/cape')    { streamParam(res, 'cape',    sectorId); return true; }
     if (p === '/cin')     { streamParam(res, 'cin',     sectorId); return true; }
     if (p === '/shear')   { streamParam(res, 'shear',   sectorId); return true; }
-    if (p === '/srh')     { streamParam(res, 'srh',     sectorId); return true; }
-    if (p === '/sigtor')  { streamParam(res, 'sigtor',  sectorId); return true; }
-    if (p === '/sfcvort') { streamParam(res, 'sfcvort', sectorId); return true; }
+    if (p === '/srh')     { streamParam(res, 'srh',    sectorId); return true; }
+    if (p === '/sigtor')  { streamParam(res, 'sigtor', sectorId); return true; }
     if (p === '/status') {
         // Per-sector status. Defaults to the one in ?sector= or all-sectors summary.
         const onlyId = url.searchParams.get('sector');
@@ -430,12 +414,11 @@ function handle(req, res) {
                 lastError: c.lastError || null,
                 refreshCount: c.refreshCount || 0,
                 counts: {
-                    cape:    c.cape    ? c.cape.length    : 0,
-                    cin:     c.cin     ? c.cin.length     : 0,
-                    shear:   c.shear   ? c.shear.length   : 0,
-                    srh:     c.srh     ? c.srh.length     : 0,
-                    sigtor:  c.sigtor  ? c.sigtor.length  : 0,
-                    sfcvort: c.sfcvort ? c.sfcvort.length : 0,
+                    cape:   c.cape   ? c.cape.length   : 0,
+                    cin:    c.cin    ? c.cin.length    : 0,
+                    shear:  c.shear  ? c.shear.length  : 0,
+                    srh:    c.srh    ? c.srh.length    : 0,
+                    sigtor: c.sigtor ? c.sigtor.length : 0,
                 },
             };
         }
