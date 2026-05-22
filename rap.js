@@ -1,4 +1,4 @@
-// rap.js — RAP mesoanalysis HTTP server (CAPE, CIN, 0-6km bulk shear)
+// rap.js — RAP mesoanalysis HTTP server (CAPE, CIN, 0-6km bulk shear, SRH, SigTor, SfcVort)
 //
 // Pipeline:
 //   1. Every 10 min, fetch the latest available RAP awp13f00.grib2 from NOMADS,
@@ -7,7 +7,11 @@
 //      combo — that shell out to `grib_get_data` (eccodes CLI) and parse the
 //      lat/lon/value rows. Up to 8 workers run in parallel across the
 //      8-vCPU Railway instance.
-//   3. Compute 0-6km bulk shear from |V500mb - V10m|.
+//   3. Compute derived fields:
+//      - shear:   0-6km bulk shear from |V500mb - V10m|
+//      - srh:     0-3km storm-relative helicity (HLCY, heightAboveGround=3000)
+//      - sigtor:  simplified STP = (CAPE/1500)×(0-1km SRH/150)×(BWD/20), each ∈[0,4]
+//      - sfcvort: 1000mb absolute vorticity × 1e5 (s⁻¹ → ×10⁻⁵ s⁻¹)
 //   4. Cache fields in memory keyed by run time; serve via NDJSON endpoints.
 //
 // NOTE: deviates from the user's NDJSON spec by emitting a leading
@@ -15,10 +19,13 @@
 //   upload — the meta tells it (nx, ny, lat/lon bbox, valid_time).
 //
 // Endpoints:
-//   GET /rap/cape   → NDJSON: meta line + {lat,lon,value} rows + {type:"end"}
-//   GET /rap/cin    → same
-//   GET /rap/shear  → same
-//   GET /healthz    → "ok"
+//   GET /rap/cape    → NDJSON: meta line + {lat,lon,value} rows + {type:"end"}
+//   GET /rap/cin     → same
+//   GET /rap/shear   → same
+//   GET /rap/srh     → same
+//   GET /rap/sigtor  → same
+//   GET /rap/sfcvort → same
+//   GET /healthz     → "ok"
 //
 // Deployment: Railway runtime image needs the eccodes binary on PATH. On a
 // Debian-based image:    apt-get install -y libeccodes-tools
@@ -34,7 +41,7 @@ const os    = require('os');
 const { Worker } = require('worker_threads');
 
 const PORT        = parseInt(process.env.PORT || '3000', 10);
-const NUM_WORKERS = 8;  // pool size; current refresh uses 6 of them per cycle
+const NUM_WORKERS = 8;  // pool size; current refresh uses 9 tasks (runs in two batches)
 const REFRESH_MS  = 10 * 60 * 1000;
 const TMP_DIR     = path.join(os.tmpdir(), 'rap-cache');
 fs.mkdirSync(TMP_DIR, { recursive: true });
@@ -69,6 +76,7 @@ function newCacheEntry() {
         validTime: null,
         meta: null,
         cape: null, cin: null, shear: null,
+        srh: null, sigtor: null, sfcvort: null,
         loading: false,
         lastError: null,
         lastAttempt: null,
@@ -91,11 +99,16 @@ function rapURLForHour(date, sector) {
         file: `rap.t${hh}z.awp130pgrbf00.grib2`,
         lev_surface: 'on',
         lev_500_mb: 'on',
+        lev_1000_mb: 'on',
         lev_10_m_above_ground: 'on',
+        'lev_0-1000_m_above_ground': 'on',
+        'lev_0-3000_m_above_ground': 'on',
         var_CAPE: 'on',
         var_CIN: 'on',
         var_UGRD: 'on',
         var_VGRD: 'on',
+        var_HLCY: 'on',
+        var_ABSV: 'on',
         subregion: '',
         leftlon:   String(sector.lonMin),
         rightlon:  String(sector.lonMax),
@@ -198,34 +211,48 @@ async function refreshSector(sectorId) {
             return;
         }
 
-        // 6 parallel field extractions. Each task provides multiple `candidates`
+        // 9 parallel field extractions. Each task provides multiple `candidates`
         // — the worker tries them in order until one matches a real GRIB2 message.
         // RAP eccodes tables vary: 10m winds may be `10u`/`10v` directly, or `u`/`v`
         // with typeOfLevel=heightAboveGround, depending on the eccodes version.
         const tasks = [
-            { tag: 'cape',  candidates: [
+            { tag: 'cape',     candidates: [
                 { shortName: 'cape',   typeOfLevel: 'surface', level: 0 },
             ]},
-            { tag: 'cin',   candidates: [
+            { tag: 'cin',      candidates: [
                 { shortName: 'cin',    typeOfLevel: 'surface', level: 0 },
             ]},
-            { tag: 'u500',  candidates: [
+            { tag: 'u500',     candidates: [
                 { shortName: 'u',      typeOfLevel: 'isobaricInhPa', level: 500 },
                 { shortName: 'UGRD',   typeOfLevel: 'isobaricInhPa', level: 500 },
             ]},
-            { tag: 'v500',  candidates: [
+            { tag: 'v500',     candidates: [
                 { shortName: 'v',      typeOfLevel: 'isobaricInhPa', level: 500 },
                 { shortName: 'VGRD',   typeOfLevel: 'isobaricInhPa', level: 500 },
             ]},
-            { tag: 'u10',   candidates: [
+            { tag: 'u10',      candidates: [
                 { shortName: '10u' },
                 { shortName: 'u',      typeOfLevel: 'heightAboveGround', level: 10 },
                 { shortName: 'UGRD',   typeOfLevel: 'heightAboveGround', level: 10 },
             ]},
-            { tag: 'v10',   candidates: [
+            { tag: 'v10',      candidates: [
                 { shortName: '10v' },
                 { shortName: 'v',      typeOfLevel: 'heightAboveGround', level: 10 },
                 { shortName: 'VGRD',   typeOfLevel: 'heightAboveGround', level: 10 },
+            ]},
+            // 0-3km SRH (for display) and 0-1km SRH (for SigTor)
+            { tag: 'srh3',     candidates: [
+                { shortName: 'hlcy',   typeOfLevel: 'heightAboveGround', level: 3000 },
+                { shortName: 'HLCY',   typeOfLevel: 'heightAboveGround', level: 3000 },
+            ]},
+            { tag: 'srh1',     candidates: [
+                { shortName: 'hlcy',   typeOfLevel: 'heightAboveGround', level: 1000 },
+                { shortName: 'HLCY',   typeOfLevel: 'heightAboveGround', level: 1000 },
+            ]},
+            // 1000mb absolute vorticity for surface vorticity display
+            { tag: 'absv1000', candidates: [
+                { shortName: 'absv',   typeOfLevel: 'isobaricInhPa', level: 1000 },
+                { shortName: 'ABSV',   typeOfLevel: 'isobaricInhPa', level: 1000 },
             ]},
         ];
         const results = await Promise.all(tasks.map(t =>
@@ -245,13 +272,34 @@ async function refreshSector(sectorId) {
         // so index-aligned subtraction is safe.
         const u500 = byTag.u500, v500 = byTag.v500;
         const u10  = byTag.u10,  v10  = byTag.v10;
-        const n = Math.min(u500.length, v500.length, u10.length, v10.length);
-        const shearPts = new Array(n);
-        for (let i = 0; i < n; i++) {
+        const nShear = Math.min(u500.length, v500.length, u10.length, v10.length);
+        const shearPts = new Array(nShear);
+        for (let i = 0; i < nShear; i++) {
             const du = u500[i].value - u10[i].value;
             const dv = v500[i].value - v10[i].value;
             shearPts[i] = { lat: u500[i].lat, lon: u500[i].lon, value: Math.sqrt(du * du + dv * dv) };
         }
+
+        // SRH: 0-3km storm-relative helicity, m²/s² (raw from eccodes).
+        const srhPts = byTag.srh3;
+
+        // Simplified Significant Tornado Parameter (STP):
+        //   STP = clamp(CAPE/1500,0,4) × clamp(SRH1km/150,0,4) × clamp(BWD/20,0,4)
+        // Uses 0-1km SRH (srh1) and 0-6km BWD (shear). Grid-aligned via index.
+        const capePts  = byTag.cape;
+        const srh1Pts  = byTag.srh1;
+        const nSig = Math.min(capePts.length, srh1Pts.length, shearPts.length);
+        const sigtorPts = new Array(nSig);
+        for (let i = 0; i < nSig; i++) {
+            const capeFac = Math.min(Math.max(capePts[i].value / 1500, 0), 4);
+            const srhFac  = Math.min(Math.max(srh1Pts[i].value / 150,  0), 4);
+            const bwdFac  = Math.min(Math.max(shearPts[i].value / 20,  0), 4);
+            sigtorPts[i]  = { lat: capePts[i].lat, lon: capePts[i].lon, value: capeFac * srhFac * bwdFac };
+        }
+
+        // Surface vorticity: 1000mb absolute vorticity × 1e5 (s⁻¹ → ×10⁻⁵ s⁻¹).
+        const absvPts = byTag.absv1000;
+        const sfcvortPts = absvPts.map(p => ({ lat: p.lat, lon: p.lon, value: p.value * 1e5 }));
 
         const meta = inferGridMeta(byTag.cape);
         cache.validTime = downloaded.date.toISOString();
@@ -259,7 +307,10 @@ async function refreshSector(sectorId) {
         cache.cape      = byTag.cape;
         cache.cin       = byTag.cin;
         cache.shear     = shearPts;
-        console.log(`[rap:${sectorId}] cache refreshed validTime=${cache.validTime} nx=${meta && meta.nx} ny=${meta && meta.ny} cape=${cache.cape.length} cin=${cache.cin.length} shear=${cache.shear.length}`);
+        cache.srh       = srhPts;
+        cache.sigtor    = sigtorPts;
+        cache.sfcvort   = sfcvortPts;
+        console.log(`[rap:${sectorId}] cache refreshed validTime=${cache.validTime} nx=${meta && meta.nx} ny=${meta && meta.ny} cape=${cache.cape.length} cin=${cache.cin.length} shear=${cache.shear.length} srh=${cache.srh.length} sigtor=${cache.sigtor.length} sfcvort=${cache.sfcvort.length}`);
         cache.lastError = null;
     } catch (e) {
         cache.lastError = e.message;
@@ -330,9 +381,12 @@ function handle(req, res) {
     let p = url.pathname;
     if (p.startsWith('/rap')) p = p.slice(4) || '/';
     const sectorId = url.searchParams.get('sector') || 'CONUS';
-    if (p === '/cape')  { streamParam(res, 'cape',  sectorId); return true; }
-    if (p === '/cin')   { streamParam(res, 'cin',   sectorId); return true; }
-    if (p === '/shear') { streamParam(res, 'shear', sectorId); return true; }
+    if (p === '/cape')    { streamParam(res, 'cape',    sectorId); return true; }
+    if (p === '/cin')     { streamParam(res, 'cin',     sectorId); return true; }
+    if (p === '/shear')   { streamParam(res, 'shear',   sectorId); return true; }
+    if (p === '/srh')     { streamParam(res, 'srh',     sectorId); return true; }
+    if (p === '/sigtor')  { streamParam(res, 'sigtor',  sectorId); return true; }
+    if (p === '/sfcvort') { streamParam(res, 'sfcvort', sectorId); return true; }
     if (p === '/status') {
         // Per-sector status. Defaults to the one in ?sector= or all-sectors summary.
         const onlyId = url.searchParams.get('sector');
@@ -348,9 +402,12 @@ function handle(req, res) {
                 lastError: c.lastError || null,
                 refreshCount: c.refreshCount || 0,
                 counts: {
-                    cape:  c.cape  ? c.cape.length  : 0,
-                    cin:   c.cin   ? c.cin.length   : 0,
-                    shear: c.shear ? c.shear.length : 0,
+                    cape:    c.cape    ? c.cape.length    : 0,
+                    cin:     c.cin     ? c.cin.length     : 0,
+                    shear:   c.shear   ? c.shear.length   : 0,
+                    srh:     c.srh     ? c.srh.length     : 0,
+                    sigtor:  c.sigtor  ? c.sigtor.length  : 0,
+                    sfcvort: c.sfcvort ? c.sfcvort.length : 0,
                 },
             };
         }
