@@ -11,7 +11,7 @@
 //      - shear:   0-6km bulk shear from |V500mb - V10m|
 //      - srh:     0-3km storm-relative helicity (HLCY, heightAboveGround=3000)
 //      - sigtor:  simplified STP = (CAPE/1500)×(0-3km SRH/150)×(BWD/20), each ∈[0,4]
-//      - sfcvort: 1000mb absolute vorticity × 1e5 (s⁻¹ → ×10⁻⁵ s⁻¹)
+//      - sfcvort: 500mb absolute vorticity × 1e5 (s⁻¹ → ×10⁻⁵ s⁻¹)
 //   4. Cache fields in memory keyed by run time; serve via NDJSON endpoints.
 //
 // NOTE: deviates from the user's NDJSON spec by emitting a leading
@@ -41,7 +41,7 @@ const os    = require('os');
 const { Worker } = require('worker_threads');
 
 const PORT        = parseInt(process.env.PORT || '3000', 10);
-const NUM_WORKERS = 8;  // pool size; current refresh uses 8 tasks
+const NUM_WORKERS = 8;  // pool size; current refresh uses 9 tasks
 const REFRESH_MS  = 10 * 60 * 1000;
 const TMP_DIR     = path.join(os.tmpdir(), 'rap-cache');
 fs.mkdirSync(TMP_DIR, { recursive: true });
@@ -99,9 +99,12 @@ function rapURLForHour(date, sector) {
         file: `rap.t${hh}z.awp130pgrbf00.grib2`,
         lev_surface: 'on',
         lev_500_mb: 'on',
-        lev_1000_mb: 'on',
         lev_10_m_above_ground: 'on',
-        'lev_0-3000_m_above_ground': 'on',
+        // NOTE: HLCY is encoded as heightAboveGroundLayer in GRIB2.
+        // NOMADS level filters (lev_0-3000_m_above_ground etc.) return 0 bytes
+        // for layer-type fields — so we request var_HLCY with NO level filter
+        // and extract the correct layer in the worker via typeOfLevel+level.
+        // ABSV only exists at 500 mb in awp130 (lev_500_mb already requested).
         var_CAPE: 'on',
         var_CIN: 'on',
         var_UGRD: 'on',
@@ -239,27 +242,19 @@ async function refreshSector(sectorId) {
                 { shortName: 'v',      typeOfLevel: 'heightAboveGround', level: 10 },
                 { shortName: 'VGRD',   typeOfLevel: 'heightAboveGround', level: 10 },
             ]},
-            // 0-3km SRH (for display and as SigTor input; 0-1km not in awp130).
-            // HLCY in GRIB2 is encoded as a layer (0–3000 m), so eccodes exposes
-            // it with typeOfLevel=heightAboveGroundLayer, not heightAboveGround.
-            // The `level` key is the TOP of the layer (3000) in most eccodes builds;
-            // some older builds report the BOTTOM (0) — try both.
-            { tag: 'srh3',     candidates: [
-                { shortName: 'hlcy',   typeOfLevel: 'heightAboveGroundLayer', level: 3000 },
-                { shortName: 'HLCY',   typeOfLevel: 'heightAboveGroundLayer', level: 3000 },
-                { shortName: 'hlcy',   typeOfLevel: 'heightAboveGroundLayer', level: 0 },
-                { shortName: 'HLCY',   typeOfLevel: 'heightAboveGroundLayer', level: 0 },
-                // Fallback: single-level form (older RAP GRIB2 tables)
-                { shortName: 'hlcy',   typeOfLevel: 'heightAboveGround', level: 3000 },
-                { shortName: 'HLCY',   typeOfLevel: 'heightAboveGround', level: 3000 },
+            // 0-3km SRH for display. HLCY is encoded as heightAboveGroundLayer
+            // in GRIB2; the `level` key in eccodes = topLevel = 3000 for 0-3km.
+            { tag: 'srh3',    candidates: [
+                { shortName: 'hlcy', typeOfLevel: 'heightAboveGroundLayer', level: 3000 },
             ]},
-            // 1000mb absolute vorticity for surface vorticity display.
-            // Some eccodes builds list ABSV as `absv` (lowercase) or `ABSV`.
-            { tag: 'absv1000', candidates: [
-                { shortName: 'absv',   typeOfLevel: 'isobaricInhPa', level: 1000 },
-                { shortName: 'ABSV',   typeOfLevel: 'isobaricInhPa', level: 1000 },
-                { shortName: 'absv',   typeOfLevel: 'isobaricInHPa', level: 1000 },
-                { shortName: 'ABSV',   typeOfLevel: 'isobaricInHPa', level: 1000 },
+            // 0-1km SRH for SigTor formula. topLevel=1000 in the same layer type.
+            { tag: 'srh1',    candidates: [
+                { shortName: 'hlcy', typeOfLevel: 'heightAboveGroundLayer', level: 1000 },
+            ]},
+            // 500mb absolute vorticity (ABSV only exists at 500mb in awp130;
+            // 1000mb ABSV is not present). Multiply ×1e5 → ×10⁻⁵ s⁻¹ for display.
+            { tag: 'absv500', candidates: [
+                { shortName: 'absv', typeOfLevel: 'isobaricInhPa', level: 500 },
             ]},
         ];
         const results = await Promise.all(tasks.map(t =>
@@ -287,26 +282,26 @@ async function refreshSector(sectorId) {
             shearPts[i] = { lat: u500[i].lat, lon: u500[i].lon, value: Math.sqrt(du * du + dv * dv) };
         }
 
-        // SRH: 0-3km storm-relative helicity, m²/s² (raw from eccodes).
+        // SRH: 0-3km storm-relative helicity, m²/s² (raw from eccodes, no scaling).
         const srhPts = byTag.srh3;
 
-        // Simplified Significant Tornado Parameter (STP):
-        //   STP = clamp(CAPE/1500,0,4) × clamp(SRH3km/150,0,4) × clamp(BWD/20,0,4)
-        // awp130 does not carry a 0-1km HLCY level, so we use 0-3km SRH / 150
-        // (a well-accepted alternative used when 0-1km is unavailable).
-        const capePts  = byTag.cape;
-        const srh3Pts  = byTag.srh3;
-        const nSig = Math.min(capePts.length, srh3Pts.length, shearPts.length);
+        // Significant Tornado Parameter (simplified):
+        //   STP = clamp(CAPE/1500,0,4) × clamp(SRH1km/150,0,4) × clamp(BWD/20,0,4)
+        // 0-1km SRH IS available in awp130 (heightAboveGroundLayer, topLevel=1000).
+        const capePts = byTag.cape;
+        const srh1Pts = byTag.srh1;
+        const nSig = Math.min(capePts.length, srh1Pts.length, shearPts.length);
         const sigtorPts = new Array(nSig);
         for (let i = 0; i < nSig; i++) {
             const capeFac = Math.min(Math.max(capePts[i].value / 1500, 0), 4);
-            const srhFac  = Math.min(Math.max(srh3Pts[i].value / 150,  0), 4);
+            const srhFac  = Math.min(Math.max(srh1Pts[i].value / 150,  0), 4);
             const bwdFac  = Math.min(Math.max(shearPts[i].value / 20,  0), 4);
             sigtorPts[i]  = { lat: capePts[i].lat, lon: capePts[i].lon, value: capeFac * srhFac * bwdFac };
         }
 
-        // Surface vorticity: 1000mb absolute vorticity × 1e5 (s⁻¹ → ×10⁻⁵ s⁻¹).
-        const absvPts = byTag.absv1000;
+        // 500mb absolute vorticity × 1e5 (s⁻¹ → ×10⁻⁵ s⁻¹).
+        // awp130 carries ABSV at 500mb only; 1000mb ABSV is absent from this product.
+        const absvPts = byTag.absv500;
         const sfcvortPts = absvPts.map(p => ({ lat: p.lat, lon: p.lon, value: p.value * 1e5 }));
 
         const meta = inferGridMeta(byTag.cape);
