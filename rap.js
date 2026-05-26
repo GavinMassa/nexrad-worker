@@ -506,7 +506,7 @@ async function refresh() {
 // Mounted by server.js via: rap.handle(req, res)
 // Strips leading '/rap' so internally routes are /all, /status, etc.
 
-function handle(req, res) {
+async function handle(req, res) {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     let p = url.pathname;
     if (p.startsWith('/rap')) p = p.slice(4) || '/';
