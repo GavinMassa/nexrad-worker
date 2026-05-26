@@ -153,7 +153,11 @@ function downloadToFile(url, destPath, depth = 0) {
  */
 function runWgrib2(gribPath, fields, stamp) {
     const binPaths = {};
-    const args = [gribPath];
+    // -order we:ns  — reorder output north-to-south before writing binary.
+    // RAP GRIB2 (awp130p) stores data south-to-north (row 0 = lat_min).
+    // The iOS Metal renderer expects row 0 = lat_max (northernmost), so we
+    // fix the scan order here rather than flipping on the client.
+    const args = [gribPath, '-order', 'we:ns'];
     for (const f of fields) {
         const bp = path.join(TMP_DIR, `${f.tag}_${stamp}.bin`);
         binPaths[f.tag] = bp;
