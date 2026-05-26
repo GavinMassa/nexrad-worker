@@ -1,6 +1,8 @@
 import logging
+import os
 import numpy as np
 import httpx
+import psutil
 from scipy.spatial import KDTree
 
 log = logging.getLogger(__name__)
@@ -175,6 +177,12 @@ def inject_observations(
     Called in main.py between fetch_rtma() and blend().
     Mesonet failure must never crash the cycle — the caller wraps this in try/except.
     """
+    ny, nx = rtma['t2m'].shape
+    log.info(f'[mesonet] inject_observations called with grid {ny}×{nx}')
+    assert ny < 500 and nx < 700, (
+        f'Grid too large for mesonet injection: {ny}×{nx} — must be downsampled first'
+    )
+
     if not stations:
         log.info('[mesonet] no stations — skipping injection, using raw RTMA')
         return rtma
@@ -205,6 +213,8 @@ def inject_observations(
     st_lons = np.array([s['lon'] for s in stations_conus], dtype=np.float32)
 
     # Nearest RTMA gridpoint value at each station (KDTree — O(n log N) vs O(n·N))
+    mem = psutil.Process(os.getpid()).memory_info().rss / 1e9
+    log.info(f'[mesonet] memory before KDTree: {mem:.2f} GB')
     log.info(f'[mesonet] KDTree lookup for {len(stations_conus)} stations on '
              f'{t2m.shape[0]}×{t2m.shape[1]} grid...')
     st_rtma_t, st_rtma_td = _nearest_rtma_values(
