@@ -589,7 +589,7 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
 
-  // Mounted RAP mesoanalysis router — handles /rap/cape, /rap/cin, /rap/shear.
+  // Mounted RAP mesoanalysis router — handles /rap/all, /rap/status.
   // If it returns true the request is fully handled; otherwise fall through.
   if (path.startsWith('/rap/') && rap.handle(req, res)) return;
 

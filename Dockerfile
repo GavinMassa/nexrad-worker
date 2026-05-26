@@ -1,20 +1,17 @@
-# Railway build — explicit Dockerfile because Nixpacks `aptPkgs` didn't get
-# `libeccodes-tools` (and therefore `grib_get_data`) onto the runtime PATH.
+# Railway build — explicit Dockerfile to guarantee wgrib2 is on the runtime PATH.
 #
-# Base image: official Node 20 on Debian bookworm-slim. `libeccodes-tools`
-# installs `grib_get_data` into /usr/bin which is on PATH for every layer.
+# Base image: official Node 20 on Debian bookworm-slim.
+# wgrib2 (from the Debian 12 main repo) is installed into /usr/bin.
 
 FROM node:20-bookworm-slim
 
 # System packages:
-#   - libeccodes-tools : grib_get_data CLI used by rap-worker.js
-#   - python3          : reserved for future Python parsers
-#   - ca-certificates  : for https fetches to NOMADS / IEM
-#   - curl             : occasionally useful for debugging from `railway run`
+#   wgrib2          — single-pass GRIB2 field extraction replacing eccodes workers
+#   ca-certificates — for HTTPS fetches to NOMADS
+#   curl            — useful for debugging from `railway run`
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        libeccodes-tools \
-        python3 \
+        wgrib2 \
         ca-certificates \
         curl \
  && rm -rf /var/lib/apt/lists/*

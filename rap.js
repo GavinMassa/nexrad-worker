@@ -1,33 +1,32 @@
-// rap.js — RAP mesoanalysis HTTP server (CAPE, CIN, 0-6km bulk shear, 0-1km SRH, Fixed SigTor)
+// rap.js — RAP mesoanalysis HTTP server (wgrib2 backend)
 //
-// Pipeline:
-//   1. Every 10 min, fetch the latest available RAP awp13f00.grib2 from NOMADS,
-//      using the filter_rap.pl subregion filter to keep the download ~15 MB.
-//   2. Spawn worker_threads (./rap-worker.js) — one per (shortName, level)
-//      combo — that shell out to `grib_get_data` (eccodes CLI) and parse the
-//      lat/lon/value rows. Up to 8 workers run in parallel across the
-//      8-vCPU Railway instance.
-//   3. Compute derived fields:
-//      - shear:  0-6km bulk shear from |V500mb - V10m|
-//      - srh:    0-1km storm-relative helicity (HLCY, heightAboveGroundLayer level=1000)
-//      - sigtor: simplified STP = (CAPE/1500)×(0-1km SRH/150)×(BWD/20), each ∈[0,4]
-//   4. Cache fields in memory keyed by run time; serve via NDJSON endpoints.
+// Pipeline (per 10-min refresh cycle):
+//   1. HEAD-check both NOMADS GRIB2 URLs; skip cycle if Last-Modified unchanged.
+//   2. Concurrently download two filtered GRIB2s from NOMADS filter_rap.pl:
+//        main  — CAPE, CIN, T2m, Td2m, UGRD/VGRD at 500mb / 10m / 0-6km layer
+//        hlcy  — HLCY only (no lev_* filter; NOMADS silently drops
+//                heightAboveGroundLayer messages when any lev_* is active)
+//   3. Single wgrib2 pass per file extracts all needed fields into flat
+//      Float32 .bin files (-if/-fi conditional blocks, one file scan each).
+//   4. Derive in the main thread:
+//        shear = 0-6km BWD; falls back to 500mb–10m if layer missing
+//        lcl   = 125 × (T2m_K – Td2m_K)  meters AGL  [Bolton 1980]
+//        stp   = (CAPE/1500) × lcl_term × (SRH/150) × min(1.5, BWD/10.288)
+//                [Thompson et al. 2003 fixed-layer STP]
+//   5. Serve GET /rap/all — binary response: five concatenated Float32 CONUS
+//      grids (cape, cin, shear, srh, stp), metadata in X-Meso-Meta header.
 //
-// NOTE: deviates from the user's NDJSON spec by emitting a leading
-//   {type:"meta", ...} line. Without it iOS can't size a single MTLTexture
-//   upload — the meta tells it (nx, ny, lat/lon bbox, valid_time).
+// Grid: awip32f00.grib2 — CONUS Lambert Conformal, NX=451 × NY=337 row-major.
 //
 // Endpoints:
-//   GET /rap/cape   → NDJSON: meta line + {lat,lon,value} rows + {type:"end"}
-//   GET /rap/cin    → same
-//   GET /rap/shear  → same
-//   GET /rap/srh    → same
-//   GET /rap/sigtor → same
-//   GET /healthz    → "ok"
+//   GET /rap/all    → octet-stream body: [cape][cin][shear][srh][stp] Float32
+//                     X-Meso-Meta: JSON {nx,ny,bbox,valid_time,params,...}
+//   GET /rap/status → JSON diagnostics
+//   GET /healthz    → "ok"   (handled by server.js, not this module)
 //
-// Deployment: Railway runtime image needs the eccodes binary on PATH. On a
-// Debian-based image:    apt-get install -y libeccodes-tools
-// Run with:              node rap.js
+// Deployment: Dockerfile must have `wgrib2` on PATH:
+//   apt-get install -y wgrib2
+// libeccodes-tools / grib_get_data are no longer required.
 
 'use strict';
 
@@ -36,425 +35,528 @@ const https = require('https');
 const fs    = require('fs');
 const path  = require('path');
 const os    = require('os');
-const { Worker } = require('worker_threads');
+const { spawn } = require('child_process');
 
-const PORT        = parseInt(process.env.PORT || '3000', 10);
-const NUM_WORKERS = 8;  // pool size; current refresh uses 7 tasks
-const REFRESH_MS  = 10 * 60 * 1000;
-const TMP_DIR     = path.join(os.tmpdir(), 'rap-cache');
+// ── Constants ────────────────────────────────────────────────────────────────
+
+const PORT       = parseInt(process.env.PORT || '3000', 10);
+const REFRESH_MS = 10 * 60 * 1000;
+const TMP_DIR    = path.join(os.tmpdir(), 'rap-cache');
 fs.mkdirSync(TMP_DIR, { recursive: true });
 
-// Sector definitions. The `id` matches the iOS RAPSector.id values; the bbox
-// is passed straight into the NOMADS filter_rap.pl subregion params so each
-// sector downloads only the GRIB2 bytes inside its window — small sectors
-// shrink the per-sector fetch + parse dramatically.
-// Sector IDs and bboxes match the real NESDIS GOES-East ABI sub-sector
-// definitions used by NOAA STAR (https://www.star.nesdis.noaa.gov/GOES/).
-// The iOS client sends ?sector=<id> from the same list so RAP data is
-// clipped to the exact bbox of the satellite imagery displayed alongside it.
-const SECTORS = {
-    "CONUS": { name: "CONUS",                latMin: 23.5, latMax: 50.0, lonMin: -125.0, lonMax: -66.5 },
-    "ne":    { name: "Northeast",            latMin: 36.0, latMax: 50.0, lonMin: -82.0,  lonMax: -65.0 },
-    "eus":   { name: "U.S. Atlantic Coast",  latMin: 28.0, latMax: 47.0, lonMin: -85.0,  lonMax: -65.0 },
-    "se":    { name: "Southeast",            latMin: 26.0, latMax: 38.0, lonMin: -94.0,  lonMax: -75.0 },
-    "mex":   { name: "Mexico / Gulf",        latMin: 14.0, latMax: 33.0, lonMin: -118.0, lonMax: -86.0 },
-    "car":   { name: "Caribbean",            latMin: 10.0, latMax: 25.0, lonMin: -90.0,  lonMax: -60.0 },
-    "cgl":   { name: "Central Great Lakes",  latMin: 38.0, latMax: 50.0, lonMin: -94.0,  lonMax: -76.0 },
-    "umv":   { name: "Upper Mississippi",    latMin: 36.0, latMax: 49.0, lonMin: -99.5,  lonMax: -82.5 },
-    "smv":   { name: "Southern Mississippi", latMin: 28.0, latMax: 41.0, lonMin: -98.0,  lonMax: -82.0 },
-    "sp":    { name: "Southern Plains",      latMin: 26.5, latMax: 39.5, lonMin: -107.0, lonMax: -91.0 },
-    "nr":    { name: "Northern Rockies",     latMin: 38.0, latMax: 51.0, lonMin: -120.0, lonMax: -100.0 },
-    "sr":    { name: "Southern Rockies",     latMin: 27.0, latMax: 42.0, lonMin: -116.0, lonMax: -96.0 },
-    "pnw":   { name: "Pacific Northwest",    latMin: 40.0, latMax: 52.0, lonMin: -131.0, lonMax: -111.0 },
-    "psw":   { name: "Pacific Southwest",    latMin: 28.0, latMax: 42.0, lonMin: -126.0, lonMax: -106.0 },
+// Fixed CONUS grid for awip32f00.grib2 (RAP 13km Lambert Conformal).
+// 337 rows × 451 cols, row-major scan.
+const NX = 451;
+const NY = 337;
+
+// Approximate corner lat/lons for the awip32 CONUS Lambert Conformal domain.
+// Used by iOS to position the Metal overlay.  Refined from operational RAP
+// grid spec; adjust if pixel offsets look wrong.
+const LAT_MIN = 21.14;
+const LAT_MAX = 47.84;
+const LON_MIN = -134.09;
+const LON_MAX = -60.92;
+
+// ── In-memory state ──────────────────────────────────────────────────────────
+
+const state = {
+    validTime:         null,
+    lastModifiedMain:  null,   // Last-Modified from NOMADS main file HEAD
+    lastModifiedHlcy:  null,   // Last-Modified from NOMADS hlcy file HEAD
+    cape:  null,               // Float32Array, NX*NY
+    cin:   null,               // Float32Array, NX*NY
+    shear: null,               // Float32Array, NX*NY  (0-6km BWD, m/s)
+    srh:   null,               // Float32Array, NX*NY  (0-1km SRH, m²/s²)
+    stp:   null,               // Float32Array, NX*NY  (Fixed SigTor, dimensionless)
+    loading:      false,
+    lastError:    null,
+    lastAttempt:  null,
+    refreshCount: 0,
 };
 
-function newCacheEntry() {
-    return {
-        validTime: null,
-        meta: null,
-        cape: null, cin: null, shear: null,
-        srh: null, sigtor: null,
-        loading: false,
-        lastError: null,
-        lastAttempt: null,
-        refreshCount: 0,
-    };
-}
-// One cache per sector. Populated lazily on first request.
-const sectorCache = {};
-// Tracks most-recently-requested sectors so the background refresh loop
-// keeps them warm. CONUS is always primed.
-const activeSectors = new Set(["CONUS"]);
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 function pad(n) { return String(n).padStart(2, '0'); }
 
-// Main fields: CAPE, CIN, 500mb+10m winds, 500mb ABSV.
-// HLCY is intentionally excluded here — NOMADS level filters (lev_surface,
-// lev_500_mb, lev_10_m_above_ground) only pass messages whose typeOfLevel
-// matches one of those level selectors.  HLCY uses typeOfLevel=heightAboveGroundLayer
-// which matches NONE of them, so it would be silently dropped.  It is fetched
-// separately via hlcyURLForHour() with no level filter.
-function rapURLForHour(date, sector) {
-    const yyyy = date.getUTCFullYear();
-    const ymd  = `${yyyy}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}`;
-    const hh   = pad(date.getUTCHours());
-    const params = new URLSearchParams({
-        file: `rap.t${hh}z.awp130pgrbf00.grib2`,
-        lev_surface: 'on',
-        lev_500_mb: 'on',
-        lev_10_m_above_ground: 'on',
-        var_CAPE: 'on',
-        var_CIN: 'on',
-        var_UGRD: 'on',
-        var_VGRD: 'on',
-        subregion: '',
-        leftlon:   String(sector.lonMin),
-        rightlon:  String(sector.lonMax),
-        toplat:    String(sector.latMax),
-        bottomlat: String(sector.latMin),
-        dir: `/rap.${ymd}`,
-    });
-    return `https://nomads.ncep.noaa.gov/cgi-bin/filter_rap.pl?${params.toString()}`;
-}
-
-// Separate small download for HLCY only — no level filter so NOMADS passes
-// all heightAboveGroundLayer HLCY messages (0-1km and 0-3km).
-function hlcyURLForHour(date, sector) {
-    const yyyy = date.getUTCFullYear();
-    const ymd  = `${yyyy}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}`;
-    const hh   = pad(date.getUTCHours());
-    const params = new URLSearchParams({
-        file: `rap.t${hh}z.awp130pgrbf00.grib2`,
-        var_HLCY: 'on',
-        subregion: '',
-        leftlon:   String(sector.lonMin),
-        rightlon:  String(sector.lonMax),
-        toplat:    String(sector.latMax),
-        bottomlat: String(sector.latMin),
-        dir: `/rap.${ymd}`,
-    });
-    return `https://nomads.ncep.noaa.gov/cgi-bin/filter_rap.pl?${params.toString()}`;
-}
-
-function downloadToFile(url, destPath, redirects = 0) {
+/** Resolve the HTTP redirect chain and return the final URL string. */
+async function resolveRedirects(url, depth = 0) {
+    if (depth > 5) throw new Error('too many redirects');
     return new Promise((resolve, reject) => {
-        if (redirects > 5) return reject(new Error('too many redirects'));
+        https.request(url, { method: 'HEAD' }, res => {
+            res.resume();
+            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                resolveRedirects(res.headers.location, depth + 1).then(resolve, reject);
+            } else {
+                resolve({ statusCode: res.statusCode, headers: res.headers, url });
+            }
+        }).on('error', reject).end();
+    });
+}
+
+/**
+ * HEAD-check a NOMADS URL.
+ * Returns the Last-Modified string if present, or null.
+ * Returns 'GONE' if NOMADS returns 404/500 (run not available yet).
+ */
+async function headCheck(url) {
+    try {
+        const r = await resolveRedirects(url);
+        if (r.statusCode === 404 || r.statusCode >= 500) return 'GONE';
+        return r.headers['last-modified'] || null;
+    } catch {
+        return null;
+    }
+}
+
+/** Download URL to destPath, following redirects. */
+function downloadToFile(url, destPath, depth = 0) {
+    return new Promise((resolve, reject) => {
+        if (depth > 5) return reject(new Error('too many redirects'));
         https.get(url, res => {
             if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
                 res.resume();
-                downloadToFile(res.headers.location, destPath, redirects + 1).then(resolve, reject);
+                downloadToFile(res.headers.location, destPath, depth + 1).then(resolve, reject);
                 return;
             }
             if (res.statusCode !== 200) {
                 res.resume();
-                reject(new Error(`HTTP ${res.statusCode} from ${url}`));
-                return;
+                return reject(new Error(`HTTP ${res.statusCode} from ${url}`));
             }
             const file = fs.createWriteStream(destPath);
             res.pipe(file);
-            file.on('finish', () => file.close(() => resolve()));
+            file.on('finish', () => file.close(resolve));
             file.on('error', reject);
         }).on('error', reject);
     });
 }
 
-function runExtraction(task) {
+/**
+ * Run wgrib2 on gribPath, extracting each field to its own .bin file.
+ *
+ * fields: Array of { tag: string, match: string }
+ *   match is a regex substring tested against wgrib2's inventory line, e.g.
+ *   ':CAPE:180-0 mb above ground:'
+ *
+ * Builds the command:
+ *   wgrib2 <gribPath> \
+ *     -if '<match1>' -no_header -bin <tag1.bin> -fi \
+ *     -if '<match2>' -no_header -bin <tag2.bin> -fi \
+ *     ...
+ *
+ * wgrib2 scans the file once; each -if/-fi block fires only for matching
+ * records.  stdout (the verbose inventory) is discarded; only stderr is
+ * captured for error reporting.
+ *
+ * Returns { [tag]: Float32Array | null }
+ */
+function runWgrib2(gribPath, fields, stamp) {
+    const binPaths = {};
+    const args = [gribPath];
+    for (const f of fields) {
+        const bp = path.join(TMP_DIR, `${f.tag}_${stamp}.bin`);
+        binPaths[f.tag] = bp;
+        args.push('-if', f.match, '-no_header', '-bin', bp, '-fi');
+    }
+
     return new Promise((resolve, reject) => {
-        const w = new Worker(path.join(__dirname, 'rap-worker.js'), { workerData: task });
-        w.on('message', msg => {
-            if (msg.error) reject(new Error(msg.error));
-            else resolve(msg);
+        // Ignore stdout (wgrib2 inventory) to avoid buffering 150k+ lines.
+        const proc = spawn('wgrib2', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+        let stderr = '';
+        proc.stderr.on('data', d => { stderr += d.toString(); });
+        proc.on('error', err => reject(new Error(`wgrib2 spawn failed: ${err.message}`)));
+        proc.on('close', code => {
+            if (code !== 0) {
+                return reject(new Error(`wgrib2 exit ${code}: ${stderr.slice(0, 800)}`));
+            }
+            const result = {};
+            for (const f of fields) {
+                const bp = binPaths[f.tag];
+                if (fs.existsSync(bp) && fs.statSync(bp).size >= 4) {
+                    const buf = fs.readFileSync(bp);
+                    // Slice into a clean ArrayBuffer (avoids shared-pool alignment issues).
+                    const ab  = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+                    result[f.tag] = new Float32Array(ab);
+                } else {
+                    result[f.tag] = null;
+                    if (stderr) {
+                        console.warn(`[rap] wgrib2: no data for tag=${f.tag} match="${f.match}"`);
+                    }
+                }
+                // Clean up immediately — these are intermediate files.
+                try { fs.unlinkSync(binPaths[f.tag]); } catch {}
+            }
+            resolve(result);
         });
-        w.on('error', reject);
-        w.on('exit', code => { if (code !== 0) reject(new Error(`worker exit ${code}`)); });
     });
 }
 
-function inferGridMeta(points) {
-    if (!points || !points.length) return null;
-    let lat_min = Infinity, lat_max = -Infinity;
-    let lon_min = Infinity, lon_max = -Infinity;
-    const lats = new Set();
-    const lons = new Set();
-    for (const p of points) {
-        if (p.lat < lat_min) lat_min = p.lat;
-        if (p.lat > lat_max) lat_max = p.lat;
-        if (p.lon < lon_min) lon_min = p.lon;
-        if (p.lon > lon_max) lon_max = p.lon;
-        // Bin to nearest 0.125° (multiply by 8) so the set count approximates
-        // the native RAP-130 grid spacing (~0.13°). Using 0.01° bins produced
-        // nx/ny ~13× too large (22M cells), causing iOS to OOM and freeze.
-        lats.add(Math.round(p.lat * 8));
-        lons.add(Math.round(p.lon * 8));
-    }
-    return { nx: lons.size, ny: lats.size, lat_min, lat_max, lon_min, lon_max };
+/** Delete files older than maxAgeMs from TMP_DIR. */
+function cleanOldFiles(maxAgeMs = 3 * 3600 * 1000) {
+    try {
+        const now = Date.now();
+        for (const name of fs.readdirSync(TMP_DIR)) {
+            const full = path.join(TMP_DIR, name);
+            try {
+                if (now - fs.statSync(full).mtimeMs > maxAgeMs) fs.unlinkSync(full);
+            } catch {}
+        }
+    } catch {}
 }
 
-async function refreshSector(sectorId) {
-    const sector = SECTORS[sectorId];
-    if (!sector) return;
-    if (!sectorCache[sectorId]) sectorCache[sectorId] = newCacheEntry();
-    const cache = sectorCache[sectorId];
-    if (cache.loading) return;
-    cache.loading = true;
-    cache.lastAttempt = new Date().toISOString();
-    cache.refreshCount++;
+// ── STP derivation ───────────────────────────────────────────────────────────
+
+/**
+ * Bolton (1980) LCL height approximation.
+ * t2m and td2m in Kelvin (difference is identical in Celsius).
+ * Returns LCL height in meters AGL.
+ */
+function lclHeight(t2m, td2m) {
+    return 125.0 * (t2m - td2m);
+}
+
+/**
+ * Thompson et al. (2003) fixed-layer STP.
+ *   capeTerm  = mlcape / 1500
+ *   lclTerm   = clamp((2000 – lclM) / 1000, 0, 1)
+ *   srhTerm   = srh1km / 150
+ *   shearTerm = min(1.5, bwd6ms / 10.288)   [20 kt = 10.288 m/s]
+ */
+function computeSTP(mlcape, lclM, srh1km, bwd6ms) {
+    const capeTerm  = mlcape / 1500;
+    const lclTerm   = Math.min(1.0, Math.max(0.0, (2000 - lclM) / 1000));
+    const srhTerm   = srh1km / 150;
+    const shearTerm = Math.min(1.5, bwd6ms / 10.288);
+    return Math.max(0, capeTerm * lclTerm * srhTerm * shearTerm);
+}
+
+// ── NOMADS URLs ──────────────────────────────────────────────────────────────
+//
+// Two downloads per cycle (same reason as before):
+//   main — CAPE/CIN/winds/TMP/DPT with lev_* filters
+//   hlcy — HLCY only, NO lev_* filter.
+//
+// NOMADS silently drops heightAboveGroundLayer messages (which HLCY uses)
+// whenever any lev_* filter is active, regardless of which file is requested.
+//
+// File changed from awp130pgrbf00 to awip32f00 (hybrid-level native analysis).
+// No subregion params — full CONUS download enables the fixed NX=451/NY=337.
+
+function rapURLForHour(date) {
+    const yyyy = date.getUTCFullYear();
+    const ymd  = `${yyyy}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}`;
+    const hh   = pad(date.getUTCHours());
+    const params = new URLSearchParams({
+        file: `rap.t${hh}z.awip32f00.grib2`,
+        lev_surface:            'on',
+        lev_500_mb:             'on',
+        lev_10_m_above_ground:  'on',
+        lev_2_m_above_ground:   'on',
+        var_CAPE: 'on',
+        var_CIN:  'on',
+        var_UGRD: 'on',
+        var_VGRD: 'on',
+        var_TMP:  'on',
+        var_DPT:  'on',
+        dir: `/rap.${ymd}`,
+    });
+    return `https://nomads.ncep.noaa.gov/cgi-bin/filter_rap.pl?${params}`;
+}
+
+function hlcyURLForHour(date) {
+    const yyyy = date.getUTCFullYear();
+    const ymd  = `${yyyy}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}`;
+    const hh   = pad(date.getUTCHours());
+    const params = new URLSearchParams({
+        file: `rap.t${hh}z.awip32f00.grib2`,
+        var_HLCY: 'on',
+        dir: `/rap.${ymd}`,
+    });
+    return `https://nomads.ncep.noaa.gov/cgi-bin/filter_rap.pl?${params}`;
+}
+
+// ── Refresh pipeline ─────────────────────────────────────────────────────────
+
+async function refresh() {
+    if (state.loading) return;
+    state.loading     = true;
+    state.lastAttempt = new Date().toISOString();
+    state.refreshCount++;
+
     try {
-        // Try the most recent 4 hours in descending order — NOMADS publishes
-        // ~30-45 min after the run hour; the current hour may not yet exist.
-        // Two downloads per run: main (CAPE/CIN/winds/ABSV) + hlcy (SRH only).
+        // ── 1. Find the latest available run (try 4 hours back) ──────────────
         const now = new Date();
         now.setUTCMinutes(0, 0, 0);
+
         let downloaded = null;
         for (let i = 0; i < 4; i++) {
-            const t      = new Date(now.getTime() - i * 3600 * 1000);
-            const stamp  = t.toISOString().replace(/[:.]/g, '_');
-            const mainDest = path.join(TMP_DIR, `rap_${sectorId}_${stamp}.grib2`);
-            const hlcyDest = path.join(TMP_DIR, `rap_hlcy_${sectorId}_${stamp}.grib2`);
+            const t     = new Date(now.getTime() - i * 3600_000);
+            const stamp = `${t.getUTCFullYear()}${pad(t.getUTCMonth()+1)}${pad(t.getUTCDate())}_${pad(t.getUTCHours())}`;
+            const mainURL  = rapURLForHour(t);
+            const hlcyURL  = hlcyURLForHour(t);
+            const mainDest = path.join(TMP_DIR, `rap_main_${stamp}.grib2`);
+            const hlcyDest = path.join(TMP_DIR, `rap_hlcy_${stamp}.grib2`);
+
+            // ── 2. HEAD-check both files before downloading ──────────────────
+            const [mainMod, hlcyMod] = await Promise.all([
+                headCheck(mainURL),
+                headCheck(hlcyURL),
+            ]);
+
+            if (mainMod === 'GONE') {
+                // This run doesn't exist yet; try an earlier one.
+                continue;
+            }
+
+            // Skip full cycle if both files are unchanged and we have data.
+            const mainUnchanged = mainMod && mainMod === state.lastModifiedMain;
+            const hlcyUnchanged = hlcyMod && hlcyMod === state.lastModifiedHlcy;
+            if (mainUnchanged && hlcyUnchanged && state.cape) {
+                console.log(`[rap] NOMADS files unchanged (${stamp}), skipping download`);
+                return;
+            }
+
             try {
-                // Download both files concurrently; skip if already cached on disk.
                 await Promise.all([
-                    (fs.existsSync(mainDest) && fs.statSync(mainDest).size > 1000)
+                    (mainUnchanged && fs.existsSync(mainDest) && fs.statSync(mainDest).size > 1000)
                         ? Promise.resolve()
-                        : downloadToFile(rapURLForHour(t, sector), mainDest),
-                    (fs.existsSync(hlcyDest) && fs.statSync(hlcyDest).size > 1000)
+                        : downloadToFile(mainURL, mainDest),
+                    (hlcyUnchanged && fs.existsSync(hlcyDest) && fs.statSync(hlcyDest).size > 1000)
                         ? Promise.resolve()
-                        : downloadToFile(hlcyURLForHour(t, sector), hlcyDest),
+                        : downloadToFile(hlcyURL, hlcyDest),
                 ]);
-                if (fs.statSync(mainDest).size > 1000) {
-                    downloaded = { date: t, path: mainDest, hlcyPath: hlcyDest };
+
+                const mainSz = fs.existsSync(mainDest) ? fs.statSync(mainDest).size : 0;
+                if (mainSz > 1000) {
+                    if (mainMod) state.lastModifiedMain = mainMod;
+                    if (hlcyMod) state.lastModifiedHlcy = hlcyMod;
+                    downloaded = { date: t, stamp, mainDest, hlcyDest };
                     break;
                 }
             } catch (e) {
-                console.warn(`[rap:${sectorId}] fetch ${t.toISOString()} failed: ${e.message}`);
+                console.warn(`[rap] fetch ${stamp} failed: ${e.message}`);
             }
         }
+
         if (!downloaded) {
-            console.warn(`[rap:${sectorId}] no run available yet`);
+            console.warn('[rap] no run available yet');
             return;
         }
 
-        // 7 parallel field extractions split across two GRIB2 files:
-        //   mainPath  — CAPE, CIN, winds  (lev_surface/500mb/10m filters)
-        //   hlcyPath  — HLCY only         (no level filter; needed because
-        //               heightAboveGroundLayer messages are silently dropped when
-        //               any lev_* filter is active in the NOMADS request)
-        const mainPath = downloaded.path;
-        const hlcyPath = downloaded.hlcyPath;
-        const tasks = [
-            { gribPath: mainPath, tag: 'cape',  candidates: [
-                { shortName: 'cape', typeOfLevel: 'surface', level: 0 },
-            ]},
-            { gribPath: mainPath, tag: 'cin',   candidates: [
-                { shortName: 'cin',  typeOfLevel: 'surface', level: 0 },
-            ]},
-            { gribPath: mainPath, tag: 'u500',  candidates: [
-                { shortName: 'u',    typeOfLevel: 'isobaricInhPa', level: 500 },
-                { shortName: 'UGRD', typeOfLevel: 'isobaricInhPa', level: 500 },
-            ]},
-            { gribPath: mainPath, tag: 'v500',  candidates: [
-                { shortName: 'v',    typeOfLevel: 'isobaricInhPa', level: 500 },
-                { shortName: 'VGRD', typeOfLevel: 'isobaricInhPa', level: 500 },
-            ]},
-            { gribPath: mainPath, tag: 'u10',   candidates: [
-                { shortName: '10u' },
-                { shortName: 'u',    typeOfLevel: 'heightAboveGround', level: 10 },
-                { shortName: 'UGRD', typeOfLevel: 'heightAboveGround', level: 10 },
-            ]},
-            { gribPath: mainPath, tag: 'v10',   candidates: [
-                { shortName: '10v' },
-                { shortName: 'v',    typeOfLevel: 'heightAboveGround', level: 10 },
-                { shortName: 'VGRD', typeOfLevel: 'heightAboveGround', level: 10 },
-            ]},
-            // 0-1km SRH read from the dedicated HLCY-only file.
-            { gribPath: hlcyPath, tag: 'srh1',  candidates: [
-                { shortName: 'hlcy', typeOfLevel: 'heightAboveGroundLayer', level: 1000 },
-            ]},
+        const { stamp, mainDest, hlcyDest } = downloaded;
+        console.log(`[rap] extracting run ${stamp}…`);
+
+        // ── 3. Single wgrib2 pass per file ───────────────────────────────────
+        //
+        // Main fields (from mainDest):
+        //   CAPE, CIN           — surface-based / mixed-layer (180-0 mb layer)
+        //   UGRD, VGRD          — 500mb isobaric  (upper wind)
+        //   UGRD, VGRD          — 10m AGL         (surface wind)
+        //   TMP, DPT            — 2m AGL           (for Bolton LCL)
+        //   UGRD, VGRD          — 6000-0m AGL layer (0-6km BWD; may be absent
+        //                         in awip32 — code falls back to 500mb–10m)
+        //
+        // HLCY fields (from hlcyDest):
+        //   HLCY                — 0-1km SRH
+
+        const mainFields = [
+            { tag: 'cape', match: ':CAPE:180-0 mb above ground:' },
+            { tag: 'cin',  match: ':CIN:180-0 mb above ground:'  },
+            { tag: 'u500', match: ':UGRD:500 mb:'                },
+            { tag: 'v500', match: ':VGRD:500 mb:'                },
+            { tag: 'u10',  match: ':UGRD:10 m above ground:'     },
+            { tag: 'v10',  match: ':VGRD:10 m above ground:'     },
+            { tag: 't2m',  match: ':TMP:2 m above ground:'       },
+            { tag: 'td2m', match: ':DPT:2 m above ground:'       },
+            // 0-6km layer winds — present in some awip32 versions; gracefully
+            // absent if the bin file comes back null (fallback fires below).
+            { tag: 'u6k',  match: ':UGRD:6000-0 m above ground:' },
+            { tag: 'v6k',  match: ':VGRD:6000-0 m above ground:' },
         ];
-        const results = await Promise.all(tasks.map(t =>
-            runExtraction({ gribPath: t.gribPath, tag: t.tag, candidates: t.candidates })));
-        const byTag = {};
-        results.forEach((r, i) => {
-            byTag[tasks[i].tag] = r.points || [];
-            if ((r.points || []).length === 0) {
-                console.warn(`[rap:${sectorId}] tag=${tasks[i].tag} 0 points; tried=${JSON.stringify(r.triedCandidates)} debug=${(r.debug || '').slice(0, 600)}`);
-            } else if (r.matched) {
-                console.log(`[rap:${sectorId}] tag=${tasks[i].tag} matched=${JSON.stringify(r.matched)} points=${r.points.length}`);
+        const hlcyFields = [
+            { tag: 'srh1', match: ':HLCY:0-1 km above ground:'  },
+        ];
+
+        // Run both extractions concurrently (each is one file scan).
+        const [mainData, hlcyData] = await Promise.all([
+            runWgrib2(mainDest, mainFields, stamp),
+            runWgrib2(hlcyDest, hlcyFields, stamp),
+        ]);
+        const d = { ...mainData, ...hlcyData };
+
+        // Validate required fields.
+        const required = ['cape', 'u500', 'v500', 'u10', 'v10', 'srh1'];
+        for (const tag of required) {
+            if (!d[tag] || d[tag].length < NX * NY) {
+                throw new Error(`Required field missing or undersized: tag=${tag} ` +
+                                `got=${d[tag] ? d[tag].length : 0} expected=${NX * NY}`);
             }
-        });
-
-        // Compute 0-6km bulk shear from V500mb - V10m magnitude.
-        // eccodes preserves grid scan order across messages from the same GRIB2,
-        // so index-aligned subtraction is safe.
-        const u500 = byTag.u500, v500 = byTag.v500;
-        const u10  = byTag.u10,  v10  = byTag.v10;
-        const nShear = Math.min(u500.length, v500.length, u10.length, v10.length);
-        const shearPts = new Array(nShear);
-        for (let i = 0; i < nShear; i++) {
-            const du = u500[i].value - u10[i].value;
-            const dv = v500[i].value - v10[i].value;
-            shearPts[i] = { lat: u500[i].lat, lon: u500[i].lon, value: Math.sqrt(du * du + dv * dv) };
         }
 
-        // SRH: 0-1km storm-relative helicity, m²/s² (raw from eccodes, no scaling).
-        const srhPts = byTag.srh1;
+        const n = NX * NY;
 
-        // Significant Tornado Parameter (simplified):
-        //   STP = clamp(CAPE/1500,0,4) × clamp(0-1km SRH/150,0,4) × clamp(BWD/20,0,4)
-        const capePts = byTag.cape;
-        const srh1Pts = byTag.srh1;
-        const nSig = Math.min(capePts.length, srh1Pts.length, shearPts.length);
-        const sigtorPts = new Array(nSig);
-        for (let i = 0; i < nSig; i++) {
-            const capeFac = Math.min(Math.max(capePts[i].value / 1500, 0), 4);
-            const srhFac  = Math.min(Math.max(srh1Pts[i].value / 150,  0), 4);
-            const bwdFac  = Math.min(Math.max(shearPts[i].value / 20,  0), 4);
-            sigtorPts[i]  = { lat: capePts[i].lat, lon: capePts[i].lon, value: capeFac * srhFac * bwdFac };
+        // ── 4a. 0-6km BWD shear (fallback to 500mb–10m) ─────────────────────
+        const shear = new Float32Array(n);
+        if (d.u6k && d.u6k.length === n) {
+            console.log('[rap] using 0-6km AGL layer winds for shear');
+            for (let i = 0; i < n; i++) {
+                const du = d.u6k[i] - d.u10[i];
+                const dv = d.v6k[i] - d.v10[i];
+                shear[i] = Math.sqrt(du * du + dv * dv);
+            }
+        } else {
+            console.log('[rap] 0-6km layer absent → falling back to 500mb–10m bulk shear');
+            for (let i = 0; i < n; i++) {
+                const du = d.u500[i] - d.u10[i];
+                const dv = d.v500[i] - d.v10[i];
+                shear[i] = Math.sqrt(du * du + dv * dv);
+            }
         }
 
-        const meta = inferGridMeta(byTag.cape);
-        cache.validTime = downloaded.date.toISOString();
-        cache.meta      = meta;
-        cache.cape      = byTag.cape;
-        cache.cin       = byTag.cin;
-        cache.shear     = shearPts;
-        cache.srh       = srhPts;
-        cache.sigtor    = sigtorPts;
-        console.log(`[rap:${sectorId}] cache refreshed validTime=${cache.validTime} nx=${meta && meta.nx} ny=${meta && meta.ny} cape=${cache.cape.length} cin=${cache.cin.length} shear=${cache.shear.length} srh=${cache.srh.length} sigtor=${cache.sigtor.length}`);
-        cache.lastError = null;
+        // ── 4b. Fixed-layer STP (Thompson 2003) ─────────────────────────────
+        //   LCL: Bolton (1980)  lcl_m = 125 × (T2m_K – Td2m_K)
+        //   STP = (CAPE/1500) × clamp((2000−lcl)/1000, 0,1) × (SRH/150)
+        //         × min(1.5, BWD/10.288)
+        const hasTd = d.t2m && d.td2m && d.t2m.length === n && d.td2m.length === n;
+        if (!hasTd) console.warn('[rap] T2m/Td2m missing — LCL defaulting to 1000 m AGL');
+
+        const stp = new Float32Array(n);
+        const cape  = d.cape;
+        const srh1  = d.srh1;
+        for (let i = 0; i < n; i++) {
+            const lcl = hasTd ? lclHeight(d.t2m[i], d.td2m[i]) : 1000.0;
+            stp[i] = computeSTP(cape[i], lcl, srh1[i], shear[i]);
+        }
+
+        // ── 5. Commit to state ───────────────────────────────────────────────
+        state.validTime = downloaded.date.toISOString();
+        state.cape  = cape;
+        state.cin   = d.cin || new Float32Array(n);  // CIN may be absent
+        state.shear = shear;
+        state.srh   = srh1;
+        state.stp   = stp;
+        state.lastError = null;
+
+        // Quick sanity log — max STP in first 10k cells.
+        let stpMax = 0;
+        const check = Math.min(10000, n);
+        for (let i = 0; i < check; i++) if (stp[i] > stpMax) stpMax = stp[i];
+        console.log(`[rap] refreshed validTime=${state.validTime} n=${n} ` +
+                    `cape0=${cape[0].toFixed(1)} stpMax(sample)=${stpMax.toFixed(2)}`);
+
+        // Clean GRIB files older than 3 h.
+        cleanOldFiles(3 * 3600_000);
+
     } catch (e) {
-        cache.lastError = e.message;
-        console.error(`[rap:${sectorId}] refresh failed: ${e.message}`);
+        state.lastError = e.message;
+        console.error(`[rap] refresh failed: ${e.message}`);
     } finally {
-        cache.loading = false;
+        state.loading = false;
     }
 }
 
-// Background loop — refreshes every sector that has been requested at least
-// once. CONUS is primed at startup.
-async function refreshAllActive() {
-    for (const sectorId of activeSectors) {
-        await refreshSector(sectorId);
-    }
-}
-
-function streamParam(res, param, sectorId) {
-    if (!SECTORS[sectorId]) sectorId = "CONUS";
-    activeSectors.add(sectorId);
-    const cache = sectorCache[sectorId];
-    if (!cache || !cache.meta || !cache[param]) {
-        // Kick off a fetch async; tell the client we're not ready yet so it can
-        // poll. On first request for a new sector this takes ~30-60s.
-        if (!cache || !cache.loading) refreshSector(sectorId);
-        const c = sectorCache[sectorId] || {};
-        res.writeHead(503, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-            error: 'rap not ready',
-            sector: sectorId,
-            loading: !!c.loading,
-            lastAttempt: c.lastAttempt || null,
-            lastError: c.lastError || null,
-            refreshCount: c.refreshCount || 0,
-        }));
-        return;
-    }
-    const data = cache[param];
-    const meta = cache.meta;
-    res.writeHead(200, {
-        'Content-Type': 'application/x-ndjson',
-        'Cache-Control': 'no-store',
-    });
-    res.write(JSON.stringify({
-        type: 'meta', param, sector: sectorId,
-        nx: meta.nx, ny: meta.ny,
-        lat_min: meta.lat_min, lat_max: meta.lat_max,
-        lon_min: meta.lon_min, lon_max: meta.lon_max,
-        valid_time: cache.validTime,
-    }) + '\n');
-    for (let i = 0; i < data.length; i++) {
-        res.write(JSON.stringify(data[i]) + '\n');
-    }
-    res.write(JSON.stringify({ type: 'end' }) + '\n');
-    res.end();
-}
-
-// Public handler — mountable into another http server (e.g. server.js).
-// Returns true if the request was handled, false otherwise (so the parent
-// router can fall through to its own routes).
+// ── HTTP handler ─────────────────────────────────────────────────────────────
 //
-// Recognized paths (with or without a `/rap` prefix):
-//   /rap/cape    /cape
-//   /rap/cin     /cin
-//   /rap/shear   /shear
-//   /rap/srh     /srh
-//   /rap/sigtor  /sigtor
+// Mounted by server.js via: rap.handle(req, res)
+// Strips leading '/rap' so internally routes are /all, /status, etc.
+
 function handle(req, res) {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     let p = url.pathname;
     if (p.startsWith('/rap')) p = p.slice(4) || '/';
-    const sectorId = url.searchParams.get('sector') || 'CONUS';
-    if (p === '/cape')    { streamParam(res, 'cape',    sectorId); return true; }
-    if (p === '/cin')     { streamParam(res, 'cin',     sectorId); return true; }
-    if (p === '/shear')   { streamParam(res, 'shear',   sectorId); return true; }
-    if (p === '/srh')     { streamParam(res, 'srh',    sectorId); return true; }
-    if (p === '/sigtor')  { streamParam(res, 'sigtor', sectorId); return true; }
-    if (p === '/status') {
-        // Per-sector status. Defaults to the one in ?sector= or all-sectors summary.
-        const onlyId = url.searchParams.get('sector');
-        const ids = onlyId ? [onlyId] : Object.keys(sectorCache);
-        const sectors = {};
-        for (const id of ids) {
-            const c = sectorCache[id] || {};
-            sectors[id] = {
-                ready: !!(c.meta && c.cape),
-                validTime: c.validTime || null,
-                loading: !!c.loading,
-                lastAttempt: c.lastAttempt || null,
-                lastError: c.lastError || null,
-                refreshCount: c.refreshCount || 0,
-                counts: {
-                    cape:   c.cape   ? c.cape.length   : 0,
-                    cin:    c.cin    ? c.cin.length    : 0,
-                    shear:  c.shear  ? c.shear.length  : 0,
-                    srh:    c.srh    ? c.srh.length    : 0,
-                    sigtor: c.sigtor ? c.sigtor.length : 0,
-                },
-            };
+
+    // ── GET /rap/all ─────────────────────────────────────────────────────────
+    // Binary response: five consecutive Float32 grids (NX*NY values each).
+    // Grid order: cape, cin, shear, srh, stp.
+    // Metadata in X-Meso-Meta response header (JSON).
+    //
+    // iOS reads the header for dims/bbox, then slices the body into 5 typed
+    // arrays of (nx * ny) Float32 values each.
+    if (p === '/all') {
+        if (!state.cape) {
+            if (!state.loading) refresh();
+            res.writeHead(503, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                error: 'rap not ready',
+                loading: state.loading,
+                lastAttempt: state.lastAttempt,
+                lastError:   state.lastError,
+                refreshCount: state.refreshCount,
+            }));
+            return true;
         }
+
+        const PARAMS  = ['cape', 'cin', 'shear', 'srh', 'stp'];
+        const BPP     = NX * NY * 4;   // bytes per param
+        const meta    = JSON.stringify({
+            nx: NX, ny: NY,
+            lat_min: LAT_MIN, lat_max: LAT_MAX,
+            lon_min: LON_MIN, lon_max: LON_MAX,
+            valid_time:     state.validTime,
+            params:         PARAMS,
+            bytes_per_param: BPP,
+        });
+
+        res.writeHead(200, {
+            'Content-Type':                  'application/octet-stream',
+            'X-Meso-Meta':                   meta,
+            'Access-Control-Allow-Origin':   '*',
+            'Access-Control-Expose-Headers': 'X-Meso-Meta',
+            'Cache-Control':                 'no-store',
+            'Content-Length':                String(PARAMS.length * BPP),
+        });
+        res.end(Buffer.concat([
+            Buffer.from(state.cape.buffer),
+            Buffer.from(state.cin.buffer),
+            Buffer.from(state.shear.buffer),
+            Buffer.from(state.srh.buffer),
+            Buffer.from(state.stp.buffer),
+        ]));
+        return true;
+    }
+
+    // ── GET /rap/status ──────────────────────────────────────────────────────
+    if (p === '/status') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
-            activeSectors: Array.from(activeSectors),
-            availableSectors: Object.keys(SECTORS),
-            sectors,
+            ready:        !!state.cape,
+            validTime:    state.validTime,
+            loading:      state.loading,
+            lastAttempt:  state.lastAttempt,
+            lastError:    state.lastError,
+            refreshCount: state.refreshCount,
+            lastModifiedMain: state.lastModifiedMain,
+            lastModifiedHlcy: state.lastModifiedHlcy,
+            gridPoints:   state.cape ? state.cape.length : 0,
+            params: state.cape ? {
+                cape:  state.cape.length,
+                cin:   state.cin.length,
+                shear: state.shear.length,
+                srh:   state.srh.length,
+                stp:   state.stp.length,
+            } : null,
         }));
         return true;
     }
-    if (p === '/sectors') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(SECTORS));
-        return true;
-    }
+
     return false;
 }
 
-// Kick off the refresh cycle as soon as this module is required.
-refreshSector("CONUS");
-const refreshTimer = setInterval(refreshAllActive, REFRESH_MS);
-refreshTimer.unref && refreshTimer.unref();
-console.log(`[rap] module loaded (workers=${NUM_WORKERS}, sectors=${Object.keys(SECTORS).length})`);
+// ── Startup ──────────────────────────────────────────────────────────────────
 
-module.exports = { handle, refresh: refreshAllActive, refreshSector };
+refresh();
+const refreshTimer = setInterval(refresh, REFRESH_MS);
+if (refreshTimer.unref) refreshTimer.unref();
+console.log('[rap] module loaded (wgrib2 backend, CONUS full-grid, NX=451 NY=337)');
 
-// Stand-alone mode — only runs when invoked directly (`node rap.js`), not
-// when required from server.js.
+module.exports = { handle, refresh };
+
+// Stand-alone mode (`node rap.js` for local testing).
 if (require.main === module) {
     const server = http.createServer((req, res) => {
         if (handle(req, res)) return;
-        if (new URL(req.url, `http://${req.headers.host}`).pathname === '/healthz') {
-            res.writeHead(200); res.end('ok'); return;
-        }
+        const p = new URL(req.url, 'http://localhost').pathname;
+        if (p === '/healthz') { res.writeHead(200); res.end('ok'); return; }
         res.writeHead(404); res.end('not found');
     });
-    server.listen(PORT, () => console.log(`[rap] standalone listening on ${PORT}`));
+    server.listen(PORT, () => console.log(`[rap] standalone on ${PORT}`));
 }
