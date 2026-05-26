@@ -91,7 +91,7 @@ def _nearest_rtma_values(
 
 
 def compute_innovation_field(
-    rtma_t2m:   np.ndarray,   # (ny, nx) K
+    rtma_t2m:   np.ndarray,   # (ny, nx) K  — must be a small (downsampled) grid
     rtma_td2m:  np.ndarray,   # (ny, nx) K
     rtma_lats:  np.ndarray,   # (ny, nx)
     rtma_lons:  np.ndarray,   # (ny, nx) already in -180..180
@@ -100,7 +100,12 @@ def compute_innovation_field(
     st_rtma_td: np.ndarray,   # (n_st,) RTMA Td at each station's nearest gridpoint
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Compute IDW innovation fields (delta_t, delta_td) on the RTMA grid.
+    Compute IDW innovation fields (delta_t, delta_td) on the passed-in grid.
+
+    The caller is responsible for passing a grid small enough that a full
+    (n_gp × n_stations) float32 distance matrix fits in RAM.  At the
+    downsampled resolution (399×586 ≈ 234k points, ~8800 stations):
+        234k × 8800 × 4 bytes ≈ 8 MB   ← safe, no chunking needed
 
     For each gridpoint:
       1. Find all stations within IDW_RADIUS_DEG
@@ -110,7 +115,6 @@ def compute_innovation_field(
       5. If < MIN_STATIONS pass QC, innovation = 0 (keep RTMA)
 
     Returns (delta_t, delta_td): float32 arrays shape (ny, nx).
-    Add these to RTMA T/Td to get the obs-corrected surface analysis.
     """
     ny, nx = rtma_t2m.shape
 
@@ -122,11 +126,11 @@ def compute_innovation_field(
     st_t    = np.array([s['t_k']  for s in stations], dtype=np.float32)
     st_td   = np.array([s['td_k'] for s in stations], dtype=np.float32)
 
-    # Obs-minus-background innovations at each station (constant across gridpoints)
+    # Obs-minus-background innovations — constant per station across all gridpoints
     innov_t  = st_t  - st_rtma_t    # (n_st,)
-    innov_td = st_td - st_rtma_td   # (n_st,)
+    innov_td = st_td - st_rtma_td
 
-    # QC: flag stations whose innovation is physically implausible
+    # QC: discard stations with physically implausible innovations
     qc_ok = (
         (np.abs(innov_t)  < MAX_INNOVATION_K) &
         (np.abs(innov_td) < MAX_INNOVATION_K)
@@ -136,48 +140,27 @@ def compute_innovation_field(
         log.info(f'[mesonet] QC removed {n_qc_fail} stations '
                  f'with |innovation| > {MAX_INNOVATION_K} K')
 
-    delta_t  = np.zeros((ny, nx), dtype=np.float32)
-    delta_td = np.zeros((ny, nx), dtype=np.float32)
+    # Full distance matrix — safe because caller passes a small grid
+    gp_lats = rtma_lats.ravel()   # (n_gp,)
+    gp_lons = rtma_lons.ravel()
 
-    # Process in row chunks to avoid a full (ny*nx × n_stations) distance matrix
-    # (~1597*2345*2000*4 bytes ≈ 30 GB). Chunking by 50 rows keeps peak RAM ~200 MB.
-    CHUNK = 50
+    dlat = gp_lats[:, None] - st_lats[None, :]   # (n_gp, n_st)
+    dlon = gp_lons[:, None] - st_lons[None, :]
+    dist = np.sqrt(dlat**2 + dlon**2)             # equirectangular, degrees
 
-    for row_start in range(0, ny, CHUNK):
-        row_end   = min(row_start + CHUNK, ny)
-        chunk_rows = row_end - row_start
+    weights    = (1.0 / np.maximum(dist, 1e-6) ** IDW_POWER) * (dist < IDW_RADIUS_DEG)
+    weights_qc = weights * qc_ok[None, :]         # zero out QC-failed stations
 
-        gp_lats = rtma_lats[row_start:row_end, :].ravel()   # (chunk*nx,)
-        gp_lons = rtma_lons[row_start:row_end, :].ravel()
-        n_gp    = len(gp_lats)
+    n_valid = (weights_qc > 0).sum(axis=1)        # (n_gp,)
+    w_sum   = weights_qc.sum(axis=1)
+    w_safe  = np.where(w_sum > 0, w_sum, 1.0)
 
-        # Equirectangular distance in degrees — adequate for <300 km at CONUS lats
-        dlat = gp_lats[:, None] - st_lats[None, :]   # (n_gp, n_st)
-        dlon = gp_lons[:, None] - st_lons[None, :]
-        dist = np.sqrt(dlat**2 + dlon**2)
+    idw_t  = (weights_qc * innov_t [None, :]).sum(axis=1) / w_safe
+    idw_td = (weights_qc * innov_td[None, :]).sum(axis=1) / w_safe
 
-        in_radius    = dist < IDW_RADIUS_DEG
-        dist_clamped = np.maximum(dist, 1e-6)
-        weights      = (1.0 / dist_clamped ** IDW_POWER) * in_radius   # (n_gp, n_st)
-
-        # Zero out QC-failed stations for all gridpoints simultaneously
-        weights_qc = weights * qc_ok[None, :]        # broadcast: (n_gp, n_st)
-
-        n_valid  = (weights_qc > 0).sum(axis=1)      # (n_gp,)
-        w_sum    = weights_qc.sum(axis=1)
-        w_safe   = np.where(w_sum > 0, w_sum, 1.0)
-
-        idw_t  = (weights_qc * innov_t [None, :]).sum(axis=1) / w_safe
-        idw_td = (weights_qc * innov_td[None, :]).sum(axis=1) / w_safe
-
-        # Only apply where enough stations are present; otherwise keep 0
-        mask   = (n_valid >= MIN_STATIONS).reshape(chunk_rows, nx)
-        idw_t  = idw_t .reshape(chunk_rows, nx)
-        idw_td = idw_td.reshape(chunk_rows, nx)
-
-        delta_t [row_start:row_end, :] = np.where(mask, idw_t,  0.0).astype(np.float32)
-        delta_td[row_start:row_end, :] = np.where(mask, idw_td, 0.0).astype(np.float32)
-
+    mask     = (n_valid >= MIN_STATIONS).reshape(ny, nx)
+    delta_t  = np.where(mask, idw_t .reshape(ny, nx), 0.0).astype(np.float32)
+    delta_td = np.where(mask, idw_td.reshape(ny, nx), 0.0).astype(np.float32)
     return delta_t, delta_td
 
 
