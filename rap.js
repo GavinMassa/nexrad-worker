@@ -16,7 +16,7 @@
 //   5. Serve GET /rap/all — binary response: five concatenated Float32 CONUS
 //      grids (cape, cin, shear, srh, stp), metadata in X-Meso-Meta header.
 //
-// Grid: awip32f00.grib2 — CONUS Lambert Conformal, NX=451 × NY=337 row-major.
+// Grid: awp130pgrbf00.grib2 — CONUS Lambert Conformal, NX=451 × NY=337 row-major.
 //
 // Endpoints:
 //   GET /rap/all    → octet-stream body: [cape][cin][shear][srh][stp] Float32
@@ -44,12 +44,12 @@ const REFRESH_MS = 10 * 60 * 1000;
 const TMP_DIR    = path.join(os.tmpdir(), 'rap-cache');
 fs.mkdirSync(TMP_DIR, { recursive: true });
 
-// Fixed CONUS grid for awip32f00.grib2 (RAP 13km Lambert Conformal).
+// Fixed CONUS grid for awp130pgrbf00.grib2 (RAP 13km Lambert Conformal).
 // 337 rows × 451 cols, row-major scan.
 const NX = 451;
 const NY = 337;
 
-// Approximate corner lat/lons for the awip32 CONUS Lambert Conformal domain.
+// Approximate corner lat/lons for the awp130 CONUS Lambert Conformal domain.
 // Used by iOS to position the Metal overlay.  Refined from operational RAP
 // grid spec; adjust if pixel offsets look wrong.
 const LAT_MIN = 21.14;
@@ -82,14 +82,16 @@ function pad(n) { return String(n).padStart(2, '0'); }
 async function resolveRedirects(url, depth = 0) {
     if (depth > 5) throw new Error('too many redirects');
     return new Promise((resolve, reject) => {
-        https.request(url, { method: 'HEAD' }, res => {
+        const req = https.request(url, { method: 'HEAD' }, res => {
             res.resume();
             if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
                 resolveRedirects(res.headers.location, depth + 1).then(resolve, reject);
             } else {
                 resolve({ statusCode: res.statusCode, headers: res.headers, url });
             }
-        }).on('error', reject).end();
+        });
+        req.setTimeout(15_000, () => { req.destroy(new Error('HEAD timeout')); });
+        req.on('error', reject).end();
     });
 }
 
@@ -135,7 +137,7 @@ function downloadToFile(url, destPath, depth = 0) {
  *
  * fields: Array of { tag: string, match: string }
  *   match is a regex substring tested against wgrib2's inventory line, e.g.
- *   ':CAPE:180-0 mb above ground:'
+ *   ':CAPE:surface:'
  *
  * Builds the command:
  *   wgrib2 <gribPath> \
@@ -238,15 +240,15 @@ function computeSTP(mlcape, lclM, srh1km, bwd6ms) {
 // NOMADS silently drops heightAboveGroundLayer messages (which HLCY uses)
 // whenever any lev_* filter is active, regardless of which file is requested.
 //
-// File changed from awp130pgrbf00 to awip32f00 (hybrid-level native analysis).
-// No subregion params — full CONUS download enables the fixed NX=451/NY=337.
+// awp130pgrbf00.grib2 is the only RAP product served through filter_rap.pl.
+// No subregion params — full CONUS download gives the fixed NX=451/NY=337 grid.
 
 function rapURLForHour(date) {
     const yyyy = date.getUTCFullYear();
     const ymd  = `${yyyy}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}`;
     const hh   = pad(date.getUTCHours());
     const params = new URLSearchParams({
-        file: `rap.t${hh}z.awip32f00.grib2`,
+        file: `rap.t${hh}z.awp130pgrbf00.grib2`,
         lev_surface:            'on',
         lev_500_mb:             'on',
         lev_10_m_above_ground:  'on',
@@ -267,7 +269,7 @@ function hlcyURLForHour(date) {
     const ymd  = `${yyyy}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}`;
     const hh   = pad(date.getUTCHours());
     const params = new URLSearchParams({
-        file: `rap.t${hh}z.awip32f00.grib2`,
+        file: `rap.t${hh}z.awp130pgrbf00.grib2`,
         var_HLCY: 'on',
         dir: `/rap.${ymd}`,
     });
@@ -348,26 +350,26 @@ async function refresh() {
         // ── 3. Single wgrib2 pass per file ───────────────────────────────────
         //
         // Main fields (from mainDest):
-        //   CAPE, CIN           — surface-based / mixed-layer (180-0 mb layer)
-        //   UGRD, VGRD          — 500mb isobaric  (upper wind)
-        //   UGRD, VGRD          — 10m AGL         (surface wind)
-        //   TMP, DPT            — 2m AGL           (for Bolton LCL)
-        //   UGRD, VGRD          — 6000-0m AGL layer (0-6km BWD; may be absent
-        //                         in awip32 — code falls back to 500mb–10m)
+        //   CAPE, CIN  — surface parcel (awp130p stores them at typeOfLevel=surface)
+        //   UGRD, VGRD — 500mb isobaric  (upper wind for shear fallback)
+        //   UGRD, VGRD — 10m AGL         (surface wind)
+        //   TMP, DPT   — 2m AGL          (Bolton LCL for STP)
+        //   UGRD, VGRD — 6000-0m AGL layer (0-6km BWD; absent in awp130p,
+        //                 fallback to 500mb–10m fires automatically)
         //
         // HLCY fields (from hlcyDest):
-        //   HLCY                — 0-1km SRH
+        //   HLCY       — 0-1km SRH
 
         const mainFields = [
-            { tag: 'cape', match: ':CAPE:180-0 mb above ground:' },
-            { tag: 'cin',  match: ':CIN:180-0 mb above ground:'  },
+            { tag: 'cape', match: ':CAPE:surface:'                },
+            { tag: 'cin',  match: ':CIN:surface:'                 },
             { tag: 'u500', match: ':UGRD:500 mb:'                },
             { tag: 'v500', match: ':VGRD:500 mb:'                },
             { tag: 'u10',  match: ':UGRD:10 m above ground:'     },
             { tag: 'v10',  match: ':VGRD:10 m above ground:'     },
             { tag: 't2m',  match: ':TMP:2 m above ground:'       },
             { tag: 'td2m', match: ':DPT:2 m above ground:'       },
-            // 0-6km layer winds — present in some awip32 versions; gracefully
+            // 0-6km layer winds — absent from awp130p; gracefully
             // absent if the bin file comes back null (fallback fires below).
             { tag: 'u6k',  match: ':UGRD:6000-0 m above ground:' },
             { tag: 'v6k',  match: ':VGRD:6000-0 m above ground:' },
