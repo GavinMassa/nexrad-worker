@@ -61,6 +61,15 @@ const LON_MAX = -60.92;
 // Internal hostname visible in Railway → sidecar service → Settings → Networking
 const SIDECAR_URL = process.env.SIDECAR_URL || null;
 
+// ── Blend response cache ─────────────────────────────────────────────────────
+// Sidecar produces a new blend once per hour. Cache the response body so
+// repeated iOS requests (e.g. app foreground, map pan/zoom) each serve
+// instantly from memory instead of fetching 14 MB from the sidecar.
+// TTL=55 min ensures the cache expires before the next sidecar cycle writes
+// new data, so clients always see the freshest available blend.
+let blendCache = null;   // { body: Buffer, meta: string, fetchedAt: number }
+const BLEND_CACHE_TTL = 55 * 60 * 1000;
+
 // ── In-memory state ──────────────────────────────────────────────────────────
 
 const state = {
@@ -586,38 +595,72 @@ async function handle(req, res) {
     }
 
     // ── GET /rap/blend/all ───────────────────────────────────────────────────
-    // Thin proxy to the Python sidecar's /blend/all endpoint.
-    // Forwards the binary body and X-Meso-Meta header unchanged.
+    // Proxy to the Python sidecar's /blend/all endpoint with in-process caching.
     // SIDECAR_URL must be set in the Node service environment variables:
     //   SIDECAR_URL = http://<internal-hostname>:4000
-    console.log('[rap] blend route hit, p=', p);
     if (p === '/blend/all') {
         if (!SIDECAR_URL) {
             res.writeHead(503, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'SIDECAR_URL env var not set' }));
             return true;
         }
+
+        // Cache hit — serve immediately without touching the sidecar.
+        // Content-Length is known so iOS gets a clean non-chunked response.
+        if (blendCache && Date.now() - blendCache.fetchedAt < BLEND_CACHE_TTL) {
+            res.writeHead(200, {
+                'Content-Type':                  'application/octet-stream',
+                'X-Meso-Meta':                   blendCache.meta,
+                'Access-Control-Allow-Origin':   '*',
+                'Access-Control-Expose-Headers': 'X-Meso-Meta',
+                'Cache-Control':                 'no-store',
+                'Content-Length':                String(blendCache.body.length),
+            });
+            res.end(blendCache.body);
+            return true;
+        }
+
+        // Cache miss — fetch from sidecar, stream to client, populate cache.
+        // Streaming with getReader() avoids a single large arrayBuffer()
+        // allocation; instead chunks (~64 KB each) are forwarded as they arrive
+        // and simultaneously accumulated to fill the cache for future requests.
         try {
-            const upstream = await fetch(`${SIDECAR_URL}/blend/all`);
+            const upstream = await fetch(`${SIDECAR_URL}/blend/all`, {
+                signal: AbortSignal.timeout(120_000),
+            });
             if (!upstream.ok) {
                 res.writeHead(upstream.status, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: `sidecar returned ${upstream.status}` }));
                 return true;
             }
-            const meta = upstream.headers.get('x-meso-meta');
-            const body = Buffer.from(await upstream.arrayBuffer());
+            const meta = upstream.headers.get('x-meso-meta') || '{}';
+
+            // Write headers before streaming — no Content-Length yet (chunked TE).
             res.writeHead(200, {
                 'Content-Type':                  'application/octet-stream',
-                'X-Meso-Meta':                   meta || '{}',
+                'X-Meso-Meta':                   meta,
                 'Access-Control-Allow-Origin':   '*',
                 'Access-Control-Expose-Headers': 'X-Meso-Meta',
                 'Cache-Control':                 'no-store',
-                'Content-Length':                String(body.length),
             });
-            res.end(body);
+            const chunks = [];
+            const reader = upstream.body.getReader();
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                chunks.push(Buffer.from(value));
+                res.write(value);
+            }
+            res.end();
+
+            // Assemble and cache the full body for subsequent requests this cycle.
+            blendCache = { body: Buffer.concat(chunks), meta, fetchedAt: Date.now() };
+            console.log(`[rap] blend cache updated: ${blendCache.body.length} bytes`);
         } catch (e) {
-            res.writeHead(502, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: `sidecar unreachable: ${e.message}` }));
+            if (!res.headersSent) {
+                res.writeHead(502, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: `sidecar unreachable: ${e.message}` }));
+            }
         }
         return true;
     }
