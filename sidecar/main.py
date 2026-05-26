@@ -16,6 +16,7 @@ log = logging.getLogger(__name__)
 # max_workers=2 — numpy-heavy and memory-intensive; more workers would
 # contend on the same physical cores and RAM.
 _thread_pool = ThreadPoolExecutor(max_workers=2)
+_cycle_lock  = asyncio.Lock()
 
 # Must match DOWNSAMPLE_FACTOR in writer.py.  The IDW runs on the same
 # 399×586 grid that ultimately gets written to disk — no information is
@@ -72,6 +73,14 @@ def _inject_downsampled(rtma_full: dict, stations: list) -> dict:
 
 
 async def run_cycle():
+    if _cycle_lock.locked():
+        log.warning('Previous cycle still running — skipping this tick')
+        return
+    async with _cycle_lock:
+        await _run_cycle_inner()
+
+
+async def _run_cycle_inner():
     now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     log.info(f'Starting cycle for {now.strftime("%Y-%m-%d %H:00Z")}')
     try:
