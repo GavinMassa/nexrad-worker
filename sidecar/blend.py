@@ -92,9 +92,20 @@ def blend(rtma: dict, rap: dict) -> dict:
     # --- SBCAPE: RAP CAPE corrected by RTMA vs RAP surface-T delta -------
     # RTMA has higher-resolution, assimilated surface T/Td. A 1 K warmer
     # surface shifts SBCAPE by ~180 J/kg (rule of thumb from operational NWP).
+    # Clamp delta_t to ±2 K to prevent spurious correction from interpolation
+    # artifacts (e.g. RAP extrapolation over Great Lakes → unclamped delta can
+    # reach +15 K → +2700 J/kg phantom CAPE over open water at night).
+    # Also suppress the correction entirely where RAP CAPE is near-zero
+    # (stable/water areas) — no need to shift 0 J/kg by surface-T bias.
     if cape_i is not None and t2m_rap is not None:
-        delta_t = t2m - t2m_rap
-        out['sbcape'] = np.maximum(0, cape_i + delta_t * 180.0).astype(np.float32)
+        delta_t_clamped  = np.clip(t2m - t2m_rap, -2.0, 2.0)
+        sbcape_corrected = np.maximum(0, cape_i + delta_t_clamped * 180.0)
+        cape_mask        = cape_i < 50.0          # stable / water / no CAPE
+        out['sbcape']    = np.where(
+            cape_mask,
+            np.maximum(0, cape_i),                # keep raw RAP value (≈ 0)
+            sbcape_corrected,
+        ).astype(np.float32)
     elif cape_i is not None:
         out['sbcape'] = np.maximum(0, cape_i)
         log.warning('blend: sbcape has no surface-T correction (t2m_rap missing)')

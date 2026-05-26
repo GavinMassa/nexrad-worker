@@ -77,13 +77,23 @@ def write_output(grids: dict, cycle_dt: datetime) -> None:
     # Write meta.json atomically last, after all .bin files are in place.
     # Node checks meta.json as a readiness signal — if it's present, every
     # .bin is fully written.
+    # Bbox always from original (non-downsampled) lats/lons.
+    # lons_180 is derived from src_lons before any zoom — corner values are
+    # preserved regardless of the downsample factor.
+    lat_min = float(src_lats.min())
+    lat_max = float(src_lats.max())
+    lon_min = float(lons_180.min())
+    lon_max = float(lons_180.max())
+    nx_new  = int(out_nx)
+    ny_new  = int(out_ny)
+
     meta = {
-        'nx':         int(out_nx),
-        'ny':         int(out_ny),
-        'lat_min':    float(src_lats.min()),
-        'lat_max':    float(src_lats.max()),
-        'lon_min':    float(lons_180.min()),
-        'lon_max':    float(lons_180.max()),
+        'nx':         nx_new,
+        'ny':         ny_new,
+        'lat_min':    lat_min,
+        'lat_max':    lat_max,
+        'lon_min':    lon_min,
+        'lon_max':    lon_max,
         'valid_time': cycle_dt.isoformat(),
         'params':     params,
         'source':     f'RTMA+RAP blend, downsampled {DOWNSAMPLE_FACTOR}× from {src_ny}×{src_nx}',
@@ -93,4 +103,6 @@ def write_output(grids: dict, cycle_dt: datetime) -> None:
     meta_tmp.write_text(json.dumps(meta))
     meta_tmp.replace(meta_final)  # atomic — Node sees either old or new, never partial
 
-    log.info(f'Wrote {len(params)} grids ({out_ny}×{out_nx}) to {OUT_DIR}: {params}')
+    log.info(f'meta bbox: lat {lat_min:.2f}–{lat_max:.2f}, lon {lon_min:.2f}–{lon_max:.2f}, '
+             f'nx={nx_new}, ny={ny_new}')
+    log.info(f'Wrote {len(params)} grids ({ny_new}×{nx_new}) to {OUT_DIR}: {params}')
