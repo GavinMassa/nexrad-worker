@@ -1,0 +1,6 @@
+cfgrib
+eccodes
+xarray
+scipy
+numpy
+httpx
