@@ -33,5 +33,13 @@ async def scheduler():
         await asyncio.sleep(wait)
         await run_cycle()
 
+async def main():
+    from server import start_server
+    runner = await start_server()
+    try:
+        await scheduler()
+    finally:
+        await runner.cleanup()
+
 if __name__ == '__main__':
-    asyncio.run(scheduler())
+    asyncio.run(main())

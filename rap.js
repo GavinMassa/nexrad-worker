@@ -57,6 +57,10 @@ const LAT_MAX = 47.84;
 const LON_MIN = -134.09;
 const LON_MAX = -60.92;
 
+// SIDECAR_URL env var: set to http://<internal-hostname>:4000
+// Internal hostname visible in Railway → sidecar service → Settings → Networking
+const SIDECAR_URL = process.env.SIDECAR_URL || null;
+
 // ── In-memory state ──────────────────────────────────────────────────────────
 
 const state = {
@@ -578,6 +582,42 @@ function handle(req, res) {
                 stp:   state.stp.length,
             } : null,
         }));
+        return true;
+    }
+
+    // ── GET /rap/blend/all ───────────────────────────────────────────────────
+    // Thin proxy to the Python sidecar's /blend/all endpoint.
+    // Forwards the binary body and X-Meso-Meta header unchanged.
+    // SIDECAR_URL must be set in the Node service environment variables:
+    //   SIDECAR_URL = http://<internal-hostname>:4000
+    if (p === '/blend/all') {
+        if (!SIDECAR_URL) {
+            res.writeHead(503, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'SIDECAR_URL env var not set' }));
+            return true;
+        }
+        try {
+            const upstream = await fetch(`${SIDECAR_URL}/blend/all`);
+            if (!upstream.ok) {
+                res.writeHead(upstream.status, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: `sidecar returned ${upstream.status}` }));
+                return true;
+            }
+            const meta = upstream.headers.get('x-meso-meta');
+            const body = Buffer.from(await upstream.arrayBuffer());
+            res.writeHead(200, {
+                'Content-Type':                  'application/octet-stream',
+                'X-Meso-Meta':                   meta || '{}',
+                'Access-Control-Allow-Origin':   '*',
+                'Access-Control-Expose-Headers': 'X-Meso-Meta',
+                'Cache-Control':                 'no-store',
+                'Content-Length':                String(body.length),
+            });
+            res.end(body);
+        } catch (e) {
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: `sidecar unreachable: ${e.message}` }));
+        }
         return true;
     }
 

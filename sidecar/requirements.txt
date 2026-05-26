@@ -4,3 +4,4 @@ xarray
 scipy
 numpy
 httpx
+aiohttp
