@@ -35,7 +35,7 @@ async def fetch_mesonet_obs() -> list[dict] | None:
     """
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
-            r = await client.get(IEM_CURRENT_URL, params={'metar': '1'})
+            r = await client.get(IEM_CURRENT_URL)
             r.raise_for_status()
             data = r.json()
     except Exception as e:
