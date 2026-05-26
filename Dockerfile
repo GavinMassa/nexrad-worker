@@ -21,7 +21,7 @@ RUN wget -q https://www.ftp.cpc.ncep.noaa.gov/wd51we/wgrib2/wgrib2.tgz \
  && tar xzf wgrib2.tgz \
  && cd grib2 \
  && export CC=gcc FC=gfortran \
- && make USE_AEC=0 \
+ && make USE_AEC=0 USE_OPENJPEG=0 \
  && cp wgrib2/wgrib2 /usr/local/bin/wgrib2 \
  && strip /usr/local/bin/wgrib2
 
