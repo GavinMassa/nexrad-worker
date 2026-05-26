@@ -1,6 +1,8 @@
 import asyncio, logging
+import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
+from scipy.ndimage import zoom
 from fetch_rtma import fetch_rtma
 from fetch_rap import fetch_rap
 from mesonet import fetch_mesonet_obs, inject_observations
@@ -14,6 +16,67 @@ log = logging.getLogger(__name__)
 # max_workers=2 — both tasks are numpy-heavy and memory-intensive; more than
 # 2 concurrent workers would contend on the same physical cores and RAM.
 _thread_pool = ThreadPoolExecutor(max_workers=2)
+
+# Must match DOWNSAMPLE_FACTOR in writer.py so the IDW runs on the same
+# resolution grid that ultimately gets written to disk.
+_IDW_FACTOR = 0.25
+
+
+def _inject_downsampled(rtma: dict, stations: list) -> dict:
+    """
+    Run mesonet IDW on a 0.25× downsampled RTMA grid, then upsample the
+    T/Td correction back to full resolution and apply it.
+
+    Why: the chunk-based IDW on the full 1597×2345 grid allocates
+    ~50 rows × 2345 cols × N_stations × 4 bytes per chunk.  At 8000+
+    stations that's ~3-4 GB per chunk — the process OOMs before finishing
+    a single row-slice.  The observation network spacing is 30-50 km, so
+    there is no information in the IDW correction at 2.5 km resolution;
+    running at 10 km (0.25× = ~400×586) is physically equivalent and
+    reduces the distance matrix 16× to ~240 MB peak.
+
+    Returns a new rtma dict with corrected full-resolution t2m / td2m.
+    All other keys (lats, lons, u10, v10) are carried over unchanged.
+    """
+    t2m_orig  = rtma['t2m']    # (1597, 2345) float32
+    td2m_orig = rtma['td2m']
+    ny, nx    = t2m_orig.shape
+
+    # Downsample all fields needed by inject_observations
+    lats_small = zoom(rtma['lats'], _IDW_FACTOR, order=1)
+    lons_small = zoom(rtma['lons'], _IDW_FACTOR, order=1)
+    t2m_small  = zoom(t2m_orig,    _IDW_FACTOR, order=1)
+    td2m_small = zoom(td2m_orig,   _IDW_FACTOR, order=1)
+
+    rtma_small = {
+        'lats': lats_small,
+        'lons': lons_small,
+        't2m':  t2m_small,
+        'td2m': td2m_small,
+        'u10':  zoom(rtma['u10'], _IDW_FACTOR, order=1),
+        'v10':  zoom(rtma['v10'], _IDW_FACTOR, order=1),
+    }
+
+    log.info(f'[mesonet] IDW running on downsampled grid '
+             f'{t2m_small.shape[0]}×{t2m_small.shape[1]} '
+             f'(full={ny}×{nx})')
+
+    # Run injection on the small grid — mesonet.py is unchanged
+    rtma_small_corrected = inject_observations(rtma_small, stations)
+
+    # Compute delta on small grid, upsample to full resolution
+    upsample      = 1.0 / _IDW_FACTOR
+    delta_t_full  = zoom(rtma_small_corrected['t2m']  - t2m_small,  upsample, order=1)
+    delta_td_full = zoom(rtma_small_corrected['td2m'] - td2m_small, upsample, order=1)
+
+    # Crop to exact original shape — zoom rounds and may produce ny±1 / nx±1
+    delta_t_full  = delta_t_full [:ny, :nx]
+    delta_td_full = delta_td_full[:ny, :nx]
+
+    corrected = dict(rtma)    # shallow copy — carries lats, lons, u10, v10 through
+    corrected['t2m']  = (t2m_orig  + delta_t_full ).astype(np.float32)
+    corrected['td2m'] = (td2m_orig + delta_td_full).astype(np.float32)
+    return corrected
 
 
 async def run_cycle():
@@ -38,21 +101,20 @@ async def run_cycle():
 
         loop = asyncio.get_running_loop()
 
-        # Inject mesonet obs into RTMA surface fields before blending.
-        # Runs in thread pool so the event loop stays free to serve /blend/all
-        # requests while the IDW analysis (CPU + memory bound) is in progress.
+        # Inject mesonet obs via downsampled IDW (see _inject_downsampled above).
+        # Runs in thread pool so the event loop stays free to serve /blend/all.
         if stations:
             try:
                 rtma = await loop.run_in_executor(
-                    _thread_pool, inject_observations, rtma, stations
+                    _thread_pool, _inject_downsampled, rtma, stations
                 )
             except Exception as e:
-                log.warning(f'[mesonet] inject_observations raised: {e} — '
+                log.warning(f'[mesonet] injection failed: {e} — '
                             f'continuing with raw RTMA', exc_info=True)
         else:
             log.warning('[mesonet] no obs available this cycle — using raw RTMA')
 
-        # Blend derivation is also CPU-heavy (gradient fields, interpolation).
+        # Blend derivation is also CPU-heavy (gradient fields, RAP interpolation).
         # Off-loaded to the same thread pool for the same reason.
         blended = await loop.run_in_executor(_thread_pool, do_blend, rtma, rap)
         write_output(blended, now)
