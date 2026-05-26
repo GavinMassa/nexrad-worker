@@ -375,7 +375,9 @@ async function refresh() {
             { tag: 'v6k',  match: ':VGRD:6000-0 m above ground:' },
         ];
         const hlcyFields = [
-            { tag: 'srh1', match: ':HLCY:0-1 km above ground:'  },
+            // wgrib2 formats RAP height layers in metres, not km.
+            // Inventory string: ":HLCY:0-1000 m above ground:"
+            { tag: 'srh1', match: ':HLCY:0-1000 m above ground:' },
         ];
 
         // Run both extractions concurrently (each is one file scan).
