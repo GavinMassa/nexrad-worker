@@ -180,15 +180,28 @@ function runWgrib2(gribPath, fields, stamp) {
                     result[f.tag] = new Float32Array(ab);
                 } else {
                     result[f.tag] = null;
-                    if (stderr) {
-                        console.warn(`[rap] wgrib2: no data for tag=${f.tag} match="${f.match}"`);
-                    }
+                    console.warn(`[rap] wgrib2: no data for tag=${f.tag} match="${f.match}" file=${path.basename(gribPath)}`);
+                    if (stderr) console.warn(`[rap] wgrib2 stderr: ${stderr.slice(0, 400)}`);
                 }
                 // Clean up immediately — these are intermediate files.
                 try { fs.unlinkSync(binPaths[f.tag]); } catch {}
             }
             resolve(result);
         });
+    });
+}
+
+/**
+ * Return the full wgrib2 inventory for a file as a string.
+ * Only use on small files (a handful of records) — stdout is buffered in memory.
+ */
+function getInventory(gribPath) {
+    return new Promise((resolve) => {
+        const proc = spawn('wgrib2', [gribPath], { stdio: ['ignore', 'pipe', 'ignore'] });
+        let out = '';
+        proc.stdout.on('data', d => { out += d.toString(); });
+        proc.on('error', () => resolve('(spawn failed)'));
+        proc.on('close', () => resolve(out.trim() || '(empty)'));
     });
 }
 
@@ -375,10 +388,23 @@ async function refresh() {
             { tag: 'v6k',  match: ':VGRD:6000-0 m above ground:' },
         ];
         const hlcyFields = [
-            // wgrib2 formats RAP height layers in metres, not km.
-            // Inventory string: ":HLCY:0-1000 m above ground:"
-            { tag: 'srh1', match: ':HLCY:0-1000 m above ground:' },
+            // wgrib2 -if uses POSIX ERE, so .* works.
+            // Match 0-1km SRH regardless of whether wgrib2 writes the layer as
+            // "0-1000 m above ground" or "1000-0 m above ground".
+            { tag: 'srh1', match: ':HLCY:.*1000' },
+            // Fallback: grab 0-3km SRH if 0-1km is absent from this file.
+            { tag: 'srh3', match: ':HLCY:.*3000' },
         ];
+
+        // Log HLCY file size + full inventory (small file; only 1-2 records).
+        // This appears in Railway logs and shows the exact wgrib2 level strings
+        // so we can verify the match patterns are correct.
+        const hlcySz = fs.existsSync(hlcyDest) ? fs.statSync(hlcyDest).size : 0;
+        console.log(`[rap] HLCY file size: ${hlcySz} bytes`);
+        if (hlcySz > 0) {
+            const hlcyInv = await getInventory(hlcyDest);
+            console.log(`[rap] HLCY inventory:\n${hlcyInv}`);
+        }
 
         // Run both extractions concurrently (each is one file scan).
         const [mainData, hlcyData] = await Promise.all([
@@ -388,12 +414,21 @@ async function refresh() {
         const d = { ...mainData, ...hlcyData };
 
         // Validate required fields.
-        const required = ['cape', 'u500', 'v500', 'u10', 'v10', 'srh1'];
+        const required = ['cape', 'u500', 'v500', 'u10', 'v10'];
         for (const tag of required) {
             if (!d[tag] || d[tag].length < NX * NY) {
                 throw new Error(`Required field missing or undersized: tag=${tag} ` +
                                 `got=${d[tag] ? d[tag].length : 0} expected=${NX * NY}`);
             }
+        }
+        // HLCY: prefer 0-1km, fall back to 0-3km, hard-fail if neither present.
+        if (d.srh1 && d.srh1.length >= NX * NY) {
+            console.log('[rap] using 0-1km SRH');
+        } else if (d.srh3 && d.srh3.length >= NX * NY) {
+            console.log('[rap] 0-1km SRH absent — falling back to 0-3km SRH');
+            d.srh1 = d.srh3;
+        } else {
+            throw new Error(`HLCY missing: srh1=${d.srh1?.length ?? 0} srh3=${d.srh3?.length ?? 0} expected=${NX * NY}`);
         }
 
         const n = NX * NY;
