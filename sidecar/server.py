@@ -3,7 +3,7 @@ from pathlib import Path
 from aiohttp import web
 
 log = logging.getLogger(__name__)
-OUT_DIR = Path('/tmp/sidecar-out')
+OUT_DIR = Path('/app/sidecar-out')
 PORT = int(os.environ.get('SIDECAR_PORT', '4000'))
 
 async def handle_all(request):
@@ -56,10 +56,17 @@ async def handle_status(request):
     except Exception as e:
         return web.json_response({'ready': False, 'error': str(e)})
 
+async def handle_health(request):
+    """Lightweight liveness probe — always returns 200 immediately.
+    Keeps Railway from killing the container during long IDW/blend cycles."""
+    return web.Response(text='ok')
+
 async def start_server():
     app = web.Application()
     app.router.add_get('/blend/all',    handle_all)
     app.router.add_get('/blend/status', handle_status)
+    app.router.add_get('/health',       handle_health)
+    app.router.add_get('/healthz',      handle_health)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)

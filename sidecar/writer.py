@@ -5,7 +5,7 @@ from datetime import datetime
 from scipy.ndimage import zoom
 
 log = logging.getLogger(__name__)
-OUT_DIR = Path('/tmp/sidecar-out')
+OUT_DIR = Path('/app/sidecar-out')
 OUT_DIR.mkdir(exist_ok=True)
 
 # Downsample factor applied to all param grids before writing.
