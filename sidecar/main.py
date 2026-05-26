@@ -1,5 +1,5 @@
 import asyncio, logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from fetch_rtma import fetch_rtma
 from writer import write_output
 
@@ -26,7 +26,8 @@ async def scheduler():
         # Next :28 past the hour
         next_run = now.replace(minute=28, second=0, microsecond=0)
         if now >= next_run:
-            next_run = next_run.replace(hour=next_run.hour + 1)
+            # timedelta addition handles hour=23 → next day correctly.
+            next_run = (next_run + timedelta(hours=1)).replace(minute=28, second=0, microsecond=0)
         wait = (next_run - now).total_seconds()
         log.info(f'Next cycle in {wait:.0f}s at {next_run.strftime("%H:%M")}Z')
         await asyncio.sleep(wait)

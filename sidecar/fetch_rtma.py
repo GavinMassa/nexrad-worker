@@ -1,4 +1,4 @@
-import asyncio, logging, tempfile, os
+import asyncio, logging, tempfile
 from pathlib import Path
 from datetime import datetime, timezone
 import httpx
@@ -67,45 +67,47 @@ async def fetch_rtma(cycle_dt: datetime) -> dict | None:
         # Both offsets exhausted without a break.
         return None
 
-    # Extract fields with cfgrib.
+    # Log the cfgrib inventory so Railway logs show exactly what's in the file.
+    # Helps diagnose shortName / parameterNumber mismatches without re-deploying.
+    try:
+        all_ds = cfgrib.open_datasets(str(dest))
+        for i, ds in enumerate(all_ds):
+            log.info(f'  cfgrib dataset[{i}]: vars={list(ds.data_vars)} '
+                     f'dims={dict(ds.dims)}')
+    except Exception as e:
+        log.warning(f'cfgrib inventory scan failed (non-fatal): {e}')
+
+    # Extract fields with cfgrib using raw GRIB2 parameter numbers.
+    # These are stable WMO codes and don't depend on eccodes shortName tables:
+    #   TMP  → discipline=0, parameterCategory=0, parameterNumber=0
+    #   DPT  → discipline=0, parameterCategory=0, parameterNumber=6
+    #   UGRD → discipline=0, parameterCategory=2, parameterNumber=2
+    #   VGRD → discipline=0, parameterCategory=2, parameterNumber=3
+    FIELDS = [
+        ('t2m',  {'discipline': 0, 'parameterCategory': 0, 'parameterNumber': 0,
+                  'typeOfLevel': 'heightAboveGround', 'level': 2}),
+        ('td2m', {'discipline': 0, 'parameterCategory': 0, 'parameterNumber': 6,
+                  'typeOfLevel': 'heightAboveGround', 'level': 2}),
+        ('u10',  {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 2,
+                  'typeOfLevel': 'heightAboveGround', 'level': 10}),
+        ('v10',  {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 3,
+                  'typeOfLevel': 'heightAboveGround', 'level': 10}),
+    ]
+
     try:
         fields: dict = {}
-
-        # T2m and Td2m — 2 m above ground.
-        for short_name, key in [('2t', 't2m'), ('2d', 'td2m')]:
-            ds = cfgrib.open_dataset(
-                str(dest),
-                filter_by_keys={
-                    'shortName':   short_name,
-                    'typeOfLevel': 'heightAboveGround',
-                    'level':       2,
-                },
-            )
+        for key, filter_keys in FIELDS:
+            ds = cfgrib.open_dataset(str(dest), filter_by_keys=filter_keys)
             var_name = list(ds.data_vars)[0]
             fields[key] = ds[var_name].values.astype(np.float32)
+            log.info(f'  {key}: var="{var_name}" shape={fields[key].shape} '
+                     f'sample={fields[key].flat[0]:.2f}')
             if 'lats' not in fields:
                 fields['lats'] = ds['latitude'].values.astype(np.float32)
                 fields['lons'] = ds['longitude'].values.astype(np.float32)
 
-        # U10 and V10 — 10 m above ground.
-        for short_name, key in [('10u', 'u10'), ('10v', 'v10')]:
-            ds = cfgrib.open_dataset(
-                str(dest),
-                filter_by_keys={
-                    'shortName':   short_name,
-                    'typeOfLevel': 'heightAboveGround',
-                    'level':       10,
-                },
-            )
-            var_name = list(ds.data_vars)[0]
-            fields[key] = ds[var_name].values.astype(np.float32)
-
         ny, nx = fields['t2m'].shape
-        log.info(
-            f'RTMA extracted: ny={ny} nx={nx} '
-            f't2m_sample={fields["t2m"].flat[0]:.1f}K '
-            f'td2m_sample={fields["td2m"].flat[0]:.1f}K'
-        )
+        log.info(f'RTMA extracted OK: ny={ny} nx={nx}')
 
     except Exception as e:
         log.error(f'RTMA cfgrib extraction failed: {e}', exc_info=True)
