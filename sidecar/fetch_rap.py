@@ -144,10 +144,18 @@ def _extract_rap(main_path: Path, hlcy_path: Path) -> dict:
                 log.info(f'    dataset[{i}]: vars={list(ds.data_vars)} dims={dict(ds.dims)}')
                 for var in ds.data_vars:
                     arr = ds[var].values
-                    if arr.shape == (337, 451):
+                    # cfgrib stacks both HLCY layers (0-1km and 0-3km) along a
+                    # heightAboveGroundLayer dimension → shape (2, 337, 451).
+                    # Index 0 is the 0-1km layer (shorter layer listed first).
+                    if arr.ndim == 3 and arr.shape[1:] == (337, 451):
+                        srh = arr[0].astype(np.float32)
+                        log.info(f'    using dataset[{i}].{var}[0] (0-1km) '
+                                 f'shape={srh.shape} sample={srh.flat[0]:.2f}')
+                        break
+                    elif arr.shape == (337, 451):
                         srh = arr.astype(np.float32)
                         log.info(f'    using dataset[{i}].{var} shape={arr.shape} '
-                                 f'sample={arr.flat[0]:.2f}')
+                                 f'sample={srh.flat[0]:.2f}')
                         break
                 if srh is not None:
                     break
