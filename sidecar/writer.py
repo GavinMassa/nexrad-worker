@@ -32,7 +32,24 @@ def write_output(grids: dict, cycle_dt: datetime) -> None:
     downsampling.
     """
     params = [k for k in grids if k not in ('lats', 'lons')]
-    src_ny, src_nx = grids['lats'].shape
+    src_lats = grids['lats']
+    src_lons = grids['lons']
+    src_ny, src_nx = src_lats.shape
+
+    # ── Coordinate normalisation ─────────────────────────────────────────────
+    # RTMA stores longitudes in 0..360 (eastward from Greenwich). iOS/MapKit
+    # expects -180..180. Without this fix, CLLocationCoordinate2D(longitude:221)
+    # falls outside Mercator → MKMapPoint(-1,-1) → zero-size overlay rect
+    # → nothing renders.
+    lons_180 = np.where(src_lons > 180.0, src_lons - 360.0, src_lons)
+
+    # RTMA's native scan order has row 0 = SW corner (lat_min, southernmost).
+    # iOS RAPGridOverlay maps texture row 0 → lat_max (northernmost), so we
+    # must flip the data N→S before writing. Same bug we hit for /rap/all,
+    # fixed there with wgrib2's -order we:ns flag.
+    flip_rows = bool(src_lats[0, 0] < src_lats[-1, 0])
+    if flip_rows:
+        log.info('RTMA grid is S→N (row 0 = lat_min); flipping rows for iOS')
 
     # Downsample one param first to learn the resulting shape so meta.json
     # carries accurate dimensions (zoom rounds; 1597 * 0.25 = 399.25 → 399).
@@ -40,6 +57,8 @@ def write_output(grids: dict, cycle_dt: datetime) -> None:
 
     for param in params:
         src = grids[param].astype(np.float32)
+        if flip_rows:
+            src = np.flipud(src)
         out = zoom(src, DOWNSAMPLE_FACTOR, order=1).astype(np.float32)
         if out_ny is None:
             out_ny, out_nx = out.shape
@@ -61,10 +80,10 @@ def write_output(grids: dict, cycle_dt: datetime) -> None:
     meta = {
         'nx':         int(out_nx),
         'ny':         int(out_ny),
-        'lat_min':    float(grids['lats'].min()),
-        'lat_max':    float(grids['lats'].max()),
-        'lon_min':    float(grids['lons'].min()),
-        'lon_max':    float(grids['lons'].max()),
+        'lat_min':    float(src_lats.min()),
+        'lat_max':    float(src_lats.max()),
+        'lon_min':    float(lons_180.min()),
+        'lon_max':    float(lons_180.max()),
         'valid_time': cycle_dt.isoformat(),
         'params':     params,
         'source':     f'RTMA+RAP blend, downsampled {DOWNSAMPLE_FACTOR}× from {src_ny}×{src_nx}',
