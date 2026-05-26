@@ -29,9 +29,13 @@ def _interp_to_rtma(rap_field: np.ndarray,
     if flip_lat:
         lats_1d = lats_1d[::-1]
 
+    # fill_value=0 stops linear extrapolation from exploding outside the
+    # RAP domain (RTMA extends past RAP edges → NaN/inf without this).
+    # Out-of-domain pixels become 0; the iOS draw range filter then hides
+    # them automatically (CAPE<100, SRH<25, etc.).
     interp = RegularGridInterpolator(
         (lats_1d, lons_1d), field,
-        method='linear', bounds_error=False, fill_value=None,
+        method='linear', bounds_error=False, fill_value=0.0,
     )
     pts = np.stack([rtma_lats.ravel(), rtma_lons.ravel()], axis=-1)
     out = interp(pts).reshape(rtma_lats.shape)
