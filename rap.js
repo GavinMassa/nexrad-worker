@@ -590,6 +590,7 @@ async function handle(req, res) {
     // Forwards the binary body and X-Meso-Meta header unchanged.
     // SIDECAR_URL must be set in the Node service environment variables:
     //   SIDECAR_URL = http://<internal-hostname>:4000
+    console.log('[rap] blend route hit, p=', p);
     if (p === '/blend/all') {
         if (!SIDECAR_URL) {
             res.writeHead(503, { 'Content-Type': 'application/json' });
