@@ -1,11 +1,10 @@
-# Railway / Nixpacks build config.
+# Railway / Nixpacks config — superseded by Dockerfile.
 #
-# Adds python3 (nix) and eccodes via the Debian apt package. We use apt for
-# eccodes rather than nix because Nixpacks doesn't reliably propagate
-# binaries from `nixPkgs` onto the runtime PATH — `eccodes` from nix installs
-# but `which grib_get_data` returns nothing at runtime. The apt package
-# `libeccodes-tools` puts `grib_get_data` in /usr/bin, always on PATH.
+# When a Dockerfile is present Railway uses it directly (Docker build), so
+# this file is not active.  It is kept for reference only.
+#
+# wgrib2 is NOT available as a Debian or Nix package; it must be compiled
+# from NCEP source.  See Dockerfile for the multi-stage build that does this.
 
 [phases.setup]
-nixPkgs = ["python3"]
-aptPkgs = ["libeccodes-tools"]
+aptPkgs = ["ca-certificates", "curl"]
