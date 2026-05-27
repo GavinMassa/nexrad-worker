@@ -219,17 +219,20 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
     # reach +15 K → +2700 J/kg phantom CAPE over open water at night).
     # Also suppress the correction entirely where RAP CAPE is near-zero
     # (stable/water areas) — no need to shift 0 J/kg by surface-T bias.
+    SBCAPE_MIN = 150.0   # J/kg — display gate
     if cape_i is not None and t2m_rap is not None:
         delta_t_clamped  = np.clip(t2m - t2m_rap, -2.0, 2.0)
         sbcape_corrected = np.maximum(0, cape_i + delta_t_clamped * 180.0)
         cape_mask        = cape_i < 50.0          # stable / water / no CAPE
-        out['sbcape']    = np.where(
+        raw_sbcape       = np.where(
             cape_mask,
             np.maximum(0, cape_i),                # keep raw RAP value (≈ 0)
             sbcape_corrected,
         ).astype(np.float32)
+        out['sbcape'] = np.where(raw_sbcape >= SBCAPE_MIN, raw_sbcape, 0.0).astype(np.float32)
     elif cape_i is not None:
-        out['sbcape'] = np.maximum(0, cape_i)
+        raw_sbcape    = np.maximum(0, cape_i).astype(np.float32)
+        out['sbcape'] = np.where(raw_sbcape >= SBCAPE_MIN, raw_sbcape, 0.0).astype(np.float32)
         log.warning('blend: sbcape has no surface-T correction (t2m_rap missing)')
     else:
         log.warning('blend: sbcape skipped (cape missing)')
