@@ -253,17 +253,22 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
     # curvature common in LJ environments and QLCS setups better than a
     # single 500mb-10m difference.
     # Falls back to single-layer 500mb-10m if 850mb is missing.
+    # Gate: values below 30 m/s are zeroed — iOS renderer skips 0-value cells,
+    # so only operationally significant shear (≥30 m/s) produces contours.
+    BWD6_MIN = 30.0   # m/s — display gate
     if u500_i is not None and v500_i is not None:
         if u850_i is not None and v850_i is not None:
             # Two-layer: |V850-V10| + |V500-V850|
             layer1 = np.sqrt((u850_i - u10)**2 + (v850_i - v10)**2)
             layer2 = np.sqrt((u500_i - u850_i)**2 + (v500_i - v850_i)**2)
-            out['bwd6'] = (layer1 + layer2).astype(np.float32)
+            raw = (layer1 + layer2).astype(np.float32)
             log.info('bwd6: two-layer (10m→850mb→500mb)')
         else:
             # Fallback: single-layer 500mb-10m
-            out['bwd6'] = np.sqrt((u500_i - u10)**2 + (v500_i - v10)**2).astype(np.float32)
+            raw = np.sqrt((u500_i - u10)**2 + (v500_i - v10)**2).astype(np.float32)
             log.warning('bwd6: fallback to single-layer (u850/v850 missing)')
+        out['bwd6'] = np.where(raw >= BWD6_MIN, raw, 0.0).astype(np.float32)
+        log.info(f'bwd6: gate={BWD6_MIN}m/s, active={int((raw >= BWD6_MIN).sum())} cells')
     else:
         log.warning('blend: bwd6 skipped (u500/v500 missing)')
 
