@@ -255,7 +255,7 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
     # Falls back to single-layer 500mb-10m if 850mb is missing.
     # Gate: values below 30 m/s are zeroed — iOS renderer skips 0-value cells,
     # so only operationally significant shear (≥30 m/s) produces contours.
-    BWD6_MIN = 30.0   # m/s — display gate
+    BWD6_MIN = 15.0   # m/s — display gate
     if u500_i is not None and v500_i is not None:
         if u850_i is not None and v850_i is not None:
             # Two-layer: |V850-V10| + |V500-V850|
