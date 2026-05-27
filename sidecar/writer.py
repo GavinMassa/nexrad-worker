@@ -15,6 +15,19 @@ OUT_DIR.mkdir(exist_ok=True)
 # Bilinear (order=1) interpolation — visually smooth, no ringing.
 DOWNSAMPLE_FACTOR = 0.25
 
+# GOES-19 CONUS sector bbox — must exactly match iOS SLIDERImageOverlay constants:
+#   sliderCONUSLatMin = 14.568
+#   sliderCONUSLatMax = 53.297
+#   sliderCONUSLonMin = -135.038
+#   sliderCONUSLonMax = -59.975
+# All blend grids are clipped to this bbox before writing so the overlay
+# co-registers perfectly with the satellite background on iOS.
+CLIP_LAT_MIN: float = 14.568
+CLIP_LAT_MAX: float = 53.297
+CLIP_LON_MIN: float = -135.038
+CLIP_LON_MAX: float = -59.975
+
+
 def write_output(grids: dict, cycle_dt: datetime) -> None:
     """
     Write completed grids to OUT_DIR atomically (write → .tmp, then os.replace).
@@ -26,10 +39,13 @@ def write_output(grids: dict, cycle_dt: datetime) -> None:
         - 'lons': np.ndarray (float32, shape ny×nx)
     cycle_dt: the valid time for this analysis cycle.
 
-    Each param grid is downsampled by DOWNSAMPLE_FACTOR (bilinear) before
-    being written. lats/lons themselves are not written — only their min/max
-    go into meta.json's bbox, and those corner values are preserved across
-    downsampling.
+    Pipeline per call:
+      1. Normalise lons 0..360 → -180..180
+      2. Determine S→N flip flag (before clip — clip doesn't change scan order)
+      3. Clip all grids to GOES satellite bbox (CLIP_LAT/LON_MIN/MAX)
+      4. Flip clipped grids N→S if needed
+      5. Downsample by DOWNSAMPLE_FACTOR (bilinear)
+      6. Write .bin files atomically, then meta.json
     """
     params = [k for k in grids if k not in ('lats', 'lons')]
     src_lats = grids['lats']
@@ -43,26 +59,46 @@ def write_output(grids: dict, cycle_dt: datetime) -> None:
     # → nothing renders.
     lons_180 = np.where(src_lons > 180.0, src_lons - 360.0, src_lons)
 
+    # ── Flip flag (determined on full grid, before clip) ─────────────────────
     # RTMA's native scan order has row 0 = SW corner (lat_min, southernmost).
     # iOS RAPGridOverlay maps texture row 0 → lat_max (northernmost), so we
-    # must flip the data N→S before writing. Same bug we hit for /rap/all,
-    # fixed there with wgrib2's -order we:ns flag.
+    # must flip the data N→S before writing.
+    # The clip step below does not change scan order — flip_rows remains valid.
     flip_rows = bool(src_lats[0, 0] < src_lats[-1, 0])
     if flip_rows:
         log.info('RTMA grid is S→N (row 0 = lat_min); flipping rows for iOS')
 
-    # Downsample one param first to learn the resulting shape so meta.json
-    # carries accurate dimensions (zoom rounds; 1597 * 0.25 = 399.25 → 399).
+    # ── Spatial clip to GOES satellite bbox ──────────────────────────────────
+    # Use centre column/row for 1D lat/lon extraction — RTMA is curvilinear
+    # (Lambert Conformal), so the outer columns curve and are not representative.
+    row_lats = src_lats[:, src_lats.shape[1] // 2]   # centre-column lat per row
+    col_lons = lons_180[lons_180.shape[0] // 2, :]   # centre-row lon per column
+
+    row_mask = (row_lats >= CLIP_LAT_MIN) & (row_lats <= CLIP_LAT_MAX)
+    col_mask = (col_lons >= CLIP_LON_MIN) & (col_lons <= CLIP_LON_MAX)
+
+    src_lats_clipped = src_lats[np.ix_(row_mask, col_mask)]
+    lons_180_clipped = lons_180[np.ix_(row_mask, col_mask)]
+    src_ny_clip, src_nx_clip = src_lats_clipped.shape
+
+    log.info(f'Clip: {src_ny}×{src_nx} → {src_ny_clip}×{src_nx_clip} '
+             f'(lat {src_lats_clipped.min():.2f}–{src_lats_clipped.max():.2f}, '
+             f'lon {lons_180_clipped.min():.2f}–{lons_180_clipped.max():.2f})')
+
+    # ── Param loop: clip → flip → downsample → write ─────────────────────────
     out_ny, out_nx = None, None
 
     for param in params:
         src = grids[param].astype(np.float32)
+        # Clip to satellite bbox (row + column boolean index)
+        src = src[np.ix_(row_mask, col_mask)]
+        # Flip S→N if needed (same flag — clipping doesn't change scan order)
         if flip_rows:
             src = np.flipud(src)
         out = zoom(src, DOWNSAMPLE_FACTOR, order=1).astype(np.float32)
         if out_ny is None:
             out_ny, out_nx = out.shape
-            log.info(f'Downsample: {src_ny}×{src_nx} → {out_ny}×{out_nx} '
+            log.info(f'Downsample: {src_ny_clip}×{src_nx_clip} → {out_ny}×{out_nx} '
                      f'(factor={DOWNSAMPLE_FACTOR})')
 
         final = OUT_DIR / f'{param}.bin'
@@ -72,18 +108,15 @@ def write_output(grids: dict, cycle_dt: datetime) -> None:
 
     # Fallback if params was empty (defensive — shouldn't happen).
     if out_ny is None:
-        out_ny, out_nx = src_ny, src_nx
+        out_ny, out_nx = src_ny_clip, src_nx_clip
 
-    # Write meta.json atomically last, after all .bin files are in place.
-    # Node checks meta.json as a readiness signal — if it's present, every
-    # .bin is fully written.
-    # Bbox always from original (non-downsampled) lats/lons.
-    # lons_180 is derived from src_lons before any zoom — corner values are
-    # preserved regardless of the downsample factor.
-    lat_min = float(src_lats.min())
-    lat_max = float(src_lats.max())
-    lon_min = float(lons_180.min())
-    lon_max = float(lons_180.max())
+    # ── meta.json ─────────────────────────────────────────────────────────────
+    # Bbox from clipped (not full-domain, not downsampled) lats/lons.
+    # These match the GOES satellite bbox so iOS overlay co-registers exactly.
+    lat_min = float(src_lats_clipped.min())
+    lat_max = float(src_lats_clipped.max())
+    lon_min = float(lons_180_clipped.min())
+    lon_max = float(lons_180_clipped.max())
     nx_new  = int(out_nx)
     ny_new  = int(out_ny)
 
@@ -96,7 +129,8 @@ def write_output(grids: dict, cycle_dt: datetime) -> None:
         'lon_max':    lon_max,
         'valid_time': cycle_dt.isoformat(),
         'params':     params,
-        'source':     f'RTMA+RAP blend, downsampled {DOWNSAMPLE_FACTOR}× from {src_ny}×{src_nx}',
+        'source':     f'RTMA+RAP blend, clipped+downsampled {DOWNSAMPLE_FACTOR}× '
+                      f'from {src_ny}×{src_nx} → {src_ny_clip}×{src_nx_clip}',
     }
     meta_final = OUT_DIR / 'meta.json'
     meta_tmp   = OUT_DIR / 'meta.json.tmp'

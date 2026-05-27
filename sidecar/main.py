@@ -182,19 +182,27 @@ async def run_cycle():
             # ensures KDTree nearest-gridpoint lookup uses the correct geometry.
             # lons converted to -180..180 to match station coordinates.
             def _save_rtma_ref(rtma_full):
+                from writer import CLIP_LAT_MIN, CLIP_LAT_MAX, CLIP_LON_MIN, CLIP_LON_MAX
                 lons_raw = rtma_full['lons']
                 lons_180 = np.where(lons_raw > 180.0, lons_raw - 360.0, lons_raw)
+                lats = rtma_full['lats']
+                # Clip to GOES bbox using centre column/row (same logic as writer.py)
+                # so mesonet_worker() reference grids match the blend output domain.
+                row_lats = lats[:, lats.shape[1] // 2]
+                col_lons = lons_180[lons_180.shape[0] // 2, :]
+                row_mask = (row_lats >= CLIP_LAT_MIN) & (row_lats <= CLIP_LAT_MAX)
+                col_mask = (col_lons >= CLIP_LON_MIN) & (col_lons <= CLIP_LON_MAX)
                 saves = [
-                    (OUT_DIR / 'rtma_t2m_small.bin',  ndimage_zoom(rtma_full['t2m'],  FACTOR, order=1)),
-                    (OUT_DIR / 'rtma_td2m_small.bin', ndimage_zoom(rtma_full['td2m'], FACTOR, order=1)),
-                    (OUT_DIR / 'rtma_lats_small.bin', ndimage_zoom(rtma_full['lats'], FACTOR, order=1)),
-                    (OUT_DIR / 'rtma_lons_small.bin', ndimage_zoom(lons_180,          FACTOR, order=1)),
+                    (OUT_DIR / 'rtma_t2m_small.bin',  ndimage_zoom(rtma_full['t2m'][np.ix_(row_mask, col_mask)],  FACTOR, order=1)),
+                    (OUT_DIR / 'rtma_td2m_small.bin', ndimage_zoom(rtma_full['td2m'][np.ix_(row_mask, col_mask)], FACTOR, order=1)),
+                    (OUT_DIR / 'rtma_lats_small.bin', ndimage_zoom(lats[np.ix_(row_mask, col_mask)],              FACTOR, order=1)),
+                    (OUT_DIR / 'rtma_lons_small.bin', ndimage_zoom(lons_180[np.ix_(row_mask, col_mask)],          FACTOR, order=1)),
                 ]
                 for fpath, arr in saves:
                     tmp = fpath.parent / (fpath.name + '.tmp')
                     arr.astype(np.float32).tofile(str(tmp))
                     tmp.replace(fpath)
-                log.info('[mesonet] saved RTMA reference grids (t2m, td2m, lats, lons)')
+                log.info('[mesonet] saved clipped RTMA reference grids (t2m, td2m, lats, lons)')
 
             await loop.run_in_executor(_thread_pool, _save_rtma_ref, rtma)
 
