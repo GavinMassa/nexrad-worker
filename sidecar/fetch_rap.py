@@ -19,6 +19,7 @@ def rap_main_url(dt: datetime) -> str:
         'var_TMP':  'on', 'var_DPT':  'on',
         'lev_surface':           'on',
         'lev_500_mb':            'on',
+        'lev_850_mb':            'on',
         'lev_10_m_above_ground': 'on',
         'lev_2_m_above_ground':  'on',
         'dir': f'/rap.{ymd}',
@@ -123,6 +124,12 @@ def _extract_rap(main_path: Path, hlcy_path: Path) -> dict:
                      'typeOfLevel': 'isobaricInhPa', 'level': 500}, 'u500')
     _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 3,
                      'typeOfLevel': 'isobaricInhPa', 'level': 500}, 'v500')
+
+    # U/V at 850mb (~1500m AGL) — intermediate layer for two-layer BWD6
+    _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 2,
+                     'typeOfLevel': 'isobaricInhPa', 'level': 850}, 'u850')
+    _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 3,
+                     'typeOfLevel': 'isobaricInhPa', 'level': 850}, 'v850')
 
     # U/V at 10m AGL
     _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 2,

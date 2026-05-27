@@ -6,3 +6,4 @@ numpy
 httpx
 aiohttp
 psutil
+netCDF4

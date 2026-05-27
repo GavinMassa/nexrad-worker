@@ -63,13 +63,101 @@ def _interp_to_rtma(rap_field: np.ndarray,
     out = interp(pts).reshape(rtma_lats.shape)
     return out.astype(np.float32)
 
-def blend(rtma: dict, rap: dict) -> dict:
+
+def apply_tpw_correction(
+    td2m:      np.ndarray,   # RTMA Td (ny, nx) K
+    rtma_lats: np.ndarray,   # (ny, nx)
+    rtma_lons: np.ndarray,   # (ny, nx) 0-360 or -180..180
+    tpw_data:  dict | None,  # output of fetch_tpw._extract_tpw or None
+) -> np.ndarray:
+    """
+    Blend GOES-18 TPW into RTMA Td to correct moisture depth.
+
+    Method (Spar & Thompson 2019 approximation):
+      1. Convert RTMA Td to equivalent TPW using Bolton (1980) approximation:
+           e_s = 6.112 * exp(17.67 * (Td-273.15) / (Td-273.15+243.5))  hPa
+           TPW_rtma ≈ 2.0 * e_s  (rule of thumb, ~valid for 1000-850mb layer)
+      2. Interpolate GOES TPW to RTMA grid using KDTree nearest-neighbor
+      3. Compute TPW innovation: delta_tpw = TPW_goes - TPW_rtma
+      4. Convert TPW innovation back to Td correction via inverse Bolton:
+           delta_Td ≈ delta_tpw / (d(TPW)/d(Td))
+      5. Clamp correction to ±3K, apply to RTMA Td
+
+    Returns corrected Td (float32, same shape as input).
+    Leaves Td unchanged if tpw_data is None.
+    """
+    if tpw_data is None:
+        return td2m
+
+    try:
+        from scipy.spatial import KDTree
+
+        tpw_arr  = tpw_data['tpw']    # (ny_goes, nx_goes) mm, NaN over no-data
+        tpw_lats = tpw_data['lats']
+        tpw_lons = tpw_data['lons']
+
+        # Normalise GOES lons to same convention as RTMA lons
+        rtma_lons_norm = np.where(rtma_lons > 180.0, rtma_lons - 360.0, rtma_lons)
+        tpw_lons_norm  = np.where(tpw_lons  > 180.0, tpw_lons  - 360.0, tpw_lons)
+
+        # Build KDTree over valid GOES TPW points only
+        valid_mask = np.isfinite(tpw_arr)
+        if valid_mask.sum() < 1000:
+            log.warning('[tpw] too few valid TPW pixels — skipping correction')
+            return td2m
+
+        valid_lats = tpw_lats[valid_mask]
+        valid_lons = tpw_lons_norm[valid_mask]
+        valid_tpw  = tpw_arr[valid_mask]
+
+        tpw_pts = np.column_stack([valid_lats, valid_lons])
+        tree    = KDTree(tpw_pts)
+
+        # Interpolate to RTMA grid
+        rtma_pts = np.column_stack([rtma_lats.ravel(), rtma_lons_norm.ravel()])
+        dists, idx = tree.query(rtma_pts, k=1)
+
+        # Mask out RTMA points too far from any GOES pixel (>0.1° ≈ 11km)
+        far_mask = dists > 0.1
+        tpw_interp = valid_tpw[idx].reshape(rtma_lats.shape)
+        tpw_interp[far_mask.reshape(rtma_lats.shape)] = np.nan
+
+        # RTMA Td → equivalent TPW (Bolton approximation)
+        td_c     = td2m - 273.15   # K → °C
+        e_s      = 6.112 * np.exp(17.67 * td_c / (td_c + 243.5))  # hPa
+        tpw_rtma = 2.0 * e_s       # mm (approximate)
+
+        # TPW innovation → Td correction
+        delta_tpw = tpw_interp - tpw_rtma   # mm
+        # Inverse Bolton: dTd ≈ delta_tpw / (d(TPW)/d(Td))
+        # d(TPW)/d(Td) = 2 * d(e_s)/d(Td) = 2 * e_s * 17.67*243.5 / (td_c+243.5)^2
+        dtpw_dtd = 2.0 * e_s * 17.67 * 243.5 / (td_c + 243.5)**2
+        dtpw_dtd = np.maximum(dtpw_dtd, 0.1)   # avoid division by zero
+        delta_td = delta_tpw / dtpw_dtd         # K
+
+        # Clamp to ±3K — prevents artifacts from GOES retrieval errors
+        delta_td = np.clip(delta_td, -3.0, 3.0)
+        delta_td = np.where(np.isfinite(delta_td), delta_td, 0.0)
+
+        n_corrected = int((np.abs(delta_td) > 0.1).sum())
+        log.info(f'[tpw] {n_corrected} gridpoints corrected, '
+                 f'max|ΔTd|={float(np.abs(delta_td).max()):.2f}K')
+
+        return (td2m + delta_td).astype(np.float32)
+
+    except Exception as e:
+        log.warning(f'[tpw] correction failed: {e} — using raw RTMA Td')
+        return td2m
+
+
+def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
     """
     Blend RTMA 2.5km surface fields with RAP 13km upper-air fields.
 
-    rtma: output of fetch_rtma  — t2m, td2m, u10, v10, lats, lons
-    rap:  output of fetch_rap   — cape, cin, srh1, u500, v500, u10, v10,
-                                   t2m_rap, td2m_rap, lats_rap, lons_rap
+    rtma:     output of fetch_rtma  — t2m, td2m, u10, v10, lats, lons
+    rap:      output of fetch_rap   — cape, cin, srh1, u500, v500, u850, v850,
+                                      u10, v10, t2m_rap, td2m_rap, lats_rap, lons_rap
+    tpw_data: output of fetch_tpw   — tpw, lats, lons (float32 2D arrays); or None
 
     Returns dict of float32 grids on the RTMA 2.5km grid, plus lats/lons.
     Missing inputs produce a warning and the dependent params are omitted
@@ -97,6 +185,8 @@ def blend(rtma: dict, rap: dict) -> dict:
     srh1_i   = interp(rap.get('srh1'),     'srh1')
     u500_i   = interp(rap.get('u500'),     'u500')
     v500_i   = interp(rap.get('v500'),     'v500')
+    u850_i   = interp(rap.get('u850'),     'u850')
+    v850_i   = interp(rap.get('v850'),     'v850')
     u10_rap  = interp(rap.get('u10'),      'u10_rap')
     v10_rap  = interp(rap.get('v10'),      'v10_rap')
     t2m_rap  = interp(rap.get('t2m_rap'),  't2m_rap')
@@ -108,6 +198,16 @@ def blend(rtma: dict, rap: dict) -> dict:
     td2m = rtma['td2m']    # K
     u10  = rtma['u10']     # m/s
     v10  = rtma['v10']     # m/s
+
+    # Apply GOES-18 TPW correction to RTMA Td BEFORE parcel calculations.
+    # This corrects for moisture depth (column moisture) not captured by
+    # surface 2m Td alone. Applied first so LCL, SBCAPE correction, and
+    # Td depression all benefit from the improved Td.
+    if tpw_data is not None:
+        log.info('[tpw] applying GOES-18 TPW moisture correction...')
+        td2m = apply_tpw_correction(td2m, rtma_lats, rtma_lons, tpw_data)
+    else:
+        log.info('[tpw] no TPW data — using raw RTMA Td')
 
     out: dict = {}
 
@@ -146,15 +246,29 @@ def blend(rtma: dict, rap: dict) -> dict:
     else:
         log.warning('blend: srh1 skipped (hlcy missing)')
 
-    # --- 0-6km BWD: RTMA 10m surface + RAP 500mb upper ------------------
-    # True 0-6km layer winds aren't in awp130p; 500mb (~5500m AGL) is the
-    # best available proxy.
+    # --- 0-6km BWD: two-layer approximation using 850mb + 500mb + 10m --------
+    # Layer 1: 10m → 850mb (~1500m AGL) captures low-level hodograph curvature
+    # Layer 2: 850mb → 500mb (~1500m → 5500m AGL) captures mid-level shear
+    # Sum of vector magnitudes approximates total 0-6km BWD, handling the
+    # curvature common in LJ environments and QLCS setups better than a
+    # single 500mb-10m difference.
+    # Falls back to single-layer 500mb-10m if 850mb is missing.
     if u500_i is not None and v500_i is not None:
-        out['bwd6'] = np.sqrt((u500_i - u10)**2 + (v500_i - v10)**2).astype(np.float32)
+        if u850_i is not None and v850_i is not None:
+            # Two-layer: |V850-V10| + |V500-V850|
+            layer1 = np.sqrt((u850_i - u10)**2 + (v850_i - v10)**2)
+            layer2 = np.sqrt((u500_i - u850_i)**2 + (v500_i - v850_i)**2)
+            out['bwd6'] = (layer1 + layer2).astype(np.float32)
+            log.info('bwd6: two-layer (10m→850mb→500mb)')
+        else:
+            # Fallback: single-layer 500mb-10m
+            out['bwd6'] = np.sqrt((u500_i - u10)**2 + (v500_i - v10)**2).astype(np.float32)
+            log.warning('bwd6: fallback to single-layer (u850/v850 missing)')
     else:
         log.warning('blend: bwd6 skipped (u500/v500 missing)')
 
     # --- LCL height: Bolton (1980) using RTMA T/Td ----------------------
+    # Uses TPW-corrected td2m if tpw_data was provided above.
     lcl = 125.0 * (t2m - td2m)    # meters AGL, float64 intermediate OK
 
     # --- Fixed-layer STP (Thompson et al. 2003) -------------------------
@@ -181,6 +295,7 @@ def blend(rtma: dict, rap: dict) -> dict:
 
     # --- Td depression: T - Td (K) ---------------------------------------
     # Lower values = more moist; useful as a dryline proxy.
+    # Uses TPW-corrected td2m if tpw_data was provided above.
     out['td_dep'] = (t2m - td2m).astype(np.float32)
 
     # Pass grid coordinates through for writer.py bbox calculation

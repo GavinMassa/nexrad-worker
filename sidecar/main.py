@@ -6,6 +6,7 @@ from datetime import datetime, timezone, timedelta
 from scipy.ndimage import zoom as ndimage_zoom
 from fetch_rtma import fetch_rtma
 from fetch_rap import fetch_rap
+from fetch_tpw import fetch_latest_tpw
 from mesonet import fetch_mesonet_obs, spatial_thin, compute_correction
 from blend import blend as do_blend
 from writer import write_output, OUT_DIR
@@ -164,7 +165,8 @@ async def run_cycle():
         try:
             rtma_task = asyncio.create_task(fetch_rtma(now))
             rap_task  = asyncio.create_task(fetch_rap(now))
-            rtma, rap = await asyncio.gather(rtma_task, rap_task)
+            tpw_task  = asyncio.create_task(fetch_latest_tpw(now))
+            rtma, rap, tpw_data = await asyncio.gather(rtma_task, rap_task, tpw_task)
 
             if rtma is None:
                 log.warning('RTMA fetch returned None — skipping cycle')
@@ -245,12 +247,16 @@ async def run_cycle():
                                 f'— using raw RTMA')
 
             # Blend derivation is CPU-heavy; off-loaded to thread pool.
-            blended = await loop.run_in_executor(_thread_pool, do_blend, rtma, rap)
+            # tpw_data is passed as third positional arg; blend() defaults to
+            # None if not available so this is safe when TPW fetch failed.
+            blended = await loop.run_in_executor(
+                _thread_pool, do_blend, rtma, rap, tpw_data
+            )
             write_output(blended, now)
 
             # Explicit cleanup — cfgrib/xarray leave internal references that
             # prevent the GC from collecting large numpy arrays promptly.
-            del rtma, rap, blended
+            del rtma, rap, tpw_data, blended
             try:
                 import cfgrib.messages
                 cfgrib.messages.EMPTY_HEADER_ERRORS.clear()
