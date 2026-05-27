@@ -68,12 +68,13 @@ async def fetch_rtma(cycle_dt: datetime) -> dict | None:
         return None
 
     # Log the cfgrib inventory so Railway logs show exactly what's in the file.
-    # Helps diagnose shortName / parameterNumber mismatches without re-deploying.
+    # Close each dataset immediately — cfgrib holds file handles + eccodes objects.
     try:
         all_ds = cfgrib.open_datasets(str(dest))
         for i, ds in enumerate(all_ds):
             log.info(f'  cfgrib dataset[{i}]: vars={list(ds.data_vars)} '
                      f'dims={dict(ds.dims)}')
+            ds.close()
     except Exception as e:
         log.warning(f'cfgrib inventory scan failed (non-fatal): {e}')
 
@@ -98,13 +99,16 @@ async def fetch_rtma(cycle_dt: datetime) -> dict | None:
         fields: dict = {}
         for key, filter_keys in FIELDS:
             ds = cfgrib.open_dataset(str(dest), filter_by_keys=filter_keys)
-            var_name = list(ds.data_vars)[0]
-            fields[key] = ds[var_name].values.astype(np.float32)
-            log.info(f'  {key}: var="{var_name}" shape={fields[key].shape} '
-                     f'sample={fields[key].flat[0]:.2f}')
-            if 'lats' not in fields:
-                fields['lats'] = ds['latitude'].values.astype(np.float32)
-                fields['lons'] = ds['longitude'].values.astype(np.float32)
+            try:
+                var_name = list(ds.data_vars)[0]
+                fields[key] = ds[var_name].values.astype(np.float32)
+                log.info(f'  {key}: var="{var_name}" shape={fields[key].shape} '
+                         f'sample={fields[key].flat[0]:.2f}')
+                if 'lats' not in fields:
+                    fields['lats'] = ds['latitude'].values.astype(np.float32)
+                    fields['lons'] = ds['longitude'].values.astype(np.float32)
+            finally:
+                ds.close()   # release eccodes file handle + index objects
 
         ny, nx = fields['t2m'].shape
         log.info(f'RTMA extracted OK: ny={ny} nx={nx}')

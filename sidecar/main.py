@@ -1,5 +1,6 @@
-import asyncio, logging, json
+import asyncio, logging, json, gc, os
 import numpy as np
+import psutil
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from scipy.ndimage import zoom as ndimage_zoom
@@ -24,6 +25,12 @@ MESONET_DT_PATH   = OUT_DIR / 'mesonet_delta_t.bin'
 MESONET_DTD_PATH  = OUT_DIR / 'mesonet_delta_td.bin'
 MESONET_META_PATH = OUT_DIR / 'mesonet_meta.json'
 MESONET_MAX_AGE_S = 90 * 60   # discard corrections older than 90 minutes
+
+
+def log_memory(label: str = '') -> None:
+    """Log current RSS so Railway logs show per-cycle memory trend."""
+    mb = psutil.Process(os.getpid()).memory_info().rss / 1e6
+    log.info(f'[mem] {label}: {mb:.0f} MB')
 
 
 # ── Mesonet background worker ─────────────────────────────────────────────────
@@ -123,8 +130,17 @@ async def mesonet_worker():
             log.info(f'[mesonet] correction written: {len(thinned)} stations, '
                      f'{ny_small}×{nx_small} grid')
 
+            # Release large arrays immediately — KDTree + distance matrix
+            # can hold hundreds of MB if the GC doesn't collect promptly.
+            del stations, stations_domain, thinned
+            del grid_lats, grid_lons, grid_t2m, grid_td2m
+            del delta_t, delta_td
+            gc.collect()
+            log_memory('[mesonet] after GC')
+
         except Exception as e:
             log.error(f'[mesonet] worker error: {e}', exc_info=True)
+            gc.collect()
 
         await asyncio.sleep(600)   # 10-minute interval
 
@@ -134,6 +150,7 @@ async def mesonet_worker():
 async def run_cycle():
     now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     log.info(f'Starting cycle for {now.strftime("%Y-%m-%d %H:00Z")}')
+    log_memory('cycle start')
     if _cycle_lock.locked():
         log.warning('Previous cycle still running — skipping')
         return
@@ -209,7 +226,19 @@ async def run_cycle():
             # Blend derivation is CPU-heavy; off-loaded to thread pool.
             blended = await loop.run_in_executor(_thread_pool, do_blend, rtma, rap)
             write_output(blended, now)
+
+            # Explicit cleanup — cfgrib/xarray leave internal references that
+            # prevent the GC from collecting large numpy arrays promptly.
+            del rtma, rap, blended
+            try:
+                import cfgrib.messages
+                cfgrib.messages.EMPTY_HEADER_ERRORS.clear()
+            except Exception:
+                pass
+            gc.collect()
+
             log.info('Cycle complete')
+            log_memory('cycle end')
         except Exception as e:
             log.error(f'Cycle failed: {e}', exc_info=True)
 

@@ -99,12 +99,15 @@ def _extract_rap(main_path: Path, hlcy_path: Path) -> dict:
         """Open one dataset, extract first data var, store in result."""
         try:
             ds = cfgrib.open_dataset(str(path), filter_by_keys=filter_keys)
-            arr = ds[list(ds.data_vars)[0]].values.astype(np.float32)
-            result[key] = arr
-            if 'lats_rap' not in result:
-                result['lats_rap'] = ds['latitude'].values.astype(np.float32)
-                result['lons_rap'] = ds['longitude'].values.astype(np.float32)
-            log.info(f'  RAP {key}: shape={arr.shape} sample={arr.flat[0]:.2f}')
+            try:
+                arr = ds[list(ds.data_vars)[0]].values.astype(np.float32)
+                result[key] = arr
+                if 'lats_rap' not in result:
+                    result['lats_rap'] = ds['latitude'].values.astype(np.float32)
+                    result['lons_rap'] = ds['longitude'].values.astype(np.float32)
+                log.info(f'  RAP {key}: shape={arr.shape} sample={arr.flat[0]:.2f}')
+            finally:
+                ds.close()   # release eccodes file handle + index objects
         except Exception as e:
             log.warning(f'  RAP {key} extraction failed: {e}')
             result[key] = None
@@ -136,7 +139,7 @@ def _extract_rap(main_path: Path, hlcy_path: Path) -> dict:
     # HLCY: try all datasets, pick the first 337×451 array (0-1km layer)
     if hlcy_path.exists() and hlcy_path.stat().st_size > 1000:
         try:
-            # Log inventory for debugging
+            # Log inventory for debugging; close each dataset after reading.
             datasets = cfgrib.open_datasets(str(hlcy_path))
             log.info(f'  RAP HLCY datasets: {len(datasets)}')
             srh = None
@@ -157,6 +160,7 @@ def _extract_rap(main_path: Path, hlcy_path: Path) -> dict:
                         log.info(f'    using dataset[{i}].{var} shape={arr.shape} '
                                  f'sample={srh.flat[0]:.2f}')
                         break
+                ds.close()   # release eccodes handle regardless of whether srh found
                 if srh is not None:
                     break
             result['srh1'] = srh
