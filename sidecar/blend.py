@@ -21,8 +21,30 @@ def _interp_to_rtma(rap_field: np.ndarray,
 
     Returns float32 array shape (ny_rtma, nx_rtma).
     """
-    lats_1d = rap_lats[:, 0] if rap_lats.ndim == 2 else rap_lats
-    lons_1d = rap_lons[0, :] if rap_lons.ndim == 2 else rap_lons
+    # Use the centre column/row for the 1D axis rather than column 0 / row 0.
+    # On a Lambert Conformal grid the outer column is curved — column 0 lats
+    # are not monotonic, which causes RegularGridInterpolator to project RAP
+    # fields onto wrong positions (~2-3° geographic shift in STP contours).
+    # The centre column is closest to the projection's standard meridian and
+    # is monotonic by construction for any standard CONUS RAP domain.
+    if rap_lats.ndim == 2:
+        mid_col = rap_lats.shape[1] // 2
+        lats_1d = rap_lats[:, mid_col]
+    else:
+        lats_1d = rap_lats
+
+    if rap_lons.ndim == 2:
+        mid_row = rap_lons.shape[0] // 2
+        lons_1d = rap_lons[mid_row, :]
+    else:
+        lons_1d = rap_lons
+
+    log.info(f'[blend] RAP lats_1d: min={lats_1d.min():.2f} max={lats_1d.max():.2f} '
+             f'monotonic={bool(np.all(np.diff(lats_1d) > 0) or np.all(np.diff(lats_1d) < 0))}')
+    log.info(f'[blend] RAP lons_1d: min={lons_1d.min():.2f} max={lons_1d.max():.2f} '
+             f'monotonic={bool(np.all(np.diff(lons_1d) > 0) or np.all(np.diff(lons_1d) < 0))}')
+    log.info(f'[blend] RTMA lats: min={rtma_lats.min():.2f} max={rtma_lats.max():.2f}')
+    log.info(f'[blend] RTMA lons: min={rtma_lons.min():.2f} max={rtma_lons.max():.2f}')
 
     flip_lat = lats_1d[0] > lats_1d[-1]
     field = np.flipud(rap_field) if flip_lat else rap_field

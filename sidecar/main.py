@@ -76,30 +76,36 @@ async def mesonet_worker():
             ]
             log.info(f'[mesonet] {len(stations_domain)}/{len(stations)} in domain')
 
-            # Spatial thinning — reduces 8000+ raw stations to ~500-800
-            thinned = spatial_thin(stations_domain)
+            # Spatial thinning at 1.5° → ~200-300 stations over CONUS.
+            # 0.45° produced ~3738 stations → distance matrix ~3.5 GB → OOM.
+            # 1.5° → peak matrix ~1.7 GB including numpy intermediates.
+            thinned = spatial_thin(stations_domain, grid_spacing_deg=1.5)
             if len(thinned) < 10:
                 log.warning('[mesonet] too few stations after thinning — skipping')
                 await asyncio.sleep(600)
                 continue
 
-            # Reconstruct the blend output lat/lon grid from bbox + dimensions.
-            # Row 0 = lat_max (N→S, matching writer.py flip convention).
-            lats_1d = np.linspace(meta['lat_max'], meta['lat_min'], ny_small,
-                                  dtype=np.float32)
-            lons_1d = np.linspace(meta['lon_min'], meta['lon_max'], nx_small,
-                                  dtype=np.float32)
-            grid_lons, grid_lats = np.meshgrid(lons_1d, lats_1d)
-
-            # RTMA reference grids (t2m / td2m at 399×586) are written by
-            # run_cycle() after each blend. Wait if not available yet.
+            # Load real RTMA reference grids saved by run_cycle().
+            # Using actual Lambert Conformal lats/lons (not linspace) ensures
+            # KDTree nearest-gridpoint lookup finds the correct background value
+            # at each station, preventing spurious QC rejections.
+            lats_path = OUT_DIR / 'rtma_lats_small.bin'
+            lons_path = OUT_DIR / 'rtma_lons_small.bin'
             t2m_path  = OUT_DIR / 'rtma_t2m_small.bin'
             td2m_path = OUT_DIR / 'rtma_td2m_small.bin'
-            if not t2m_path.exists() or not td2m_path.exists():
-                log.info('[mesonet] waiting for RTMA reference grids...')
+
+            missing = [p for p in [lats_path, lons_path, t2m_path, td2m_path]
+                       if not p.exists()]
+            if missing:
+                log.info(f'[mesonet] waiting for reference grids: '
+                         f'{[p.name for p in missing]}')
                 await asyncio.sleep(60)
                 continue
 
+            grid_lats = np.frombuffer(lats_path.read_bytes(),
+                                      dtype=np.float32).reshape(ny_small, nx_small)
+            grid_lons = np.frombuffer(lons_path.read_bytes(),
+                                      dtype=np.float32).reshape(ny_small, nx_small)
             grid_t2m  = np.frombuffer(t2m_path.read_bytes(),
                                       dtype=np.float32).reshape(ny_small, nx_small)
             grid_td2m = np.frombuffer(td2m_path.read_bytes(),
@@ -171,17 +177,24 @@ async def run_cycle():
             FACTOR = 0.25
             loop   = asyncio.get_running_loop()
 
-            # Save downsampled RTMA T/Td as the background reference for
-            # mesonet_worker(). Atomic write so the worker never reads partial data.
+            # Save downsampled RTMA T/Td + lats/lons as the reference for
+            # mesonet_worker(). Using real projected lats/lons (not linspace)
+            # ensures KDTree nearest-gridpoint lookup uses the correct geometry.
+            # lons converted to -180..180 to match station coordinates.
             def _save_rtma_ref(rtma_full):
-                t_small  = ndimage_zoom(rtma_full['t2m'],  FACTOR, order=1).astype(np.float32)
-                td_small = ndimage_zoom(rtma_full['td2m'], FACTOR, order=1).astype(np.float32)
-                for fpath, arr in [(OUT_DIR / 'rtma_t2m_small.bin',  t_small),
-                                   (OUT_DIR / 'rtma_td2m_small.bin', td_small)]:
+                lons_raw = rtma_full['lons']
+                lons_180 = np.where(lons_raw > 180.0, lons_raw - 360.0, lons_raw)
+                saves = [
+                    (OUT_DIR / 'rtma_t2m_small.bin',  ndimage_zoom(rtma_full['t2m'],  FACTOR, order=1)),
+                    (OUT_DIR / 'rtma_td2m_small.bin', ndimage_zoom(rtma_full['td2m'], FACTOR, order=1)),
+                    (OUT_DIR / 'rtma_lats_small.bin', ndimage_zoom(rtma_full['lats'], FACTOR, order=1)),
+                    (OUT_DIR / 'rtma_lons_small.bin', ndimage_zoom(lons_180,          FACTOR, order=1)),
+                ]
+                for fpath, arr in saves:
                     tmp = fpath.parent / (fpath.name + '.tmp')
-                    arr.tofile(str(tmp))
+                    arr.astype(np.float32).tofile(str(tmp))
                     tmp.replace(fpath)
-                log.info(f'[mesonet] saved RTMA reference grid {t_small.shape}')
+                log.info('[mesonet] saved RTMA reference grids (t2m, td2m, lats, lons)')
 
             await loop.run_in_executor(_thread_pool, _save_rtma_ref, rtma)
 

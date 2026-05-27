@@ -68,13 +68,20 @@ async def fetch_rtma(cycle_dt: datetime) -> dict | None:
         return None
 
     # Log the cfgrib inventory so Railway logs show exactly what's in the file.
-    # Close each dataset immediately — cfgrib holds file handles + eccodes objects.
+    # Use finally to guarantee all handles are closed even if an exception is
+    # raised mid-loop (e.g. a malformed dataset after a valid one).
     try:
         all_ds = cfgrib.open_datasets(str(dest))
-        for i, ds in enumerate(all_ds):
-            log.info(f'  cfgrib dataset[{i}]: vars={list(ds.data_vars)} '
-                     f'dims={dict(ds.dims)}')
-            ds.close()
+        try:
+            for i, ds in enumerate(all_ds):
+                log.info(f'  cfgrib dataset[{i}]: vars={list(ds.data_vars)} '
+                         f'dims={dict(ds.dims)}')
+        finally:
+            for ds in all_ds:
+                try:
+                    ds.close()
+                except Exception:
+                    pass
     except Exception as e:
         log.warning(f'cfgrib inventory scan failed (non-fatal): {e}')
 
@@ -120,4 +127,5 @@ async def fetch_rtma(cycle_dt: datetime) -> dict | None:
 
     # Clean up GRIB file immediately after extraction.
     dest.unlink(missing_ok=True)
+    import gc; gc.collect()
     return fields

@@ -136,33 +136,40 @@ def _extract_rap(main_path: Path, hlcy_path: Path) -> dict:
     _get(main_path, {'discipline': 0, 'parameterCategory': 0, 'parameterNumber': 6,
                      'typeOfLevel': 'heightAboveGround', 'level': 2}, 'td2m_rap')
 
-    # HLCY: try all datasets, pick the first 337×451 array (0-1km layer)
+    # HLCY: try all datasets, pick the first 337×451 array (0-1km layer).
+    # Use a finally block to guarantee ALL dataset handles are closed even if
+    # an exception occurs mid-loop or before ds.close() is reached.
     if hlcy_path.exists() and hlcy_path.stat().st_size > 1000:
         try:
-            # Log inventory for debugging; close each dataset after reading.
             datasets = cfgrib.open_datasets(str(hlcy_path))
             log.info(f'  RAP HLCY datasets: {len(datasets)}')
             srh = None
-            for i, ds in enumerate(datasets):
-                log.info(f'    dataset[{i}]: vars={list(ds.data_vars)} dims={dict(ds.dims)}')
-                for var in ds.data_vars:
-                    arr = ds[var].values
-                    # cfgrib stacks both HLCY layers (0-1km and 0-3km) along a
-                    # heightAboveGroundLayer dimension → shape (2, 337, 451).
-                    # Index 0 is the 0-1km layer (shorter layer listed first).
-                    if arr.ndim == 3 and arr.shape[1:] == (337, 451):
-                        srh = arr[0].astype(np.float32)
-                        log.info(f'    using dataset[{i}].{var}[0] (0-1km) '
-                                 f'shape={srh.shape} sample={srh.flat[0]:.2f}')
+            try:
+                for i, ds in enumerate(datasets):
+                    log.info(f'    dataset[{i}]: vars={list(ds.data_vars)} dims={dict(ds.dims)}')
+                    for var in ds.data_vars:
+                        arr = ds[var].values
+                        # cfgrib stacks both HLCY layers (0-1km and 0-3km) along a
+                        # heightAboveGroundLayer dimension → shape (2, 337, 451).
+                        # Index 0 is the 0-1km layer (shorter layer listed first).
+                        if arr.ndim == 3 and arr.shape[1:] == (337, 451):
+                            srh = arr[0].astype(np.float32)
+                            log.info(f'    using dataset[{i}].{var}[0] (0-1km) '
+                                     f'shape={srh.shape} sample={srh.flat[0]:.2f}')
+                            break
+                        elif arr.shape == (337, 451):
+                            srh = arr.astype(np.float32)
+                            log.info(f'    using dataset[{i}].{var} shape={arr.shape} '
+                                     f'sample={srh.flat[0]:.2f}')
+                            break
+                    if srh is not None:
                         break
-                    elif arr.shape == (337, 451):
-                        srh = arr.astype(np.float32)
-                        log.info(f'    using dataset[{i}].{var} shape={arr.shape} '
-                                 f'sample={srh.flat[0]:.2f}')
-                        break
-                ds.close()   # release eccodes handle regardless of whether srh found
-                if srh is not None:
-                    break
+            finally:
+                for ds in datasets:
+                    try:
+                        ds.close()
+                    except Exception:
+                        pass
             result['srh1'] = srh
             if srh is None:
                 log.warning('RAP HLCY: no 337×451 array found')
@@ -176,4 +183,5 @@ def _extract_rap(main_path: Path, hlcy_path: Path) -> dict:
     extracted = [k for k, v in result.items()
                  if k not in ('lats_rap', 'lons_rap') and v is not None]
     log.info(f'RAP extraction done: {extracted}')
+    import gc; gc.collect()
     return result
