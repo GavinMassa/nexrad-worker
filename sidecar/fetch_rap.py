@@ -16,7 +16,7 @@ def rap_main_url(dt: datetime) -> str:
         'file':                   f'rap.t{hh}z.awp130pgrbf00.grib2',
         'var_CAPE': 'on', 'var_CIN': 'on',
         'var_UGRD': 'on', 'var_VGRD': 'on',
-        'var_TMP':  'on',
+        'var_TMP':  'on', 'var_DPT':  'on',
         'lev_surface':           'on',
         'lev_500_mb':            'on',
         'lev_700_mb':            'on',
