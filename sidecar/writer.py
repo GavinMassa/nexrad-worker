@@ -13,7 +13,7 @@ OUT_DIR.mkdir(exist_ok=True)
 # 0.25 → roughly 400×586 (~3.7 MB total), closer to RAP-native resolution
 # and matches what the iOS parser already handles for /rap/all.
 # Bilinear (order=1) interpolation — visually smooth, no ringing.
-DOWNSAMPLE_FACTOR = 0.25
+DOWNSAMPLE_FACTOR = 0.5
 
 # GOES-19 CONUS sector bbox — must exactly match iOS SLIDERImageOverlay constants:
 #   sliderCONUSLatMin = 14.568
