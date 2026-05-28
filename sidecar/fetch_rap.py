@@ -138,9 +138,20 @@ def _extract_rap(main_path: Path, hlcy_path: Path) -> dict:
     _get(main_path, {'discipline': 0, 'parameterCategory': 0, 'parameterNumber': 0,
                      'typeOfLevel': 'isobaricInhPa', 'level': 700}, 't700')
 
-    # Td at 700mb — for mid-level moisture / RH
+    # Td at 700mb — try dewpoint first, fall back to deriving from RH if available
     _get(main_path, {'discipline': 0, 'parameterCategory': 0, 'parameterNumber': 6,
                      'typeOfLevel': 'isobaricInhPa', 'level': 700}, 'td700')
+
+    if result.get('td700') is None:
+        _get(main_path, {'discipline': 0, 'parameterCategory': 1, 'parameterNumber': 1,
+                         'typeOfLevel': 'isobaricInhPa', 'level': 700}, 'rh700')
+        if result.get('rh700') is not None and result.get('t700') is not None:
+            t7   = result['t700'] - 273.15
+            rh7  = np.clip(result['rh700'], 1.0, 100.0)
+            td7_c = t7 - (14.55 + 0.114 * t7) * (1.0 - 0.01 * rh7)
+            result['td700'] = (td7_c + 273.15).astype(np.float32)
+            result.pop('rh700', None)
+            log.info(f'  RAP td700: derived from RH700, sample={result["td700"].flat[0]:.2f}')
 
     # T at 925mb (~750m AGL) — for low-level lapse rate baseline
     _get(main_path, {'discipline': 0, 'parameterCategory': 0, 'parameterNumber': 0,
