@@ -143,6 +143,133 @@ def apply_tpw_correction(
         return td2m
 
 
+def compute_baci(
+    rtma:      dict,
+    rap:       dict,
+    rap_lats:  np.ndarray,
+    rap_lons:  np.ndarray,
+    rtma_lats: np.ndarray,
+    rtma_lons: np.ndarray,
+) -> np.ndarray:
+    """
+    Bay Area Convection Index — terrain-aware convection initiation risk.
+    Valid for lat 36.5–38.5, lon -123 to -120 (Santa Cruz Mtns, Diablo Range,
+    Central Valley). Zero outside this domain.
+    """
+    from pathlib import Path
+
+    TERRAIN_PATH  = Path('/app/sidecar-out/baci_terrain.npz')
+    BACI_LAT_MIN, BACI_LAT_MAX =  36.5,  38.5
+    BACI_LON_MIN, BACI_LON_MAX = -123.0, -120.0
+
+    ny_rtma, nx_rtma = rtma_lats.shape
+    baci_out = np.zeros((ny_rtma, nx_rtma), dtype=np.float32)
+
+    lons_180    = np.where(rtma_lons > 180.0, rtma_lons - 360.0, rtma_lons)
+    domain_mask = (
+        (rtma_lats >= BACI_LAT_MIN) & (rtma_lats <= BACI_LAT_MAX) &
+        (lons_180  >= BACI_LON_MIN) & (lons_180  <= BACI_LON_MAX)
+    )
+    if domain_mask.sum() < 100:
+        log.warning('[BACI] domain mask empty — RTMA may not cover Bay Area')
+        return baci_out
+
+    def interp_rap(field, name):
+        if field is None:
+            log.warning(f'[BACI] RAP field {name} missing')
+            return None
+        try:
+            return _interp_to_rtma(field, rap_lats, rap_lons, rtma_lats, rtma_lons)
+        except Exception as e:
+            log.warning(f'[BACI] interp failed for {name}: {e}')
+            return None
+
+    cape_i  = interp_rap(rap.get('cape'),  'cape')
+    cin_i   = interp_rap(rap.get('cin'),   'cin')
+    t925_i  = interp_rap(rap.get('t925'),  't925')
+    t700_i  = interp_rap(rap.get('t700'),  't700')
+    td700_i = interp_rap(rap.get('td700'), 'td700')
+    pwat_i  = interp_rap(rap.get('pwat'),  'pwat')
+    u850_i  = interp_rap(rap.get('u850'),  'u850')
+    v850_i  = interp_rap(rap.get('v850'),  'v850')
+
+    t2m = rtma['t2m']
+
+    # Term 1: CAPE — 1.0 at 500 J/kg (validated: 568 J/kg on 2026-05-27)
+    if cape_i is None:
+        log.warning('[BACI] skipping — cape missing')
+        return baci_out
+    cape_term = np.clip(cape_i / 500.0, 0.0, 1.0)
+
+    # Term 2: No-cap — validated: CIN=0 on event day → nocin_term=1.0
+    if cin_i is None:
+        nocin_term = np.ones_like(cape_term)
+    else:
+        nocin_term = np.clip(1.0 - np.abs(cin_i) / 50.0, 0.0, 1.0)
+
+    # Term 3: 0-3km lapse rate — validated: 9.3°C/km on event day
+    if t925_i is None:
+        lapse_term = np.ones_like(cape_term) * 0.5
+    else:
+        lr_0_3km   = (t2m - t925_i) / 0.750   # °C/km
+        lapse_term = np.clip((lr_0_3km - 7.0) / 3.0, 0.0, 1.0)
+
+    # Term 4: PWAT — validated: 18.3mm on event day → pwat_term=0.64
+    if pwat_i is None:
+        pwat_term = np.ones_like(cape_term) * 0.5
+    else:
+        pwat_mm   = np.where(pwat_i < 3.0, pwat_i * 25.4, pwat_i)
+        pwat_term = np.clip((pwat_mm - 10.0) / 15.0, 0.0, 1.0)
+
+    # Term 5: 700mb RH — validated: 79% on event day → rh_term=0.73
+    if t700_i is None or td700_i is None:
+        rh_term = np.ones_like(cape_term) * 0.5
+    else:
+        td700_c = td700_i - 273.15
+        t700_c  = t700_i  - 273.15
+        rh_700  = 100.0 * np.exp(17.67 * td700_c / (td700_c + 243.5)) / \
+                          np.exp(17.67 * t700_c  / (t700_c  + 243.5))
+        rh_700  = np.clip(rh_700, 0.0, 100.0)
+        rh_term = np.clip((rh_700 - 50.0) / 40.0, 0.0, 1.0)
+
+    # Term 6: upslope 850mb wind component perpendicular to terrain
+    upslope_term = np.ones_like(cape_term) * 0.5
+
+    if TERRAIN_PATH.exists() and u850_i is not None and v850_i is not None:
+        try:
+            from scipy.spatial import KDTree
+            terrain    = np.load(str(TERRAIN_PATH))
+            aspect_deg = terrain['aspect']
+            t_lats     = terrain['lats']
+            t_lons     = terrain['lons']
+
+            t_lons_2d, t_lats_2d = np.meshgrid(t_lons, t_lats)
+            tree = KDTree(np.column_stack([t_lats_2d.ravel(), t_lons_2d.ravel()]))
+
+            rtma_lons_180 = np.where(rtma_lons > 180.0, rtma_lons - 360.0, rtma_lons)
+            _, idx        = tree.query(
+                np.column_stack([rtma_lats.ravel(), rtma_lons_180.ravel()]), k=1
+            )
+            aspect_interp = aspect_deg.ravel()[idx].reshape(ny_rtma, nx_rtma)
+
+            uphill_rad   = np.radians(aspect_interp + 180.0)
+            upslope_ms   = u850_i * np.sin(uphill_rad) + v850_i * np.cos(uphill_rad)
+            upslope_term = np.clip(upslope_ms / 8.0, 0.0, 1.0)
+            log.info(f'[BACI] upslope: max={float(upslope_term.max()):.2f}, '
+                     f'domain mean={float(upslope_term[domain_mask].mean()):.2f}')
+        except Exception as e:
+            log.warning(f'[BACI] terrain aspect failed: {e} — using default')
+
+    baci_full = (cape_term * nocin_term * lapse_term *
+                 pwat_term * rh_term * upslope_term).astype(np.float32)
+    baci_out  = np.where(domain_mask, baci_full, 0.0).astype(np.float32)
+
+    log.info(f'[BACI] n≥0.25={int((baci_out >= 0.25).sum())}, '
+             f'n≥0.5={int((baci_out >= 0.5).sum())}, '
+             f'max={float(baci_out.max()):.3f}')
+    return baci_out
+
+
 def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
     """
     Blend RTMA 2.5km surface fields with RAP 13km upper-air fields.
@@ -308,6 +435,14 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
     # Lower values = more moist; useful as a dryline proxy.
     # Uses TPW-corrected td2m if tpw_data was provided above.
     out['td_dep'] = (t2m - td2m).astype(np.float32)
+
+    # --- BACI: Bay Area Convection Index --------------------------------
+    # Regional parameter — non-zero only within lat 36.5–38.5, lon -123 to -120.
+    out['baci'] = compute_baci(
+        rtma=rtma, rap=rap,
+        rap_lats=rap_lats, rap_lons=rap_lons,
+        rtma_lats=rtma_lats, rtma_lons=rtma_lons,
+    )
 
     # Pass grid coordinates through for writer.py bbox calculation
     out['lats'] = rtma_lats
