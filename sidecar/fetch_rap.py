@@ -138,35 +138,58 @@ def _extract_rap(main_path: Path, hlcy_path: Path) -> dict:
     _get(main_path, {'discipline': 0, 'parameterCategory': 0, 'parameterNumber': 0,
                      'typeOfLevel': 'isobaricInhPa', 'level': 700}, 't700')
 
-    # Td at 700mb — try dewpoint first, fall back to deriving from RH if available
-    _get(main_path, {'discipline': 0, 'parameterCategory': 0, 'parameterNumber': 6,
-                     'typeOfLevel': 'isobaricInhPa', 'level': 700}, 'td700')
-
-    if result.get('td700') is None:
-        _get(main_path, {'discipline': 0, 'parameterCategory': 1, 'parameterNumber': 1,
-                         'typeOfLevel': 'isobaricInhPa', 'level': 700}, 'rh700')
-        if result.get('rh700') is not None and result.get('t700') is not None:
-            t7   = result['t700'] - 273.15
-            rh7  = np.clip(result['rh700'], 1.0, 100.0)
-            td7_c = t7 - (14.55 + 0.114 * t7) * (1.0 - 0.01 * rh7)
-            result['td700'] = (td7_c + 273.15).astype(np.float32)
-            result.pop('rh700', None)
-            log.info(f'  RAP td700: derived from RH700, sample={result["td700"].flat[0]:.2f}')
+    # td700 — derive from t700 + RH at 700mb (DPT not in awp130p isobaric messages)
+    try:
+        import xarray as xr
+        ds_rh = xr.open_dataset(str(main_path), engine='cfgrib',
+                                backend_kwargs={'filter_by_keys': {
+                                    'typeOfLevel': 'isobaricInhPa',
+                                    'shortName': 'r'}})
+        try:
+            rh700_arr = ds_rh['r'].sel(isobaricInhPa=700).values.astype(np.float32)
+            if result.get('t700') is not None:
+                t700_c = result['t700'] - 273.15
+                rh700_c = np.clip(rh700_arr, 1.0, 100.0)
+                td700_c = t700_c - (14.55 + 0.114 * t700_c) * (1.0 - 0.01 * rh700_c)
+                result['td700'] = (td700_c + 273.15).astype(np.float32)
+                log.info(f"  RAP td700: derived from RH700, sample={result['td700'].flat[0]:.2f}")
+            else:
+                result['td700'] = None
+        finally:
+            ds_rh.close()
+    except Exception as e:
+        log.warning(f'  RAP td700 extraction failed: {e}')
+        if result.get('t700') is not None and result.get('t2m_rap') is not None and result.get('td2m_rap') is not None:
+            sfc_dep = result['t2m_rap'] - result['td2m_rap']
+            result['td700'] = (result['t700'] - sfc_dep * 0.5).astype(np.float32)
+            log.info(f"  RAP td700: derived from surface scaling, sample={result['td700'].flat[0]:.2f}")
+        else:
+            result['td700'] = None
 
     # T at 925mb (~750m AGL) — for low-level lapse rate baseline
     _get(main_path, {'discipline': 0, 'parameterCategory': 0, 'parameterNumber': 0,
                      'typeOfLevel': 'isobaricInhPa', 'level': 925}, 't925')
 
-    # PWAT (precipitable water) — try multiple typeOfLevel variants
-    _get(main_path, {'discipline': 0, 'parameterCategory': 1, 'parameterNumber': 3,
-                     'typeOfLevel': 'atmosphereSingleLayer'}, 'pwat')
-
-    if result.get('pwat') is None:
-        _get(main_path, {'discipline': 0, 'parameterCategory': 1, 'parameterNumber': 3,
-                         'typeOfLevel': 'entireAtmosphere'}, 'pwat')
-
-    if result.get('pwat') is None:
-        _get(main_path, {'shortName': 'pwat'}, 'pwat')
+    # PWAT — must use entireAtmosphere typeOfLevel directly
+    try:
+        import xarray as xr
+        ds_pw = xr.open_dataset(str(main_path), engine='cfgrib',
+                                backend_kwargs={'filter_by_keys': {'typeOfLevel': 'entireAtmosphere'}})
+        try:
+            pwat_arr = ds_pw['pwat'].values.astype(np.float32)
+            result['pwat'] = pwat_arr
+            log.info(f'  RAP pwat: shape={pwat_arr.shape} sample={pwat_arr.flat[0]:.2f}')
+        finally:
+            ds_pw.close()
+    except Exception as e:
+        log.warning(f'  RAP pwat extraction failed: {e}')
+        if result.get('td2m_rap') is not None:
+            td_c = result['td2m_rap'] - 273.15
+            e_s = 6.112 * np.exp(17.67 * td_c / (td_c + 243.5))
+            result['pwat'] = (2.0 * e_s).astype(np.float32)
+            log.info(f"  RAP pwat: derived from surface Td, sample={result['pwat'].flat[0]:.2f}mm")
+        else:
+            result['pwat'] = None
 
     # U/V at 10m AGL
     _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 2,
