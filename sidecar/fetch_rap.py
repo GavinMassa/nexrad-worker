@@ -3,7 +3,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import httpx, cfgrib, numpy as np
 
-log = logging.getLogger(__name__)
+log = logging.getLogger(__name__)  # sentinel
 TMP_DIR = Path(tempfile.gettempdir()) / 'sidecar-cache'
 TMP_DIR.mkdir(exist_ok=True)
 
@@ -17,9 +17,12 @@ def rap_main_url(dt: datetime) -> str:
         'var_CAPE': 'on', 'var_CIN': 'on',
         'var_UGRD': 'on', 'var_VGRD': 'on',
         'var_TMP':  'on', 'var_DPT':  'on',
+        'var_PWAT': 'on',
         'lev_surface':           'on',
         'lev_500_mb':            'on',
+        'lev_700_mb':            'on',
         'lev_850_mb':            'on',
+        'lev_925_mb':            'on',
         'lev_10_m_above_ground': 'on',
         'lev_2_m_above_ground':  'on',
         'dir': f'/rap.{ymd}',
@@ -130,6 +133,25 @@ def _extract_rap(main_path: Path, hlcy_path: Path) -> dict:
                      'typeOfLevel': 'isobaricInhPa', 'level': 850}, 'u850')
     _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 3,
                      'typeOfLevel': 'isobaricInhPa', 'level': 850}, 'v850')
+
+    # T at 700mb (~3000m AGL) — for 0-3km and 700-500mb lapse rate
+    _get(main_path, {'discipline': 0, 'parameterCategory': 0, 'parameterNumber': 0,
+                     'typeOfLevel': 'isobaricInhPa', 'level': 700}, 't700')
+
+    # Td at 700mb — for mid-level moisture / RH
+    _get(main_path, {'discipline': 0, 'parameterCategory': 0, 'parameterNumber': 6,
+                     'typeOfLevel': 'isobaricInhPa', 'level': 700}, 'td700')
+
+    # T at 925mb (~750m AGL) — for low-level lapse rate baseline
+    _get(main_path, {'discipline': 0, 'parameterCategory': 0, 'parameterNumber': 0,
+                     'typeOfLevel': 'isobaricInhPa', 'level': 925}, 't925')
+
+    # PWAT (precipitable water) — column-integrated moisture
+    _get(main_path, {'discipline': 0, 'parameterCategory': 1, 'parameterNumber': 3,
+                     'typeOfLevel': 'atmosphereSingleLayer'}, 'pwat')
+    if result.get('pwat') is None:
+        _get(main_path, {'discipline': 0, 'parameterCategory': 1, 'parameterNumber': 3,
+                         'typeOfLevel': 'entireAtmosphere'}, 'pwat')
 
     # U/V at 10m AGL
     _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 2,
