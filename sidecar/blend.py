@@ -39,13 +39,6 @@ def _interp_to_rtma(rap_field: np.ndarray,
     else:
         lons_1d = rap_lons
 
-    log.info(f'[blend] RAP lats_1d: min={lats_1d.min():.2f} max={lats_1d.max():.2f} '
-             f'monotonic={bool(np.all(np.diff(lats_1d) > 0) or np.all(np.diff(lats_1d) < 0))}')
-    log.info(f'[blend] RAP lons_1d: min={lons_1d.min():.2f} max={lons_1d.max():.2f} '
-             f'monotonic={bool(np.all(np.diff(lons_1d) > 0) or np.all(np.diff(lons_1d) < 0))}')
-    log.info(f'[blend] RTMA lats: min={rtma_lats.min():.2f} max={rtma_lats.max():.2f}')
-    log.info(f'[blend] RTMA lons: min={rtma_lons.min():.2f} max={rtma_lons.max():.2f}')
-
     flip_lat = lats_1d[0] > lats_1d[-1]
     field = np.flipud(rap_field) if flip_lat else rap_field
     if flip_lat:
