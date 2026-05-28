@@ -10,6 +10,7 @@ from fetch_tpw import fetch_latest_tpw
 from mesonet import fetch_mesonet_obs, spatial_thin, compute_correction
 from blend import blend as do_blend
 from writer import write_output, OUT_DIR
+from terrain_setup import build_terrain, terrain_already_exists
 
 logging.basicConfig(level=logging.INFO, format='[sidecar] %(message)s')
 log = logging.getLogger(__name__)
@@ -294,9 +295,12 @@ async def main():
     from server import start_server
     runner = await start_server()
     try:
-        # scheduler() and mesonet_worker() run concurrently on the same event loop.
-        # They share _thread_pool but never block each other — scheduler holds
-        # _cycle_lock during blend; mesonet_worker uses separate file paths.
+        # One-time terrain setup for BACI — runs in background, non-blocking
+        if not terrain_already_exists():
+            log.info('[terrain] Starting one-time BACI terrain build...')
+            asyncio.create_task(build_terrain())
+        else:
+            log.info('[terrain] BACI terrain already built — skipping')
         await asyncio.gather(
             scheduler(),
             mesonet_worker(),
