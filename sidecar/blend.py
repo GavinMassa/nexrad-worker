@@ -172,6 +172,16 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
             log.warning(f'blend: interpolation failed for "{name}": {e}')
             return None
 
+    _mid_col = rap_lats.shape[1] // 2 if rap_lats.ndim == 2 else 0
+    _mid_row = rap_lons.shape[0] // 2 if rap_lons.ndim == 2 else 0
+    _lats_1d = rap_lats[:, _mid_col] if rap_lats.ndim == 2 else rap_lats
+    _lons_1d = rap_lons[_mid_row, :] if rap_lons.ndim == 2 else rap_lons
+    log.info(f'[blend] RAP lats_1d: min={_lats_1d.min():.2f} max={_lats_1d.max():.2f} '
+             f'monotonic={bool(np.all(np.diff(_lats_1d) > 0) or np.all(np.diff(_lats_1d) < 0))}')
+    log.info(f'[blend] RAP lons_1d: min={_lons_1d.min():.2f} max={_lons_1d.max():.2f} '
+             f'monotonic={bool(np.all(np.diff(_lons_1d) > 0) or np.all(np.diff(_lons_1d) < 0))}')
+    log.info(f'[blend] RTMA lats: min={rtma_lats.min():.2f} max={rtma_lats.max():.2f}')
+    log.info(f'[blend] RTMA lons: min={rtma_lons.min():.2f} max={rtma_lons.max():.2f}')
     log.info('Interpolating RAP fields to RTMA 2.5km grid...')
     cape_i   = interp(rap.get('cape'),     'cape')
     cin_i    = interp(rap.get('cin'),      'cin')
