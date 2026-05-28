@@ -3,7 +3,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import httpx, cfgrib, numpy as np
 
-log = logging.getLogger(__name__)  # sentinel
+log = logging.getLogger(__name__)
 TMP_DIR = Path(tempfile.gettempdir()) / 'sidecar-cache'
 TMP_DIR.mkdir(exist_ok=True)
 
