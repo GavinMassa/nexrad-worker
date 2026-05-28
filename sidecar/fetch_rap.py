@@ -157,12 +157,16 @@ def _extract_rap(main_path: Path, hlcy_path: Path) -> dict:
     _get(main_path, {'discipline': 0, 'parameterCategory': 0, 'parameterNumber': 0,
                      'typeOfLevel': 'isobaricInhPa', 'level': 925}, 't925')
 
-    # PWAT (precipitable water) — column-integrated moisture
+    # PWAT (precipitable water) — try multiple typeOfLevel variants
     _get(main_path, {'discipline': 0, 'parameterCategory': 1, 'parameterNumber': 3,
                      'typeOfLevel': 'atmosphereSingleLayer'}, 'pwat')
+
     if result.get('pwat') is None:
         _get(main_path, {'discipline': 0, 'parameterCategory': 1, 'parameterNumber': 3,
                          'typeOfLevel': 'entireAtmosphere'}, 'pwat')
+
+    if result.get('pwat') is None:
+        _get(main_path, {'shortName': 'pwat'}, 'pwat')
 
     # U/V at 10m AGL
     _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 2,
