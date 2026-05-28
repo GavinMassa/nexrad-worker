@@ -116,6 +116,18 @@ def _extract_rap(main_path: Path, hlcy_path: Path) -> dict:
             log.warning(f'  RAP {key} extraction failed: {e}')
             result[key] = None
 
+    # Diagnostic: log all available datasets and their variables
+    try:
+        import xarray as xr
+        all_ds = xr.open_datasets(str(main_path), engine='cfgrib')
+        for i, ds in enumerate(all_ds):
+            log.info(f'  [diag] dataset[{i}]: vars={list(ds.data_vars)} '
+                     f'typeOfLevel={ds.coords.get("typeOfLevel", "?")} '
+                     f'dims={dict(ds.dims)}')
+            ds.close()
+    except Exception as e:
+        log.warning(f'  [diag] failed: {e}')
+
     # CAPE and CIN at surface (awp130p stores these at typeOfLevel=surface)
     _get(main_path, {'discipline': 0, 'parameterCategory': 7, 'parameterNumber': 6,
                      'typeOfLevel': 'surface'}, 'cape')
