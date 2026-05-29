@@ -1,8 +1,10 @@
-const http = require('http');
-const zlib = require('zlib');
+const http  = require('http');
+const zlib  = require('zlib');
 const { URL } = require('url');
 const seekBzip = require('seek-bzip');
-const rap = require('./rap');
+const sharp = require('sharp');
+const fs    = require('fs');
+const rap   = require('./rap');
 
 const PORT = process.env.PORT || 3000;
 
@@ -47,6 +49,22 @@ const satCache = {
   visible:  { buf: null, expires: 0 },
 };
 const SAT_DIR = '/app/sidecar-out';
+
+// ── Satellite tile cache ─────────────────────────────────────────────────────
+// Keyed by "{product}/{z}/{x}/{y}". Stores rendered PNG Buffer.
+// Invalidated when the source JPEG file changes (mtime check on each miss).
+const tileCache = new Map();
+const TILE_CACHE_MAX = 2000;   // ~500 MB at 256KB average — well within RAM
+const TILE_SIZE = 256;
+
+// GOES CONUS bbox — must match sidecar/satellite.py constants exactly.
+const SAT_LAT_MIN =  14.568;
+const SAT_LAT_MAX =  53.297;
+const SAT_LON_MIN = -135.038;
+const SAT_LON_MAX =  -59.975;
+
+// Track source file mtime so tile cache is invalidated when sidecar writes new image.
+const satMtime = { geocolor: 0, visible: 0 };
 
 // ============================================================
 // BZIP2 DECODER (seek-bzip npm package)
@@ -587,6 +605,111 @@ function sendPng(res, png) {
   res.end(png);
 }
 
+// Web Mercator tile → geographic bounds (WGS-84 degrees)
+function tileToBBox(x, y, z) {
+  const n = Math.pow(2, z);
+  const lonMin = x / n * 360 - 180;
+  const lonMax = (x + 1) / n * 360 - 180;
+  const latMax = Math.atan(Math.sinh(Math.PI * (1 - 2 * y / n))) * 180 / Math.PI;
+  const latMin = Math.atan(Math.sinh(Math.PI * (1 - 2 * (y + 1) / n))) * 180 / Math.PI;
+  return { lonMin, lonMax, latMin, latMax };
+}
+
+// Render one XYZ tile from the source satellite JPEG.
+// Returns a PNG Buffer or null if the tile is fully outside the image bbox.
+async function renderSatTile(product, z, x, y) {
+  const cacheKey = `${product}/${z}/${x}/${y}`;
+
+  // Check mtime — invalidate cache if source file was updated.
+  const fpath = `${SAT_DIR}/satellite_${product}.jpg`;
+  let mtime = 0;
+  try { mtime = fs.statSync(fpath).mtimeMs; } catch { return null; }
+  if (mtime !== satMtime[product]) {
+    // New image written — clear all tiles for this product.
+    for (const k of tileCache.keys()) {
+      if (k.startsWith(product + '/')) tileCache.delete(k);
+    }
+    satMtime[product] = mtime;
+  }
+
+  if (tileCache.has(cacheKey)) return tileCache.get(cacheKey);
+
+  // Compute overlap between tile bbox and satellite image bbox.
+  const tb = tileToBBox(x, y, z);
+  if (tb.lonMax <= SAT_LON_MIN || tb.lonMin >= SAT_LON_MAX ||
+      tb.latMax <= SAT_LAT_MIN || tb.latMin >= SAT_LAT_MAX) {
+    // Tile is fully outside satellite coverage — return transparent PNG.
+    const transparent = await sharp({
+      create: { width: TILE_SIZE, height: TILE_SIZE, channels: 4,
+                background: { r: 0, g: 0, b: 0, alpha: 0 } }
+    }).png().toBuffer();
+    return transparent;
+  }
+
+  // Load source image metadata (fast — just reads header).
+  const meta = await sharp(fpath).metadata();
+  const srcW = meta.width, srcH = meta.height;
+
+  // Map geographic coords → pixel coords in source image.
+  // Source image: left=lon_min, right=lon_max, top=lat_max, bottom=lat_min
+  // (standard north-up Web Mercator after reprojection).
+  function lonToPixel(lon) {
+    return (lon - SAT_LON_MIN) / (SAT_LON_MAX - SAT_LON_MIN) * srcW;
+  }
+  function latToPixel(lat) {
+    // Mercator y is non-linear — use inverse Mercator for accuracy.
+    function mercY(latDeg) {
+      const r = latDeg * Math.PI / 180;
+      return Math.log(Math.tan(Math.PI / 4 + r / 2));
+    }
+    const yMin = mercY(SAT_LAT_MIN), yMax = mercY(SAT_LAT_MAX);
+    return (yMax - mercY(lat)) / (yMax - yMin) * srcH;
+  }
+
+  // Tile pixel region in source image coordinates.
+  const px0 = lonToPixel(Math.max(tb.lonMin, SAT_LON_MIN));
+  const px1 = lonToPixel(Math.min(tb.lonMax, SAT_LON_MAX));
+  const py0 = latToPixel(Math.min(tb.latMax, SAT_LAT_MAX));
+  const py1 = latToPixel(Math.max(tb.latMin, SAT_LAT_MIN));
+
+  const cropX = Math.max(0, Math.floor(px0));
+  const cropY = Math.max(0, Math.floor(py0));
+  const cropW = Math.min(srcW - cropX, Math.ceil(px1) - cropX);
+  const cropH = Math.min(srcH - cropY, Math.ceil(py1) - cropY);
+
+  if (cropW <= 0 || cropH <= 0) return null;
+
+  // Compute where the cropped region maps within the 256×256 output tile
+  // (tile may extend outside the satellite image — pad with transparency).
+  const tileScaleX = TILE_SIZE / (lonToPixel(tb.lonMax) - lonToPixel(tb.lonMin));
+  const tileScaleY = TILE_SIZE / (latToPixel(tb.latMin) - latToPixel(tb.latMax));
+  const dstX = Math.round((cropX - lonToPixel(tb.lonMin)) * tileScaleX);
+  const dstY = Math.round((cropY - latToPixel(tb.latMax)) * tileScaleY);
+  const dstW = Math.round(cropW * tileScaleX);
+  const dstH = Math.round(cropH * tileScaleY);
+
+  // Crop source region, resize to destination size, composite onto transparent tile.
+  const cropped = await sharp(fpath)
+    .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
+    .resize(Math.max(1, dstW), Math.max(1, dstH), { fit: 'fill', kernel: 'lanczos3' })
+    .toBuffer();
+
+  const tile = await sharp({
+    create: { width: TILE_SIZE, height: TILE_SIZE, channels: 4,
+              background: { r: 0, g: 0, b: 0, alpha: 0 } }
+  })
+  .composite([{ input: cropped, left: Math.max(0, dstX), top: Math.max(0, dstY) }])
+  .png({ compressionLevel: 6 })
+  .toBuffer();
+
+  // Evict oldest entry if cache is full.
+  if (tileCache.size >= TILE_CACHE_MAX) {
+    tileCache.delete(tileCache.keys().next().value);
+  }
+  tileCache.set(cacheKey, tile);
+  return tile;
+}
+
 async function serveSatellite(res, product) {
   const entry = satCache[product];
   const now = Date.now();
@@ -636,6 +759,33 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
+    // GET /satellite/:product/tiles/:z/:x/:y.png
+    // XYZ tile slices of the pre-reprojected satellite JPEG.
+    // product: "geocolor" or "visible"
+    // z: zoom level (4–12 recommended; outside coverage returns transparent)
+    const satTileMatch = path.match(/^\/satellite\/(geocolor|visible)\/tiles\/(\d+)\/(\d+)\/(\d+)\.png$/i);
+    if (satTileMatch) {
+      const product = satTileMatch[1].toLowerCase();
+      const z = parseInt(satTileMatch[2]), x = parseInt(satTileMatch[3]), y = parseInt(satTileMatch[4]);
+      if (z < 1 || z > 14 || isNaN(x) || isNaN(y)) {
+        res.writeHead(400); return res.end('Bad tile coordinates');
+      }
+      try {
+        const tile = await renderSatTile(product, z, x, y);
+        if (!tile) { res.writeHead(204); return res.end(); }
+        res.writeHead(200, {
+          'Content-Type':                'image/png',
+          'Content-Length':              tile.length,
+          'Cache-Control':               'public, max-age=270',
+          'Access-Control-Allow-Origin': '*',
+        });
+        return res.end(tile);
+      } catch (err) {
+        console.error('[tile] error:', err.message);
+        res.writeHead(500); return res.end('Tile error');
+      }
+    }
+
     // GET /satellite/geocolor — pre-reprojected GOES-19 GeoColor JPEG
     if (path === '/satellite/geocolor') {
       return serveSatellite(res, 'geocolor');
@@ -972,6 +1122,7 @@ const server = http.createServer(async (req, res) => {
         'GET /satellite/geocolor',
         'GET /satellite/visible',
         'GET /satellite/meta',
+        'GET /satellite/:product/tiles/:z/:x/:y.png',
       ]});
     }
 

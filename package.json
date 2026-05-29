@@ -9,6 +9,7 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "seek-bzip": "^2.0.0"
+    "seek-bzip": "^2.0.0",
+    "sharp": "^0.33.0"
   }
 }
