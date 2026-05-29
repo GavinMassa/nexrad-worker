@@ -8,3 +8,4 @@ aiohttp
 psutil
 netCDF4
 rasterio
+Pillow

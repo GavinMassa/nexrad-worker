@@ -11,6 +11,7 @@ from mesonet import fetch_mesonet_obs, spatial_thin, compute_correction
 from blend import blend as do_blend
 from writer import write_output, OUT_DIR
 from terrain_setup import build_terrain, terrain_already_exists
+from satellite import satellite_worker
 
 logging.basicConfig(level=logging.INFO, format='[sidecar] %(message)s')
 log = logging.getLogger(__name__)
@@ -304,6 +305,7 @@ async def main():
         await asyncio.gather(
             scheduler(),
             mesonet_worker(),
+            satellite_worker(),
         )
     finally:
         _thread_pool.shutdown(wait=False)
