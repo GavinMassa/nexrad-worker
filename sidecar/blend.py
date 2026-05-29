@@ -225,8 +225,8 @@ def compute_baci(
     if t700_i is None or td700_i is None:
         rh_term = np.ones_like(cape_term) * 0.5
     else:
-        td700_c = td700_i - 273.15
-        t700_c  = t700_i  - 273.15
+        td700_c = np.clip(td700_i - 273.15, -60.0, 30.0)
+        t700_c  = np.clip(t700_i  - 273.15, -60.0, 30.0)
         rh_700  = 100.0 * np.exp(17.67 * td700_c / (td700_c + 243.5)) / \
                           np.exp(17.67 * t700_c  / (t700_c  + 243.5))
         rh_700  = np.clip(rh_700, 0.0, 100.0)

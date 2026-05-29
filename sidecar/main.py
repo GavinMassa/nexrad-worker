@@ -47,7 +47,7 @@ async def mesonet_worker():
     Correction files are read by run_cycle() and applied in <1 s via a simple
     array read + upsample, with no IDW running inline with the blend pipeline.
     """
-    FACTOR = 0.25
+    FACTOR = 0.5
 
     while True:
         try:
@@ -178,7 +178,7 @@ async def run_cycle():
                 write_output(rtma, now)
                 return
 
-            FACTOR = 0.25
+            FACTOR = 0.5
             loop   = asyncio.get_running_loop()
 
             # Save downsampled RTMA T/Td + lats/lons as the reference for

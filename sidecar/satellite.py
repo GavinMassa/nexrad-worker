@@ -70,10 +70,10 @@ OUT_HEIGHT = int(OUT_WIDTH * (CONUS_LAT_MAX - CONUS_LAT_MIN) /
 
 JPEG_QUALITY = 85
 
-# ── NESDIS CDN source URLs (10848×6136 full-res CONUS) ──────────────────────
+# ── NESDIS CDN source URLs (5000×3000 full-res CONUS) ──────────────────────
 NESDIS_URLS = {
-    'geocolor': 'https://cdn.star.nesdis.noaa.gov/GOES19/ABI/CONUS/GEOCOLOR/10848x6136.jpg',
-    'visible':  'https://cdn.star.nesdis.noaa.gov/GOES19/ABI/CONUS/02/10848x6136.jpg',
+    'geocolor': 'https://cdn.star.nesdis.noaa.gov/GOES19/ABI/CONUS/GEOCOLOR/5000x3000.jpg',
+    'visible':  'https://cdn.star.nesdis.noaa.gov/GOES19/ABI/CONUS/02/5000x3000.jpg',
 }
 
 
