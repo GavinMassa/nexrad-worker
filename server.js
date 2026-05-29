@@ -37,6 +37,17 @@ function cacheSet(key, value, ttl) {
   cache.set(key, { value, expires: Date.now() + ttl });
 }
 
+// ── Satellite image cache ────────────────────────────────────────────────────
+// Holds the last-read Buffer per product so disk is only hit when the file
+// changes. TTL = 4.5 minutes — slightly under the 5-minute update interval
+// so iOS always gets a fresh image within one extra poll.
+const SAT_CACHE_TTL_MS = 4.5 * 60 * 1000;
+const satCache = {
+  geocolor: { buf: null, expires: 0 },
+  visible:  { buf: null, expires: 0 },
+};
+const SAT_DIR = '/app/sidecar-out';
+
 // ============================================================
 // BZIP2 DECODER (seek-bzip npm package)
 // ============================================================
@@ -576,6 +587,33 @@ function sendPng(res, png) {
   res.end(png);
 }
 
+async function serveSatellite(res, product) {
+  const entry = satCache[product];
+  const now = Date.now();
+
+  if (!entry.buf || now > entry.expires) {
+    const fpath = `${SAT_DIR}/satellite_${product}.jpg`;
+    try {
+      const fs = require('fs').promises;
+      entry.buf = await fs.readFile(fpath);
+      entry.expires = now + SAT_CACHE_TTL_MS;
+    } catch (e) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `satellite_${product}.jpg not ready yet` }));
+      return;
+    }
+  }
+
+  res.writeHead(200, {
+    'Content-Type':                'image/jpeg',
+    'Content-Length':              entry.buf.length,
+    'Cache-Control':               'public, max-age=270',   // 4.5 min — matches TTL
+    'Access-Control-Allow-Origin': '*',
+    'X-Satellite-Product':         product,
+  });
+  res.end(entry.buf);
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const path = url.pathname;
@@ -598,6 +636,33 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
+    // GET /satellite/geocolor — pre-reprojected GOES-19 GeoColor JPEG
+    if (path === '/satellite/geocolor') {
+      return serveSatellite(res, 'geocolor');
+    }
+
+    // GET /satellite/visible — pre-reprojected GOES-19 Band 02 visible JPEG
+    if (path === '/satellite/visible') {
+      return serveSatellite(res, 'visible');
+    }
+
+    // GET /satellite/meta — metadata (timestamps, bbox, dimensions)
+    if (path === '/satellite/meta') {
+      const fs = require('fs').promises;
+      try {
+        const meta = await fs.readFile(`${SAT_DIR}/satellite_meta.json`, 'utf8');
+        res.writeHead(200, {
+          'Content-Type':                'application/json',
+          'Cache-Control':               'public, max-age=60',
+          'Access-Control-Allow-Origin': '*',
+        });
+        return res.end(meta);
+      } catch {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'satellite_meta.json not ready yet' }));
+      }
+    }
+
     // GET /api/scans/:station?date=YYYY-MM-DD
     let m = path.match(/^\/api\/scans\/([A-Z]{3,4})$/i);
     if (m) {
@@ -904,6 +969,9 @@ const server = http.createServer(async (req, res) => {
         'GET /api/products/{STATION}?time=YYYYMMDD_HHMMSS',
         'GET /tiles/{STATION}/{PRODUCT}/{z}/{x}/{y}.png?time=YYYYMMDD_HHMMSS&elevation=0.5',
         'GET /debug/parse/{STATION}',
+        'GET /satellite/geocolor',
+        'GET /satellite/visible',
+        'GET /satellite/meta',
       ]});
     }
 
