@@ -2,7 +2,13 @@ const http  = require('http');
 const zlib  = require('zlib');
 const { URL } = require('url');
 const seekBzip = require('seek-bzip');
-const Jimp  = require('jimp');
+let sharp;
+try {
+  sharp = require('sharp');
+  console.log('[sharp] loaded successfully');
+} catch (e) {
+  console.error('[sharp] failed to load — tile endpoint will return 503:', e.message);
+}
 const fs    = require('fs');
 const rap   = require('./rap');
 
@@ -79,37 +85,6 @@ async function fetchSatJpeg(product) {
   entry.buf = buf;
   entry.expires = now + SAT_JPEG_TTL_MS;
   return buf;
-}
-
-// Cache decoded Jimp bitmaps — decode once per 4.5-min refresh cycle,
-// reuse for all tile crops. Avoids re-decoding the full 5000×3000 JPEG
-// (~800ms) on every individual tile request (~20-50ms per crop after).
-const satBitmapCache = {
-  geocolor: { bitmap: null, expires: 0 },
-  visible:  { bitmap: null, expires: 0 },
-};
-
-async function fetchSatBitmap(product) {
-  const entry = satBitmapCache[product];
-  const now = Date.now();
-  if (entry.bitmap && now < entry.expires) return entry.bitmap;
-
-  // Clear tile cache — source will change.
-  for (const k of tileCache.keys()) {
-    if (k.startsWith(product + '/')) tileCache.delete(k);
-  }
-
-  const jpegBuf = await fetchSatJpeg(product);
-  if (!jpegBuf) return entry.bitmap;   // return stale bitmap rather than null
-
-  console.log(`[satellite] decoding ${product} bitmap...`);
-  const t0 = Date.now();
-  const bitmap = await Jimp.read(jpegBuf);
-  console.log(`[satellite] ${product} decoded in ${Date.now() - t0}ms`);
-
-  entry.bitmap = bitmap;
-  entry.expires = now + SAT_JPEG_TTL_MS;
-  return bitmap;
 }
 
 // ── Satellite tile cache ─────────────────────────────────────────────────────
@@ -678,28 +653,31 @@ function tileToBBox(x, y, z) {
 // Render one XYZ tile from the source satellite JPEG.
 // Returns a PNG Buffer or null if the tile is fully outside the image bbox.
 async function renderSatTile(product, z, x, y) {
+  if (!sharp) return null;
+
   const cacheKey = `${product}/${z}/${x}/${y}`;
   if (tileCache.has(cacheKey)) return tileCache.get(cacheKey);
 
-  // Compute overlap between tile bbox and satellite image bbox.
   const tb = tileToBBox(x, y, z);
+
+  // Fully outside satellite coverage — return transparent PNG.
   if (tb.lonMax <= SAT_LON_MIN || tb.lonMin >= SAT_LON_MAX ||
       tb.latMax <= SAT_LAT_MIN || tb.latMin >= SAT_LAT_MAX) {
-    // Tile is fully outside satellite coverage — return transparent PNG.
-    const transparent = new Jimp(TILE_SIZE, TILE_SIZE, 0x00000000);
-    return await transparent.getBufferAsync(Jimp.MIME_PNG);
+    const transparent = await sharp({
+      create: { width: TILE_SIZE, height: TILE_SIZE, channels: 4,
+                background: { r: 0, g: 0, b: 0, alpha: 0 } }
+    }).png().toBuffer();
+    return transparent;
   }
 
-  // Fetch pre-decoded bitmap (decoded once per 4.5-min cycle, reused for all crops).
-  const src = await fetchSatBitmap(product);
-  if (!src) return null;
-  const srcW = src.bitmap.width, srcH = src.bitmap.height;
+  // Fetch cached JPEG buffer — sharp reads directly from Buffer, no full decode needed.
+  const jpegBuf = await fetchSatJpeg(product);
+  if (!jpegBuf) return null;
 
-  // Map geographic coords → pixel coords in source image.
-  // Source image: left=lon_min, right=lon_max, top=lat_max, bottom=lat_min
-  // (standard north-up Web Mercator after sidecar reprojection).
-  // mercY constants hoisted outside both functions so seam tiles share
-  // identical precision and don't accumulate a rounding gap.
+  // Get source dimensions without full decode (fast header read).
+  const meta = await sharp(jpegBuf).metadata();
+  const srcW = meta.width, srcH = meta.height;
+
   function mercY(latDeg) {
     const r = latDeg * Math.PI / 180;
     return Math.log(Math.tan(Math.PI / 4 + r / 2));
@@ -714,7 +692,6 @@ async function renderSatTile(product, z, x, y) {
     return (yMercSatMax - mercY(lat)) / (yMercSatMax - yMercSatMin) * srcH;
   }
 
-  // Tile pixel region in source image coordinates.
   const px0 = lonToPixel(Math.max(tb.lonMin, SAT_LON_MIN));
   const px1 = lonToPixel(Math.min(tb.lonMax, SAT_LON_MAX));
   const py0 = latToPixel(Math.min(tb.latMax, SAT_LAT_MAX));
@@ -727,25 +704,28 @@ async function renderSatTile(product, z, x, y) {
 
   if (cropW <= 0 || cropH <= 0) return null;
 
-  // Compute where the cropped region maps within the 256×256 output tile
-  // (tile may extend outside the satellite image — pad with transparency).
   const tileScaleX = TILE_SIZE / (lonToPixel(tb.lonMax) - lonToPixel(tb.lonMin));
   const tileScaleY = TILE_SIZE / (latToPixel(tb.latMin) - latToPixel(tb.latMax));
   const dstX = Math.round((cropX - lonToPixel(tb.lonMin)) * tileScaleX);
   const dstY = Math.round((cropY - latToPixel(tb.latMax)) * tileScaleY);
-  const dstW = Math.round(cropW * tileScaleX);
-  const dstH = Math.round(cropH * tileScaleY);
+  const dstW = Math.max(1, Math.round(cropW * tileScaleX));
+  const dstH = Math.max(1, Math.round(cropH * tileScaleY));
 
-  // Crop source region, resize to destination size, composite onto transparent tile.
-  const cropped = src.clone()
-    .crop(cropX, cropY, cropW, cropH)
-    .resize(Math.max(1, dstW), Math.max(1, dstH), Jimp.RESIZE_LANCZOS3);
+  // sharp reads from the JPEG Buffer — libvips partial-decodes only the crop
+  // region via DCT coefficients (~3ms total vs ~300ms for a full decode).
+  const cropped = await sharp(jpegBuf)
+    .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
+    .resize(dstW, dstH, { fit: 'fill', kernel: 'lanczos3' })
+    .toBuffer();
 
-  const tile = new Jimp(TILE_SIZE, TILE_SIZE, 0x00000000);
-  tile.composite(cropped, Math.max(0, dstX), Math.max(0, dstY));
-  const pngBuf = await tile.getBufferAsync(Jimp.MIME_PNG);
+  const pngBuf = await sharp({
+    create: { width: TILE_SIZE, height: TILE_SIZE, channels: 4,
+              background: { r: 0, g: 0, b: 0, alpha: 0 } }
+  })
+  .composite([{ input: cropped, left: Math.max(0, dstX), top: Math.max(0, dstY) }])
+  .png({ compressionLevel: 6 })
+  .toBuffer();
 
-  // Evict oldest entry if cache is full, then store.
   if (tileCache.size >= TILE_CACHE_MAX) {
     tileCache.delete(tileCache.keys().next().value);
   }
@@ -1173,13 +1153,13 @@ server.listen(PORT, () => {
   console.log(`NEXRAD Level II server listening on port ${PORT}`);
 });
 
-// Pre-fetch and decode both satellite images at startup so the first tile
-// request hits the in-memory bitmap rather than triggering a fetch + decode.
+// Pre-fetch both satellite JPEGs into cache at startup so the first tile
+// request hits the in-memory buffer rather than triggering a sidecar fetch.
 async function prefetchSatelliteImages() {
   for (const product of ['geocolor', 'visible']) {
     try {
-      await fetchSatBitmap(product);   // fetch JPEG + decode bitmap in one shot
-      console.log(`[satellite] pre-fetched and decoded ${product}`);
+      await fetchSatJpeg(product);
+      console.log(`[satellite] pre-fetched ${product}`);
     } catch (e) {
       console.warn(`[satellite] pre-fetch failed for ${product}:`, e.message);
     }
