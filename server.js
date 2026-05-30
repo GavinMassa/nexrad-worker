@@ -39,16 +39,47 @@ function cacheSet(key, value, ttl) {
   cache.set(key, { value, expires: Date.now() + ttl });
 }
 
-// ── Satellite image cache ────────────────────────────────────────────────────
-// Holds the last-read Buffer per product so disk is only hit when the file
-// changes. TTL = 4.5 minutes — slightly under the 5-minute update interval
-// so iOS always gets a fresh image within one extra poll.
-const SAT_CACHE_TTL_MS = 4.5 * 60 * 1000;
-const satCache = {
+// ── Sidecar proxy — satellite images ────────────────────────────────────────
+// Node fetches satellite JPEGs from the Python sidecar over localhost HTTP.
+// Results are cached in-process for 4.5 min (just under the 5-min update interval).
+// When the JPEG changes, all tile cache entries for that product are evicted.
+const SIDECAR_URL = process.env.SIDECAR_URL || 'http://localhost:4000';
+const SAT_JPEG_TTL_MS = 4.5 * 60 * 1000;
+const satJpegCache = {
   geocolor: { buf: null, expires: 0 },
   visible:  { buf: null, expires: 0 },
 };
-const SAT_DIR = '/app/sidecar-out';
+
+async function fetchSatJpeg(product) {
+  const entry = satJpegCache[product];
+  const now = Date.now();
+  if (entry.buf && now < entry.expires) return entry.buf;
+
+  let resp;
+  try {
+    resp = await fetch(`${SIDECAR_URL}/satellite/${product}`,
+                      { signal: AbortSignal.timeout(15000) });
+  } catch (e) {
+    console.error(`[satellite] fetch ${product} from sidecar failed:`, e.message);
+    return entry.buf;   // return stale buffer rather than failing tile render
+  }
+  if (!resp.ok) {
+    console.warn(`[satellite] sidecar returned ${resp.status} for ${product}`);
+    return entry.buf;
+  }
+  const buf = Buffer.from(await resp.arrayBuffer());
+
+  // If JPEG content changed, evict all tile cache entries for this product.
+  if (entry.buf && !buf.equals(entry.buf)) {
+    for (const k of tileCache.keys()) {
+      if (k.startsWith(product + '/')) tileCache.delete(k);
+    }
+    console.log(`[satellite] ${product} updated — tile cache cleared`);
+  }
+  entry.buf = buf;
+  entry.expires = now + SAT_JPEG_TTL_MS;
+  return buf;
+}
 
 // ── Satellite tile cache ─────────────────────────────────────────────────────
 // Keyed by "{product}/{z}/{x}/{y}". Stores rendered PNG Buffer.
@@ -63,8 +94,6 @@ const SAT_LAT_MAX =  53.297;
 const SAT_LON_MIN = -135.038;
 const SAT_LON_MAX =  -59.975;
 
-// Track source file mtime so tile cache is invalidated when sidecar writes new image.
-const satMtime = { geocolor: 0, visible: 0 };
 
 // ============================================================
 // BZIP2 DECODER (seek-bzip npm package)
@@ -619,19 +648,6 @@ function tileToBBox(x, y, z) {
 // Returns a PNG Buffer or null if the tile is fully outside the image bbox.
 async function renderSatTile(product, z, x, y) {
   const cacheKey = `${product}/${z}/${x}/${y}`;
-
-  // Check mtime — invalidate cache if source file was updated.
-  const fpath = `${SAT_DIR}/satellite_${product}.jpg`;
-  let mtime = 0;
-  try { mtime = fs.statSync(fpath).mtimeMs; } catch { return null; }
-  if (mtime !== satMtime[product]) {
-    // New image written — clear all tiles for this product.
-    for (const k of tileCache.keys()) {
-      if (k.startsWith(product + '/')) tileCache.delete(k);
-    }
-    satMtime[product] = mtime;
-  }
-
   if (tileCache.has(cacheKey)) return tileCache.get(cacheKey);
 
   // Compute overlap between tile bbox and satellite image bbox.
@@ -646,13 +662,17 @@ async function renderSatTile(product, z, x, y) {
     return transparent;
   }
 
-  // Load source image metadata (fast — just reads header).
-  const meta = await sharp(fpath).metadata();
+  // Fetch JPEG from sidecar (cached in-process for 4.5 min).
+  const jpegBuf = await fetchSatJpeg(product);
+  if (!jpegBuf) return null;
+
+  // Load source image metadata from buffer (fast — reads header only).
+  const meta = await sharp(jpegBuf).metadata();
   const srcW = meta.width, srcH = meta.height;
 
   // Map geographic coords → pixel coords in source image.
   // Source image: left=lon_min, right=lon_max, top=lat_max, bottom=lat_min
-  // (standard north-up Web Mercator after reprojection).
+  // (standard north-up Web Mercator after sidecar reprojection).
   function lonToPixel(lon) {
     return (lon - SAT_LON_MIN) / (SAT_LON_MAX - SAT_LON_MIN) * srcW;
   }
@@ -689,7 +709,7 @@ async function renderSatTile(product, z, x, y) {
   const dstH = Math.round(cropH * tileScaleY);
 
   // Crop source region, resize to destination size, composite onto transparent tile.
-  const cropped = await sharp(fpath)
+  const cropped = await sharp(jpegBuf)
     .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
     .resize(Math.max(1, dstW), Math.max(1, dstH), { fit: 'fill', kernel: 'lanczos3' })
     .toBuffer();
@@ -711,30 +731,20 @@ async function renderSatTile(product, z, x, y) {
 }
 
 async function serveSatellite(res, product) {
-  const entry = satCache[product];
-  const now = Date.now();
-
-  if (!entry.buf || now > entry.expires) {
-    const fpath = `${SAT_DIR}/satellite_${product}.jpg`;
-    try {
-      const fs = require('fs').promises;
-      entry.buf = await fs.readFile(fpath);
-      entry.expires = now + SAT_CACHE_TTL_MS;
-    } catch (e) {
-      res.writeHead(503, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: `satellite_${product}.jpg not ready yet` }));
-      return;
-    }
+  const buf = await fetchSatJpeg(product);
+  if (!buf) {
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: `satellite_${product} not ready yet` }));
+    return;
   }
-
   res.writeHead(200, {
     'Content-Type':                'image/jpeg',
-    'Content-Length':              entry.buf.length,
-    'Cache-Control':               'public, max-age=270',   // 4.5 min — matches TTL
+    'Content-Length':              buf.length,
+    'Cache-Control':               'public, max-age=270',
     'Access-Control-Allow-Origin': '*',
     'X-Satellite-Product':         product,
   });
-  res.end(entry.buf);
+  res.end(buf);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -798,9 +808,11 @@ const server = http.createServer(async (req, res) => {
 
     // GET /satellite/meta — metadata (timestamps, bbox, dimensions)
     if (path === '/satellite/meta') {
-      const fs = require('fs').promises;
       try {
-        const meta = await fs.readFile(`${SAT_DIR}/satellite_meta.json`, 'utf8');
+        const resp = await fetch(`${SIDECAR_URL}/satellite/meta`,
+                                 { signal: AbortSignal.timeout(5000) });
+        if (!resp.ok) throw new Error(`sidecar ${resp.status}`);
+        const meta = await resp.text();
         res.writeHead(200, {
           'Content-Type':                'application/json',
           'Cache-Control':               'public, max-age=60',
@@ -809,7 +821,7 @@ const server = http.createServer(async (req, res) => {
         return res.end(meta);
       } catch {
         res.writeHead(503, { 'Content-Type': 'application/json' });
-        return res.end(JSON.stringify({ error: 'satellite_meta.json not ready yet' }));
+        return res.end(JSON.stringify({ error: 'satellite_meta not ready yet' }));
       }
     }
 
