@@ -85,7 +85,7 @@ async function fetchSatJpeg(product) {
 // Keyed by "{product}/{z}/{x}/{y}". Stores rendered PNG Buffer.
 // Invalidated when the source JPEG file changes (mtime check on each miss).
 const tileCache = new Map();
-const TILE_CACHE_MAX = 2000;   // ~500 MB at 256KB average — well within RAM
+const TILE_CACHE_MAX = 5000;   // z=8 CONUS needs ~800 tiles; 5000 avoids eviction mid-session
 // TILE_SIZE = 256 shared with NEXRAD renderer below — declared once there.
 
 // GOES CONUS bbox — must match sidecar/satellite.py constants exactly.
@@ -673,17 +673,20 @@ async function renderSatTile(product, z, x, y) {
   // Map geographic coords → pixel coords in source image.
   // Source image: left=lon_min, right=lon_max, top=lat_max, bottom=lat_min
   // (standard north-up Web Mercator after sidecar reprojection).
+  // mercY constants hoisted outside both functions so seam tiles share
+  // identical precision and don't accumulate a rounding gap.
+  function mercY(latDeg) {
+    const r = latDeg * Math.PI / 180;
+    return Math.log(Math.tan(Math.PI / 4 + r / 2));
+  }
+  const yMercSatMin = mercY(SAT_LAT_MIN);
+  const yMercSatMax = mercY(SAT_LAT_MAX);
+
   function lonToPixel(lon) {
     return (lon - SAT_LON_MIN) / (SAT_LON_MAX - SAT_LON_MIN) * srcW;
   }
   function latToPixel(lat) {
-    // Mercator y is non-linear — use inverse Mercator for accuracy.
-    function mercY(latDeg) {
-      const r = latDeg * Math.PI / 180;
-      return Math.log(Math.tan(Math.PI / 4 + r / 2));
-    }
-    const yMin = mercY(SAT_LAT_MIN), yMax = mercY(SAT_LAT_MAX);
-    return (yMax - mercY(lat)) / (yMax - yMin) * srcH;
+    return (yMercSatMax - mercY(lat)) / (yMercSatMax - yMercSatMin) * srcH;
   }
 
   // Tile pixel region in source image coordinates.
@@ -1149,3 +1152,17 @@ server.timeout = 120000;
 server.listen(PORT, () => {
   console.log(`NEXRAD Level II server listening on port ${PORT}`);
 });
+
+// Pre-fetch both satellite images into cache at startup so the first tile
+// request is served from memory rather than triggering a 3.5 MB sidecar fetch.
+async function prefetchSatelliteImages() {
+  for (const product of ['geocolor', 'visible']) {
+    try {
+      await fetchSatJpeg(product);
+      console.log(`[satellite] pre-fetched ${product}`);
+    } catch (e) {
+      console.warn(`[satellite] pre-fetch failed for ${product}:`, e.message);
+    }
+  }
+}
+prefetchSatelliteImages();
