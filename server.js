@@ -2,7 +2,7 @@ const http  = require('http');
 const zlib  = require('zlib');
 const { URL } = require('url');
 const seekBzip = require('seek-bzip');
-const sharp = require('sharp');
+const Jimp  = require('jimp');
 const fs    = require('fs');
 const rap   = require('./rap');
 
@@ -655,20 +655,17 @@ async function renderSatTile(product, z, x, y) {
   if (tb.lonMax <= SAT_LON_MIN || tb.lonMin >= SAT_LON_MAX ||
       tb.latMax <= SAT_LAT_MIN || tb.latMin >= SAT_LAT_MAX) {
     // Tile is fully outside satellite coverage — return transparent PNG.
-    const transparent = await sharp({
-      create: { width: TILE_SIZE, height: TILE_SIZE, channels: 4,
-                background: { r: 0, g: 0, b: 0, alpha: 0 } }
-    }).png().toBuffer();
-    return transparent;
+    const transparent = new Jimp(TILE_SIZE, TILE_SIZE, 0x00000000);
+    return await transparent.getBufferAsync(Jimp.MIME_PNG);
   }
 
   // Fetch JPEG from sidecar (cached in-process for 4.5 min).
   const jpegBuf = await fetchSatJpeg(product);
   if (!jpegBuf) return null;
 
-  // Load source image metadata from buffer (fast — reads header only).
-  const meta = await sharp(jpegBuf).metadata();
-  const srcW = meta.width, srcH = meta.height;
+  // Load source image from buffer.
+  const src = await Jimp.read(jpegBuf);
+  const srcW = src.bitmap.width, srcH = src.bitmap.height;
 
   // Map geographic coords → pixel coords in source image.
   // Source image: left=lon_min, right=lon_max, top=lat_max, bottom=lat_min
@@ -712,25 +709,20 @@ async function renderSatTile(product, z, x, y) {
   const dstH = Math.round(cropH * tileScaleY);
 
   // Crop source region, resize to destination size, composite onto transparent tile.
-  const cropped = await sharp(jpegBuf)
-    .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
-    .resize(Math.max(1, dstW), Math.max(1, dstH), { fit: 'fill', kernel: 'lanczos3' })
-    .toBuffer();
+  const cropped = src.clone()
+    .crop(cropX, cropY, cropW, cropH)
+    .resize(Math.max(1, dstW), Math.max(1, dstH), Jimp.RESIZE_LANCZOS3);
 
-  const tile = await sharp({
-    create: { width: TILE_SIZE, height: TILE_SIZE, channels: 4,
-              background: { r: 0, g: 0, b: 0, alpha: 0 } }
-  })
-  .composite([{ input: cropped, left: Math.max(0, dstX), top: Math.max(0, dstY) }])
-  .png({ compressionLevel: 6 })
-  .toBuffer();
+  const tile = new Jimp(TILE_SIZE, TILE_SIZE, 0x00000000);
+  tile.composite(cropped, Math.max(0, dstX), Math.max(0, dstY));
+  const pngBuf = await tile.getBufferAsync(Jimp.MIME_PNG);
 
-  // Evict oldest entry if cache is full.
+  // Evict oldest entry if cache is full, then store.
   if (tileCache.size >= TILE_CACHE_MAX) {
     tileCache.delete(tileCache.keys().next().value);
   }
-  tileCache.set(cacheKey, tile);
-  return tile;
+  tileCache.set(cacheKey, pngBuf);
+  return pngBuf;
 }
 
 async function serveSatellite(res, product) {
