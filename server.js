@@ -716,18 +716,25 @@ async function renderSatTile(product, z, x, y) {
   const dstW = Math.max(1, Math.round(cropW * tileScaleX));
   const dstH = Math.max(1, Math.round(cropH * tileScaleY));
 
+  // Clamp dst size to canvas bounds — composite requires input fits within destination.
+  // Negative dstX/Y (tile extends beyond image edge) shrinks the usable canvas area.
+  const clampedDstX = Math.max(0, dstX);
+  const clampedDstY = Math.max(0, dstY);
+  const clampedDstW = Math.max(1, Math.min(dstW, TILE_SIZE - clampedDstX));
+  const clampedDstH = Math.max(1, Math.min(dstH, TILE_SIZE - clampedDstY));
+
   // sharp reads from the JPEG Buffer — libvips partial-decodes only the crop
   // region via DCT coefficients (~3ms total vs ~300ms for a full decode).
   const cropped = await sharp(jpegBuf)
     .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
-    .resize(dstW, dstH, { fit: 'fill', kernel: 'lanczos3' })
+    .resize(clampedDstW, clampedDstH, { fit: 'fill', kernel: 'lanczos3' })
     .toBuffer();
 
   const pngBuf = await sharp({
     create: { width: TILE_SIZE, height: TILE_SIZE, channels: 4,
               background: { r: 0, g: 0, b: 0, alpha: 0 } }
   })
-  .composite([{ input: cropped, left: Math.max(0, dstX), top: Math.max(0, dstY) }])
+  .composite([{ input: cropped, left: clampedDstX, top: clampedDstY }])
   .png({ compressionLevel: 6 })
   .toBuffer();
 
