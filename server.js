@@ -55,7 +55,7 @@ const SAT_DIR = '/app/sidecar-out';
 // Invalidated when the source JPEG file changes (mtime check on each miss).
 const tileCache = new Map();
 const TILE_CACHE_MAX = 2000;   // ~500 MB at 256KB average — well within RAM
-const TILE_SIZE = 256;
+// TILE_SIZE = 256 shared with NEXRAD renderer below — declared once there.
 
 // GOES CONUS bbox — must match sidecar/satellite.py constants exactly.
 const SAT_LAT_MIN =  14.568;
