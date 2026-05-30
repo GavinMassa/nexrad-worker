@@ -655,6 +655,8 @@ function tileToBBox(x, y, z) {
 async function renderSatTile(product, z, x, y) {
   if (!sharp) return null;
 
+  console.log(`[tile] rendering z=${z} x=${x} y=${y} product=${product}`);
+
   const cacheKey = `${product}/${z}/${x}/${y}`;
   if (tileCache.has(cacheKey)) return tileCache.get(cacheKey);
 
@@ -697,12 +699,15 @@ async function renderSatTile(product, z, x, y) {
   const py0 = latToPixel(Math.min(tb.latMax, SAT_LAT_MAX));
   const py1 = latToPixel(Math.max(tb.latMin, SAT_LAT_MIN));
 
-  const cropX = Math.max(0, Math.floor(px0));
-  const cropY = Math.max(0, Math.floor(py0));
-  const cropW = Math.min(srcW - cropX, Math.ceil(px1) - cropX);
-  const cropH = Math.min(srcH - cropY, Math.ceil(py1) - cropY);
+  const cropX = Math.max(0, Math.floor(Math.min(px0, px1)));
+  const cropY = Math.max(0, Math.floor(Math.min(py0, py1)));
+  const cropW = Math.min(srcW - cropX, Math.ceil(Math.max(px0, px1)) - cropX);
+  const cropH = Math.min(srcH - cropY, Math.ceil(Math.max(py0, py1)) - cropY);
 
-  if (cropW <= 0 || cropH <= 0) return null;
+  if (cropW <= 0 || cropH <= 0) {
+    console.log(`[tile] empty crop z=${z} x=${x} y=${y} product=${product} cropX=${cropX} cropY=${cropY} cropW=${cropW} cropH=${cropH} px0=${px0.toFixed(1)} px1=${px1.toFixed(1)} srcW=${srcW}`);
+    return null;
+  }
 
   const tileScaleX = TILE_SIZE / (lonToPixel(tb.lonMax) - lonToPixel(tb.lonMin));
   const tileScaleY = TILE_SIZE / (latToPixel(tb.latMin) - latToPixel(tb.latMax));
