@@ -81,6 +81,37 @@ async function fetchSatJpeg(product) {
   return buf;
 }
 
+// Cache decoded Jimp bitmaps — decode once per 4.5-min refresh cycle,
+// reuse for all tile crops. Avoids re-decoding the full 5000×3000 JPEG
+// (~800ms) on every individual tile request (~20-50ms per crop after).
+const satBitmapCache = {
+  geocolor: { bitmap: null, expires: 0 },
+  visible:  { bitmap: null, expires: 0 },
+};
+
+async function fetchSatBitmap(product) {
+  const entry = satBitmapCache[product];
+  const now = Date.now();
+  if (entry.bitmap && now < entry.expires) return entry.bitmap;
+
+  // Clear tile cache — source will change.
+  for (const k of tileCache.keys()) {
+    if (k.startsWith(product + '/')) tileCache.delete(k);
+  }
+
+  const jpegBuf = await fetchSatJpeg(product);
+  if (!jpegBuf) return entry.bitmap;   // return stale bitmap rather than null
+
+  console.log(`[satellite] decoding ${product} bitmap...`);
+  const t0 = Date.now();
+  const bitmap = await Jimp.read(jpegBuf);
+  console.log(`[satellite] ${product} decoded in ${Date.now() - t0}ms`);
+
+  entry.bitmap = bitmap;
+  entry.expires = now + SAT_JPEG_TTL_MS;
+  return bitmap;
+}
+
 // ── Satellite tile cache ─────────────────────────────────────────────────────
 // Keyed by "{product}/{z}/{x}/{y}". Stores rendered PNG Buffer.
 // Invalidated when the source JPEG file changes (mtime check on each miss).
@@ -659,12 +690,9 @@ async function renderSatTile(product, z, x, y) {
     return await transparent.getBufferAsync(Jimp.MIME_PNG);
   }
 
-  // Fetch JPEG from sidecar (cached in-process for 4.5 min).
-  const jpegBuf = await fetchSatJpeg(product);
-  if (!jpegBuf) return null;
-
-  // Load source image from buffer.
-  const src = await Jimp.read(jpegBuf);
+  // Fetch pre-decoded bitmap (decoded once per 4.5-min cycle, reused for all crops).
+  const src = await fetchSatBitmap(product);
+  if (!src) return null;
   const srcW = src.bitmap.width, srcH = src.bitmap.height;
 
   // Map geographic coords → pixel coords in source image.
@@ -1145,13 +1173,13 @@ server.listen(PORT, () => {
   console.log(`NEXRAD Level II server listening on port ${PORT}`);
 });
 
-// Pre-fetch both satellite images into cache at startup so the first tile
-// request is served from memory rather than triggering a 3.5 MB sidecar fetch.
+// Pre-fetch and decode both satellite images at startup so the first tile
+// request hits the in-memory bitmap rather than triggering a fetch + decode.
 async function prefetchSatelliteImages() {
   for (const product of ['geocolor', 'visible']) {
     try {
-      await fetchSatJpeg(product);
-      console.log(`[satellite] pre-fetched ${product}`);
+      await fetchSatBitmap(product);   // fetch JPEG + decode bitmap in one shot
+      console.log(`[satellite] pre-fetched and decoded ${product}`);
     } catch (e) {
       console.warn(`[satellite] pre-fetch failed for ${product}:`, e.message);
     }
