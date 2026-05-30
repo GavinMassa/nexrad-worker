@@ -655,8 +655,6 @@ function tileToBBox(x, y, z) {
 async function renderSatTile(product, z, x, y) {
   if (!sharp) return null;
 
-  console.log(`[tile] rendering z=${z} x=${x} y=${y} product=${product}`);
-
   const cacheKey = `${product}/${z}/${x}/${y}`;
   if (tileCache.has(cacheKey)) return tileCache.get(cacheKey);
 
@@ -704,10 +702,7 @@ async function renderSatTile(product, z, x, y) {
   const cropW = Math.min(srcW - cropX, Math.ceil(Math.max(px0, px1)) - cropX);
   const cropH = Math.min(srcH - cropY, Math.ceil(Math.max(py0, py1)) - cropY);
 
-  if (cropW <= 0 || cropH <= 0) {
-    console.log(`[tile] empty crop z=${z} x=${x} y=${y} product=${product} cropX=${cropX} cropY=${cropY} cropW=${cropW} cropH=${cropH} px0=${px0.toFixed(1)} px1=${px1.toFixed(1)} srcW=${srcW}`);
-    return null;
-  }
+  if (cropW <= 0 || cropH <= 0) return null;
 
   const tileScaleX = TILE_SIZE / (lonToPixel(tb.lonMax) - lonToPixel(tb.lonMin));
   const tileScaleY = TILE_SIZE / (latToPixel(tb.latMin) - latToPixel(tb.latMax));
@@ -716,27 +711,36 @@ async function renderSatTile(product, z, x, y) {
   const dstW = Math.max(1, Math.round(cropW * tileScaleX));
   const dstH = Math.max(1, Math.round(cropH * tileScaleY));
 
-  // Clamp dst size to canvas bounds — composite requires input fits within destination.
-  // Negative dstX/Y (tile extends beyond image edge) shrinks the usable canvas area.
   const clampedDstX = Math.max(0, dstX);
   const clampedDstY = Math.max(0, dstY);
-  const clampedDstW = Math.max(1, Math.min(dstW, TILE_SIZE - clampedDstX));
-  const clampedDstH = Math.max(1, Math.min(dstH, TILE_SIZE - clampedDstY));
+  const maxW = TILE_SIZE - clampedDstX;
+  const maxH = TILE_SIZE - clampedDstY;
+  const clampedDstW = Math.max(1, Math.min(dstW, maxW));
+  const clampedDstH = Math.max(1, Math.min(dstH, maxH));
 
-  // sharp reads from the JPEG Buffer — libvips partial-decodes only the crop
-  // region via DCT coefficients (~3ms total vs ~300ms for a full decode).
-  const cropped = await sharp(jpegBuf)
-    .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
-    .resize(clampedDstW, clampedDstH, { fit: 'fill', kernel: 'lanczos3' })
+  let pngBuf;
+  // Fast path: crop fills the whole canvas — skip composite, one pipeline call.
+  if (clampedDstX === 0 && clampedDstY === 0 &&
+      clampedDstW >= TILE_SIZE && clampedDstH >= TILE_SIZE) {
+    pngBuf = await sharp(jpegBuf)
+      .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
+      .resize(TILE_SIZE, TILE_SIZE, { fit: 'fill', kernel: 'lanczos3' })
+      .png({ compressionLevel: 6 })
+      .toBuffer();
+  } else {
+    // Edge tile: crop sits at an offset — composite onto transparent canvas.
+    const cropped = await sharp(jpegBuf)
+      .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
+      .resize(clampedDstW, clampedDstH, { fit: 'fill', kernel: 'lanczos3' })
+      .toBuffer();
+    pngBuf = await sharp({
+      create: { width: TILE_SIZE, height: TILE_SIZE, channels: 4,
+                background: { r: 0, g: 0, b: 0, alpha: 0 } }
+    })
+    .composite([{ input: cropped, left: clampedDstX, top: clampedDstY }])
+    .png({ compressionLevel: 6 })
     .toBuffer();
-
-  const pngBuf = await sharp({
-    create: { width: TILE_SIZE, height: TILE_SIZE, channels: 4,
-              background: { r: 0, g: 0, b: 0, alpha: 0 } }
-  })
-  .composite([{ input: cropped, left: clampedDstX, top: clampedDstY }])
-  .png({ compressionLevel: 6 })
-  .toBuffer();
+  }
 
   if (tileCache.size >= TILE_CACHE_MAX) {
     tileCache.delete(tileCache.keys().next().value);
