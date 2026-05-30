@@ -62,40 +62,25 @@ async def handle_health(request):
     return web.Response(text='ok')
 
 async def handle_satellite_product(request):
-    """Serve a pre-reprojected GOES-19 satellite JPEG written by satellite_worker().
-    product: 'geocolor' or 'visible'"""
-    product = request.match_info['product']
+    product = request.match_info.get('product', '')
     if product not in ('geocolor', 'visible'):
-        return web.Response(status=400, text='unknown product; use geocolor or visible')
-    fpath = OUT_DIR / f'satellite_{product}.jpg'
-    if not fpath.exists():
-        return web.Response(status=503, text=f'satellite_{product}.jpg not ready yet')
-    try:
-        data = fpath.read_bytes()
-        return web.Response(
-            body=data,
-            content_type='image/jpeg',
-            headers={'Cache-Control': 'public, max-age=270'},
-        )
-    except Exception as e:
-        log.error(f'handle_satellite_product error: {e}', exc_info=True)
-        return web.Response(status=500, text=str(e))
+        raise web.HTTPNotFound()
+    path = OUT_DIR / f'satellite_{product}.jpg'
+    if not path.exists():
+        raise web.HTTPServiceUnavailable()
+    return web.FileResponse(path, headers={
+        'Content-Type':                'image/jpeg',
+        'Cache-Control':               'public, max-age=270',
+        'Access-Control-Allow-Origin': '*',
+    })
 
 async def handle_satellite_meta(request):
-    """Serve satellite_meta.json written by satellite_worker()."""
-    fpath = OUT_DIR / 'satellite_meta.json'
-    if not fpath.exists():
-        return web.Response(status=503, text='satellite_meta.json not ready yet')
-    try:
-        data = fpath.read_text()
-        return web.Response(
-            text=data,
-            content_type='application/json',
-            headers={'Cache-Control': 'public, max-age=60'},
-        )
-    except Exception as e:
-        log.error(f'handle_satellite_meta error: {e}', exc_info=True)
-        return web.Response(status=500, text=str(e))
+    path = OUT_DIR / 'satellite_meta.json'
+    if not path.exists():
+        raise web.HTTPServiceUnavailable()
+    return web.Response(text=path.read_text(), content_type='application/json',
+                        headers={'Cache-Control':               'public, max-age=60',
+                                 'Access-Control-Allow-Origin': '*'})
 
 async def start_server():
     app = web.Application()
