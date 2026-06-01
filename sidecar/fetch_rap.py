@@ -22,8 +22,6 @@ def rap_main_url(dt: datetime) -> str:
         'lev_700_mb':            'on',
         'lev_850_mb':            'on',
         'lev_925_mb':            'on',
-        'lev_950_mb':            'on',
-        'lev_975_mb':            'on',
         'lev_10_m_above_ground': 'on',
         'lev_2_m_above_ground':  'on',
         'dir': f'/rap.{ymd}',
@@ -190,18 +188,6 @@ def _extract_rap(main_path: Path,
     _get(main_path, {'discipline': 0, 'parameterCategory': 0, 'parameterNumber': 0,
                      'typeOfLevel': 'isobaricInhPa', 'level': 925}, 't925')
 
-    # U/V at 975mb (~250m AGL) — SRH integration intermediate level 1
-    _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 2,
-                     'typeOfLevel': 'isobaricInhPa', 'level': 975}, 'u975')
-    _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 3,
-                     'typeOfLevel': 'isobaricInhPa', 'level': 975}, 'v975')
-
-    # U/V at 950mb (~500m AGL) — SRH integration intermediate level 2
-    _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 2,
-                     'typeOfLevel': 'isobaricInhPa', 'level': 950}, 'u950')
-    _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 3,
-                     'typeOfLevel': 'isobaricInhPa', 'level': 950}, 'v950')
-
     # U/V at 925mb (~750m AGL)
     _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 2,
                      'typeOfLevel': 'isobaricInhPa', 'level': 925}, 'u925')
@@ -281,11 +267,21 @@ def _extract_rap(main_path: Path,
         result['srh1'] = None
 
     # ── STM file (optional) — USTM/VSTM storm motion ─────────────────────────
-    if stm_path is not None and stm_path.exists() and stm_path.stat().st_size > 1000:
-        _get(stm_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 27,
-                        'typeOfLevel': 'heightAboveGroundLayer'}, 'ustm')
-        _get(stm_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 28,
-                        'typeOfLevel': 'heightAboveGroundLayer'}, 'vstm')
+    if stm_path and stm_path.exists():
+        try:
+            import xarray as xr
+            ds_motion = xr.open_dataset(str(stm_path), engine='cfgrib')
+            try:
+                result['ustm'] = ds_motion['ustm'].values.astype(np.float32)
+                result['vstm'] = ds_motion['vstm'].values.astype(np.float32)
+                log.info(f'  RAP ustm: shape={result["ustm"].shape} sample={result["ustm"].flat[0]:.2f}')
+                log.info(f'  RAP vstm: shape={result["vstm"].shape} sample={result["vstm"].flat[0]:.2f}')
+            finally:
+                ds_motion.close()
+        except Exception as e:
+            log.warning(f'  RAP ustm/vstm extraction failed: {e}')
+            result['ustm'] = None
+            result['vstm'] = None
     else:
         result['ustm'] = None
         result['vstm'] = None
