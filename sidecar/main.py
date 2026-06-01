@@ -97,6 +97,16 @@ async def mesonet_worker():
             west_count = len(thinned) - east_count
             log.info(f'[mesonet] thinned {len(stations_domain)} → {len(thinned)} stations '
                      f'(east={east_count}@0.75°, west={west_count}@1.5°)')
+
+            # Hard cap: IDW intermediate arrays scale as N_stations × N_gridpoints.
+            # At 1350 stations on a 1597×2345 grid that's ~20GB — OOM on Railway Hobby.
+            # Slice the front of the list; stations are already spatially distributed
+            # by the thinning loop so the cap preserves geographic spread.
+            MAX_STATIONS = 900
+            if len(thinned) > MAX_STATIONS:
+                thinned = thinned[:MAX_STATIONS]
+                log.info(f'[mesonet] capped to {MAX_STATIONS} stations (memory limit)')
+
             if len(thinned) < 10:
                 log.warning('[mesonet] too few stations after thinning — skipping')
                 await asyncio.sleep(600)
