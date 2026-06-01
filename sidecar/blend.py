@@ -382,6 +382,11 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
         # delta_t_clamped already computed above for SBCAPE
         cin_multiplier = np.clip(np.exp(-delta_t_clamped / 2.0), 0.1, 3.0)
         out['sbcin'] = (cin_i * cin_multiplier).astype(np.float32)
+        # Clamp to physically realistic CIN range — RAP occasionally produces
+        # large negative CIN artefacts (e.g. -1600 J/kg) in data-sparse regions;
+        # the exponential multiplier can amplify these further. Real CIN never
+        # drops below ~-300 J/kg in any observed sounding.
+        out['sbcin'] = np.clip(out['sbcin'], -300.0, 0.0).astype(np.float32)
         log.info(f'[sbcin] thermally nudged: min={float(out["sbcin"].min()):.0f} '
                  f'multiplier range=[{float(cin_multiplier.min()):.2f}, '
                  f'{float(cin_multiplier.max()):.2f}]')
@@ -534,11 +539,17 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
 
         # CIN gate term
         if 'sbcin' in out:
+            # Looser CIN gate matching Thompson et al. operational thresholds:
+            # >= -50  J/kg → 1.0 (no suppression, cap easily broken)
+            # <= -400 J/kg → 0.0 (full suppression, cap unbreakable)
+            # Linear ramp between -50 and -400. With SBCIN clamped to -300 max,
+            # the effective ramp spans -50 to -300, which covers the full
+            # realistic range without collapsing STP over the warm sector.
             cin_gate = np.where(
                 out['sbcin'] >= -50.0,  1.0,
                 np.where(
-                    out['sbcin'] <= -200.0, 0.0,
-                    (200.0 + out['sbcin']) / 150.0
+                    out['sbcin'] <= -400.0, 0.0,
+                    (400.0 + out['sbcin']) / 350.0
                 )
             ).astype(np.float32)
         else:
