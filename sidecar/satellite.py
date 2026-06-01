@@ -40,19 +40,24 @@ log = logging.getLogger(__name__)
 OUT_DIR = Path('/app/sidecar-out')
 OUT_DIR.mkdir(exist_ok=True)
 
-# ── GOES-19 ABI fixed-grid constants (GOES-R PUG Vol. 3, §4.2.8.1) ─────────
-# GOES-19 is at 75.2°W, same orbital slot as GOES-16 East.
-LAMBDA0 = -75.2 * np.pi / 180   # sub-satellite longitude (rad)
+# ── GOES-19 ABI fixed-grid constants (from GOES-19 ABI L1b RadC NetCDF) ─────
+# longitude_of_projection_origin = -75.0° (verified from L1b goes_imager_projection).
+# GOES-East nominal slot is 75.0°W (same as GOES-16 before it).
+LAMBDA0 = -75.0 * np.pi / 180   # sub-satellite longitude (rad)
 H       = 42_164_160.0           # satellite distance from Earth centre (m)
 R_EQ    = 6_378_137.0            # equatorial radius (m)
 R_POL   = 6_356_752.3141         # polar radius (m)
 E2      = 0.00669437999014       # eccentricity²
 
 # CONUS sector ABI fixed-grid scan angle extent (radians).
-X_MIN =  -0.101370   # west scan angle
-X_MAX =   0.038706   # east scan angle
-Y_MIN =   0.044588   # south elevation angle
-Y_MAX =   0.128212   # north elevation angle
+# Derived from Band 2 L1b: x add_offset=-0.101353, scale=1.4e-5, 10000px (0.5km).
+# The 5000×3000 GEOCOLOR is the 1km (2×aggregated) version of the same grid:
+#   pixel-0 centre = avg of Band-2 pixels 0 & 1 → -0.101353 + 7e-6 = -0.101346
+#   pixel-N centre shifts symmetrically at the other end.
+X_MIN =  -0.101346   # west scan angle  (1km CONUS grid, pixel 0 centre)
+X_MAX =   0.038626   # east scan angle  (1km CONUS grid, pixel 4999 centre)
+Y_MIN =   0.044254   # south elevation angle  (1km CONUS grid, row 2999 centre)
+Y_MAX =   0.128226   # north elevation angle  (1km CONUS grid, row 0 centre)
 
 # ── Output grid — Web Mercator, clipped to GOES CONUS satellite bbox ─────────
 # These constants MUST match iOS SLIDERImageOverlay / sliderCONUS* constants exactly.
