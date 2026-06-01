@@ -369,30 +369,26 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
     else:
         log.warning('blend: sbcape skipped (cape missing)')
 
-    # --- SBCIN: RAP CIN with RTMA thermal nudging -----------------------
-    # CIN is sensitive to BL modifications — a warmer RTMA surface shrinks
-    # the negative area under the LFC (cap erodes), a cooler surface
-    # amplifies it. Apply exponential scaling using the same delta_t used
-    # for SBCAPE. exp(-delta_t/2) gives ~0.37 multiplier at +2K warming
-    # (cap eroded by 63%) and ~2.7 at -2K cooling (cap amplified by 170%).
-    # CIN is negative in GRIB2; multiplier preserves sign correctly.
-    # Clamp multiplier to [0.1, 3.0] to prevent pathological values at
-    # grid edges where delta_t interpolation may produce large anomalies.
-    if cin_i is not None and t2m_rap is not None:
-        # delta_t_clamped already computed above for SBCAPE
-        cin_multiplier = np.clip(np.exp(-delta_t_clamped / 2.0), 0.1, 3.0)
-        out['sbcin'] = (cin_i * cin_multiplier).astype(np.float32)
-        # Clamp to physically realistic CIN range — RAP occasionally produces
-        # large negative CIN artefacts (e.g. -1600 J/kg) in data-sparse regions;
-        # the exponential multiplier can amplify these further. Real CIN never
-        # drops below ~-300 J/kg in any observed sounding.
-        out['sbcin'] = np.clip(out['sbcin'], -300.0, 0.0).astype(np.float32)
-        log.info(f'[sbcin] thermally nudged: min={float(out["sbcin"].min()):.0f} '
-                 f'multiplier range=[{float(cin_multiplier.min()):.2f}, '
-                 f'{float(cin_multiplier.max()):.2f}]')
-    elif cin_i is not None:
-        out['sbcin'] = cin_i
-        log.warning('blend: sbcin has no thermal nudge (t2m_rap missing)')
+    # --- SBCIN: RAP CIN with RTMA linear thermal correction -------------
+    # Linear additive correction: 1K surface warming reduces cap by 40 J/kg,
+    # 1K cooling amplifies it. 40 J/kg/K is the empirical mixed-layer sensitivity.
+    # Uses additive (not multiplicative) approach because CIN is a negative
+    # energy quantity — exponential multipliers on negative numbers produce
+    # unbounded amplification when delta_t is negative (cold air advection).
+    # Clamp to [-600, 0] — physically realistic operational range.
+    if cin_i is not None:
+        if t2m_rap is not None:
+            cin_correction = delta_t_clamped * 40.0
+            out['sbcin'] = np.clip(
+                cin_i + cin_correction, -600.0, 0.0
+            ).astype(np.float32)
+            log.info(f'[sbcin] linear thermal correction: '
+                     f'min={float(out["sbcin"].min()):.0f} '
+                     f'correction range=[{float(cin_correction.min()):.0f}, '
+                     f'{float(cin_correction.max()):.0f}] J/kg')
+        else:
+            out['sbcin'] = np.clip(cin_i, -600.0, 0.0).astype(np.float32)
+            log.warning('blend: sbcin has no thermal correction (t2m_rap missing)')
     else:
         log.warning('blend: sbcin skipped (cin missing)')
 
