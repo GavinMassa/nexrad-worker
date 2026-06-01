@@ -7,7 +7,7 @@ from scipy.ndimage import zoom as ndimage_zoom
 from fetch_rtma import fetch_rtma
 from fetch_rap import fetch_rap
 from fetch_tpw import fetch_latest_tpw
-from mesonet import fetch_mesonet_obs, spatial_thin, compute_correction
+from mesonet import fetch_mesonet_obs, compute_correction
 from blend import blend as do_blend
 from writer import write_output, OUT_DIR
 from terrain_setup import build_terrain, terrain_already_exists
@@ -79,10 +79,24 @@ async def mesonet_worker():
             ]
             log.info(f'[mesonet] {len(stations_domain)}/{len(stations)} in domain')
 
-            # Spatial thinning at 1.5° → ~200-300 stations over CONUS.
-            # 0.45° produced ~3738 stations → distance matrix ~3.5 GB → OOM.
-            # 1.5° → peak matrix ~1.7 GB including numpy intermediates.
-            thinned = spatial_thin(stations_domain, grid_spacing_deg=1.5)
+            # Spatially adaptive thinning:
+            # East of -100° (dense ASOS/AWOS network): 0.75° spacing → ~2x station density
+            # West of -100° (sparse network): 1.5° spacing → same as before
+            # This sharpens moisture/temp gradients near boundaries in the Plains/East
+            # without the memory cost of global densification.
+            occupied = {}
+            thinned = []
+            for st in stations_domain:
+                spacing = 0.75 if st['lon'] > -100.0 else 1.5
+                key = (int(st['lat'] / spacing), int(st['lon'] / spacing), spacing)
+                if key not in occupied:
+                    occupied[key] = True
+                    thinned.append(st)
+
+            east_count = sum(1 for st in thinned if st['lon'] > -100.0)
+            west_count = len(thinned) - east_count
+            log.info(f'[mesonet] thinned {len(stations_domain)} → {len(thinned)} stations '
+                     f'(east={east_count}@0.75°, west={west_count}@1.5°)')
             if len(thinned) < 10:
                 log.warning('[mesonet] too few stations after thinning — skipping')
                 await asyncio.sleep(600)
