@@ -321,6 +321,8 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
     v10_rap  = interp(rap.get('v10'),      'v10_rap')
     u925_i   = interp(rap.get('u925'),     'u925')
     v925_i   = interp(rap.get('v925'),     'v925')
+    u950_i   = interp(rap.get('u950'),     'u950')
+    v950_i   = interp(rap.get('v950'),     'v950')
     ustm_i   = interp(rap.get('ustm'),     'ustm')
     vstm_i   = interp(rap.get('vstm'),     'vstm')
     t2m_rap  = interp(rap.get('t2m_rap'),  't2m_rap')
@@ -370,13 +372,14 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
     # Method:
     #   1. Surface anomaly: RTMA 10m − RAP 10m
     #   2. Exponential decay through BL: V_corr(z) = V_RAP(z) + Δ·exp(−z/z0)
-    #      z0 = 500m; weights: 925mb(750m) ≈ 0.22, 850mb(1500m) ≈ 0.05
-    #   3. 2-layer hodograph integral: surface(RTMA) → 925mb → 850mb
+    #      z0 = 500m; weights: 950mb(~500m) ≈ 0.37, 925mb(~750m) ≈ 0.22,
+    #                          850mb(~1500m) ≈ 0.05
+    #   3. 4-layer hodograph integral: surface(RTMA) → 950mb → 925mb → 850mb
+    #      Falls back to 2-layer (sfc→925→850) if 950mb unavailable.
     #   4. RAP native USTM/VSTM for storm motion (no manual Bunkers)
     #   5. 50/50 blend with RAP native HLCY as backstop
 
-    if (u925_i is not None and v925_i is not None and
-            u850_i is not None and v850_i is not None and
+    if (u850_i is not None and v850_i is not None and
             ustm_i is not None and vstm_i is not None):
 
         z0 = 500.0  # BL scale height (m)
@@ -384,23 +387,55 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
         du_anom = u10 - u10_rap if u10_rap is not None else np.zeros_like(u10)
         dv_anom = v10 - v10_rap if v10_rap is not None else np.zeros_like(v10)
 
-        u925_corr = u925_i + du_anom * np.exp(-750.0  / z0)   # w ≈ 0.22
-        v925_corr = v925_i + dv_anom * np.exp(-750.0  / z0)
         u850_corr = u850_i + du_anom * np.exp(-1500.0 / z0)   # w ≈ 0.05
         v850_corr = v850_i + dv_anom * np.exp(-1500.0 / z0)
 
-        # Layer 1: surface → 925mb (~750m AGL)
-        srh_l1 = ((u10       - ustm_i) * (v925_corr - v10)       -
-                  (v10       - vstm_i) * (u925_corr - u10))
-        # Layer 2: 925mb → 850mb (~750m → 1500m AGL)
-        srh_l2 = ((u925_corr - ustm_i) * (v850_corr - v925_corr) -
-                  (v925_corr - vstm_i) * (u850_corr - u925_corr))
+        if (u950_i is not None and v950_i is not None and
+                u925_i is not None and v925_i is not None):
+            # 4-layer: surface(10m) → 950mb(~500m) → 925mb(~750m) → 850mb(~1500m)
+            u950_corr = u950_i + du_anom * np.exp(-500.0  / z0)   # w ≈ 0.37
+            v950_corr = v950_i + dv_anom * np.exp(-500.0  / z0)
+            u925_corr = u925_i + du_anom * np.exp(-750.0  / z0)   # w ≈ 0.22
+            v925_corr = v925_i + dv_anom * np.exp(-750.0  / z0)
 
-        srh_rtma = np.clip(np.abs(srh_l1 + srh_l2), 0.0, 1200.0).astype(np.float32)
+            # Layer 1: surface(10m) → 950mb (~500m AGL)
+            srh_l1 = ((u10       - ustm_i) * (v950_corr - v10)       -
+                      (v10       - vstm_i) * (u950_corr - u10))
+            # Layer 2: 950mb → 925mb (~500m → 750m AGL)
+            srh_l2 = ((u950_corr - ustm_i) * (v925_corr - v950_corr) -
+                      (v950_corr - vstm_i) * (u925_corr - u950_corr))
+            # Layer 3: 925mb → 850mb (~750m → 1500m AGL)
+            srh_l3 = ((u925_corr - ustm_i) * (v850_corr - v925_corr) -
+                      (v925_corr - vstm_i) * (u850_corr - u925_corr))
+
+            srh_rtma = np.clip(np.abs(srh_l1 + srh_l2 + srh_l3), 0.0, 1200.0).astype(np.float32)
+            log.info(f'[srh1] 4-layer: sfc→950→925→850mb, raw_max={float(srh_rtma.max()):.0f}')
+
+        elif u925_i is not None and v925_i is not None:
+            # 2-layer fallback: surface(10m) → 925mb → 850mb
+            u925_corr = u925_i + du_anom * np.exp(-750.0  / z0)
+            v925_corr = v925_i + dv_anom * np.exp(-750.0  / z0)
+
+            srh_l1 = ((u10       - ustm_i) * (v925_corr - v10)       -
+                      (v10       - vstm_i) * (u925_corr - u10))
+            srh_l2 = ((u925_corr - ustm_i) * (v850_corr - v925_corr) -
+                      (v925_corr - vstm_i) * (u850_corr - u925_corr))
+
+            srh_rtma = np.clip(np.abs(srh_l1 + srh_l2), 0.0, 1200.0).astype(np.float32)
+            log.info(f'[srh1] 2-layer fallback (950mb unavail): sfc→925→850mb, '
+                     f'raw_max={float(srh_rtma.max()):.0f}')
+
+        else:
+            # Minimal 1-layer fallback: surface → 850mb only
+            srh_l1 = ((u10    - ustm_i) * (v850_corr - v10) -
+                      (v10    - vstm_i) * (u850_corr - u10))
+            srh_rtma = np.clip(np.abs(srh_l1), 0.0, 1200.0).astype(np.float32)
+            log.info(f'[srh1] 1-layer fallback (925/950mb unavail): sfc→850mb, '
+                     f'raw_max={float(srh_rtma.max()):.0f}')
 
         if srh1_i is not None:
             out['srh1'] = (0.5 * srh_rtma + 0.5 * srh1_i).astype(np.float32)
-            log.info(f'[srh1] RTMA decay-corrected (50/50 blend): '
+            log.info(f'[srh1] 50/50 blend with RAP native: '
                      f'max={float(out["srh1"].max()):.0f} '
                      f'rtma_max={float(srh_rtma.max()):.0f} '
                      f'rap_max={float(srh1_i.max()):.0f}')
@@ -410,7 +445,7 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
 
     elif srh1_i is not None:
         out['srh1'] = srh1_i
-        log.warning('[srh1] using raw RAP SRH (ustm/vstm or 925/850mb winds missing)')
+        log.warning('[srh1] using raw RAP SRH (ustm/vstm or 850mb winds missing)')
     else:
         log.warning('blend: srh1 skipped (all SRH sources missing)')
 

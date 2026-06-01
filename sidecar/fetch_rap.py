@@ -22,6 +22,7 @@ def rap_main_url(dt: datetime) -> str:
         'lev_700_mb':            'on',
         'lev_850_mb':            'on',
         'lev_925_mb':            'on',
+        'lev_950_mb':            'on',
         'lev_10_m_above_ground': 'on',
         'lev_2_m_above_ground':  'on',
         'dir': f'/rap.{ymd}',
@@ -168,17 +169,39 @@ def _extract_rap(main_path: Path,
     _get(main_path, {'discipline': 0, 'parameterCategory': 7, 'parameterNumber': 7,
                      'typeOfLevel': 'surface'}, 'cin')
 
-    # U/V at 500mb (isobaricInhPa level 500)
-    _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 2,
-                     'typeOfLevel': 'isobaricInhPa', 'level': 500}, 'u500')
-    _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 3,
-                     'typeOfLevel': 'isobaricInhPa', 'level': 500}, 'v500')
+    # ── Isobaric U/V winds — all pressure levels in one cfgrib open ──────────
+    # Filtering once by typeOfLevel+shortName avoids 8 separate file opens and
+    # prevents mismatched u/v if any individual per-level filter fails.
+    # 950mb requires lev_950_mb=on in rap_main_url().
+    _iso_levels = {500: ('u500', 'v500'), 850: ('u850', 'v850'),
+                   925: ('u925', 'v925'), 950: ('u950', 'v950')}
+    for _k in [k for pair in _iso_levels.values() for k in pair]:
+        result[_k] = None   # pre-fill; overwritten per level on success
 
-    # U/V at 850mb (~1500m AGL) — intermediate layer for two-layer BWD6
-    _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 2,
-                     'typeOfLevel': 'isobaricInhPa', 'level': 850}, 'u850')
-    _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 3,
-                     'typeOfLevel': 'isobaricInhPa', 'level': 850}, 'v850')
+    try:
+        _ds_iso = cfgrib.open_dataset(str(main_path), filter_by_keys={
+            'typeOfLevel': 'isobaricInhPa',
+            'shortName':   ['u', 'v'],
+        })
+        try:
+            _lev_dim = 'isobaricInhPa' if 'isobaricInhPa' in _ds_iso.coords else 'level'
+            for _lvl, (_ku, _kv) in _iso_levels.items():
+                try:
+                    _u = _ds_iso['u'].sel({_lev_dim: _lvl}).values.astype(np.float32)
+                    _v = _ds_iso['v'].sel({_lev_dim: _lvl}).values.astype(np.float32)
+                    result[_ku] = _u
+                    result[_kv] = _v
+                    if 'lats_rap' not in result:
+                        result['lats_rap'] = _ds_iso['latitude'].values.astype(np.float32)
+                        result['lons_rap']  = _ds_iso['longitude'].values.astype(np.float32)
+                    log.info(f'  RAP {_ku}: shape={_u.shape} sample={_u.flat[0]:.2f}')
+                    log.info(f'  RAP {_kv}: shape={_v.shape} sample={_v.flat[0]:.2f}')
+                except Exception as _e:
+                    log.warning(f'  RAP {_ku}/{_kv} slice failed: {_e}')
+        finally:
+            _ds_iso.close()
+    except Exception as e:
+        log.warning(f'  RAP isobaric wind open failed — all levels set to None: {e}')
 
     # T at 700mb (~3000m AGL) — for 0-3km and 700-500mb lapse rate
     _get(main_path, {'discipline': 0, 'parameterCategory': 0, 'parameterNumber': 0,
@@ -187,12 +210,6 @@ def _extract_rap(main_path: Path,
     # T at 925mb (~750m AGL) — for low-level lapse rate baseline
     _get(main_path, {'discipline': 0, 'parameterCategory': 0, 'parameterNumber': 0,
                      'typeOfLevel': 'isobaricInhPa', 'level': 925}, 't925')
-
-    # U/V at 925mb (~750m AGL)
-    _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 2,
-                     'typeOfLevel': 'isobaricInhPa', 'level': 925}, 'u925')
-    _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 3,
-                     'typeOfLevel': 'isobaricInhPa', 'level': 925}, 'v925')
 
     # U/V at 10m AGL
     _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 2,
