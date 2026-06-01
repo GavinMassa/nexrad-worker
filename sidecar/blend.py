@@ -319,6 +319,10 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
     v850_i   = interp(rap.get('v850'),     'v850')
     u10_rap  = interp(rap.get('u10'),      'u10_rap')
     v10_rap  = interp(rap.get('v10'),      'v10_rap')
+    u975_i   = interp(rap.get('u975'),     'u975')
+    v975_i   = interp(rap.get('v975'),     'v975')
+    u950_i   = interp(rap.get('u950'),     'u950')
+    v950_i   = interp(rap.get('v950'),     'v950')
     u925_i   = interp(rap.get('u925'),     'u925')
     v925_i   = interp(rap.get('v925'),     'v925')
     ustm_i   = interp(rap.get('ustm'),     'ustm')
@@ -345,29 +349,55 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
 
     out: dict = {}
 
-    # --- SBCAPE: RAP CAPE corrected by RTMA vs RAP surface-T delta -------
-    # RTMA has higher-resolution, assimilated surface T/Td. A 1 K warmer
-    # surface shifts SBCAPE by ~180 J/kg (rule of thumb from operational NWP).
-    # Clamp delta_t to ±2 K to prevent spurious correction from interpolation
-    # artifacts (e.g. RAP extrapolation over Great Lakes → unclamped delta can
-    # reach +15 K → +2700 J/kg phantom CAPE over open water at night).
-    # Also suppress the correction entirely where RAP CAPE is near-zero
-    # (stable/water areas) — no need to shift 0 J/kg by surface-T bias.
+    # --- SBCAPE: θ_e ratio correction (Bolton 1980) -----------------------
+    # Linear delta_T × 180 J/kg/K is physically wrong — CAPE is non-linear.
+    # Near a capping inversion a +1.5K surface warming can break the cap and
+    # jump CAPE from 0 to 2500 J/kg (massive underestimate), while in dry
+    # mid-levels with poor lapse rates it adds little buoyancy (overestimate).
+    #
+    # Better: scale RAP CAPE by (θ_e_RTMA / θ_e_RAP)^2.5, which captures the
+    # dominant moisture contribution to CAPE (mixing ratio weighs 10× more than
+    # temperature in equivalent potential temperature).
+    #
+    # θ_e ≈ T_K × exp(Lv × r / (cp × T_K))   [Bolton 1980 simplified]
+    # r = 0.622 × e_s / (p_sfc − e_s)         [mixing ratio, kg/kg]
+    # e_s(Td) = 6.112 × exp(17.67 × Td_C / (Td_C + 243.5))  [hPa]
     SBCAPE_MIN = 150.0   # J/kg — display gate
-    if cape_i is not None and t2m_rap is not None:
-        delta_t_clamped  = np.clip(t2m - t2m_rap, -2.0, 2.0)
-        sbcape_corrected = np.maximum(0, cape_i + delta_t_clamped * 180.0)
-        cape_mask        = cape_i < 50.0          # stable / water / no CAPE
-        raw_sbcape       = np.where(
+    _Lv = 2.5e6    # J/kg  latent heat of vaporisation
+    _cp = 1004.0   # J/kg/K specific heat of dry air
+    _p0 = 1013.25  # hPa  surface pressure assumption
+
+    if cape_i is not None and t2m_rap is not None and td2m_rap is not None:
+        # RTMA surface mixing ratio (uses TPW-corrected td2m)
+        _td_rtma_c = td2m - 273.15
+        _e_rtma    = 6.112 * np.exp(17.67 * _td_rtma_c / (_td_rtma_c + 243.5))
+        _r_rtma    = 0.622 * _e_rtma / np.maximum(_p0 - _e_rtma, 1.0)
+
+        # RAP surface mixing ratio
+        _td_rap_c = td2m_rap - 273.15
+        _e_rap    = 6.112 * np.exp(17.67 * _td_rap_c / (_td_rap_c + 243.5))
+        _r_rap    = 0.622 * _e_rap / np.maximum(_p0 - _e_rap, 1.0)
+
+        _the_rtma = t2m     * np.exp(_Lv * _r_rtma / (_cp * t2m))
+        _the_rap  = t2m_rap * np.exp(_Lv * _r_rap  / (_cp * t2m_rap))
+
+        # Clamp ratio 0.5–2.0: prevents runaway correction from extrapolation
+        # artifacts (e.g. Great Lakes, coasts where RAP surface Td is unreliable)
+        _ratio    = np.clip(_the_rtma / np.maximum(_the_rap, 1.0), 0.5, 2.0)
+
+        # Suppress correction where RAP CAPE is near-zero (stable/water areas)
+        cape_mask = cape_i < 50.0
+        raw_sbcape = np.where(
             cape_mask,
-            np.maximum(0, cape_i),                # keep raw RAP value (≈ 0)
-            sbcape_corrected,
+            np.maximum(0, cape_i),
+            np.maximum(0, cape_i * _ratio ** 2.5),
         ).astype(np.float32)
         out['sbcape'] = np.where(raw_sbcape >= SBCAPE_MIN, raw_sbcape, 0.0).astype(np.float32)
+        log.info(f'sbcape: θ_e ratio correction, max={float(out["sbcape"].max()):.0f} J/kg')
     elif cape_i is not None:
         raw_sbcape    = np.maximum(0, cape_i).astype(np.float32)
         out['sbcape'] = np.where(raw_sbcape >= SBCAPE_MIN, raw_sbcape, 0.0).astype(np.float32)
-        log.warning('blend: sbcape has no surface-T correction (t2m_rap missing)')
+        log.warning('blend: sbcape uncorrected (t2m_rap or td2m_rap missing)')
     else:
         log.warning('blend: sbcape skipped (cape missing)')
 
@@ -379,103 +409,116 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
 
     # --- 0-1km SRH: exponential-decay RTMA wind correction ---------------
     # Method:
-    #   1. Compute surface wind anomaly: RTMA - RAP at 10m
-    #   2. Apply exponential decay through the boundary layer:
-    #      V_corrected(z) = V_RAP(z) + anomaly * exp(-z / z0)
-    #      where z0 = 500m (typical BL scale height)
-    #   3. Integrate SRH across corrected 3-layer hodograph:
-    #      surface(RTMA) → 925mb corrected → 850mb corrected
-    #   4. Use RAP native USTM/VSTM for storm motion (no manual Bunkers)
-    #   5. Blend 50/50 with RAP native SRH as backstop for data-sparse regions
-    #
-    # Heights AGL for decay weights:
-    #   10m   → exp(-10/500)   ≈ 0.98  (full RTMA correction at surface)
-    #   925mb → exp(-750/500)  ≈ 0.22
-    #   850mb → exp(-1500/500) ≈ 0.05
-    if (u925_i is not None and v925_i is not None and
-            u850_i is not None and v850_i is not None and
-            ustm_i is not None and vstm_i is not None):
+    #   1. Surface anomaly: RTMA 10m − RAP 10m
+    #   2. Exponential decay through BL: V_corr(z) = V_RAP(z) + Δ·exp(−z/z0)
+    #      z0 = 500m; weights at 250m/500m/750m/1500m ≈ 0.61/0.37/0.22/0.05
+    #   3. 4-layer Riemann hodograph integral, capturing the critical 0–500m
+    #      curvature that a 2-layer scheme cuts off entirely:
+    #      surface → 975mb(~250m) → 950mb(~500m) → 925mb(~750m) → 850mb(~1500m)
+    #   4. RAP native USTM/VSTM for storm motion (no manual Bunkers)
+    #   5. 50/50 blend with RAP native HLCY as backstop
 
-        z0 = 500.0  # boundary layer scale height (metres)
+    _have_stm  = ustm_i is not None and vstm_i is not None
+    _have_core = (u925_i is not None and v925_i is not None and
+                  u850_i is not None and v850_i is not None)
+    _have_mid  = (u975_i is not None and v975_i is not None and
+                  u950_i is not None and v950_i is not None)
 
-        # Surface wind anomaly: RTMA minus RAP at 10m
+    if _have_core and _have_stm:
+        z0 = 500.0  # BL scale height (m)
+
         du_anom = u10 - u10_rap if u10_rap is not None else np.zeros_like(u10)
         dv_anom = v10 - v10_rap if v10_rap is not None else np.zeros_like(v10)
 
-        # Exponentially decayed correction at each pressure level
-        w_925 = np.exp(-750.0  / z0)   # ≈ 0.22
-        w_850 = np.exp(-1500.0 / z0)   # ≈ 0.05
+        # Decay weights at each pressure-level height AGL
+        u925_corr = u925_i + du_anom * np.exp(-750.0  / z0)   # w ≈ 0.22
+        v925_corr = v925_i + dv_anom * np.exp(-750.0  / z0)
+        u850_corr = u850_i + du_anom * np.exp(-1500.0 / z0)   # w ≈ 0.05
+        v850_corr = v850_i + dv_anom * np.exp(-1500.0 / z0)
 
-        u925_corr = u925_i + du_anom * w_925
-        v925_corr = v925_i + dv_anom * w_925
-        u850_corr = u850_i + du_anom * w_850
-        v850_corr = v850_i + dv_anom * w_850
+        if _have_mid:
+            # 4-layer integration: resolves critical 0–500m hodograph curvature
+            u975_corr = u975_i + du_anom * np.exp(-250.0 / z0)   # w ≈ 0.61
+            v975_corr = v975_i + dv_anom * np.exp(-250.0 / z0)
+            u950_corr = u950_i + du_anom * np.exp(-500.0 / z0)   # w ≈ 0.37
+            v950_corr = v950_i + dv_anom * np.exp(-500.0 / z0)
 
-        # Three-layer SRH integration using corrected hodograph + RAP storm motion
-        # Layer 1: surface → 925mb (~750m AGL)
-        srh_l1 = ((u10       - ustm_i) * (v925_corr - v10)       -
-                  (v10       - vstm_i) * (u925_corr - u10))
-        # Layer 2: 925mb → 850mb (~750m → 1500m AGL)
-        srh_l2 = ((u925_corr - ustm_i) * (v850_corr - v925_corr) -
-                  (v925_corr - vstm_i) * (u850_corr - u925_corr))
-
-        srh_rtma = np.clip(np.abs(srh_l1 + srh_l2), 0.0, 1200.0).astype(np.float32)
+            srh_l1 = ((u10       - ustm_i) * (v975_corr - v10)       -
+                      (v10       - vstm_i) * (u975_corr - u10))
+            srh_l2 = ((u975_corr - ustm_i) * (v950_corr - v975_corr) -
+                      (v975_corr - vstm_i) * (u950_corr - u975_corr))
+            srh_l3 = ((u950_corr - ustm_i) * (v925_corr - v950_corr) -
+                      (v950_corr - vstm_i) * (u925_corr - u950_corr))
+            srh_l4 = ((u925_corr - ustm_i) * (v850_corr - v925_corr) -
+                      (v925_corr - vstm_i) * (u850_corr - u925_corr))
+            srh_rtma = np.clip(np.abs(srh_l1 + srh_l2 + srh_l3 + srh_l4),
+                               0.0, 1200.0).astype(np.float32)
+            method = '4-layer'
+        else:
+            # 2-layer fallback when 975/950mb unavailable
+            srh_l1 = ((u10       - ustm_i) * (v925_corr - v10)       -
+                      (v10       - vstm_i) * (u925_corr - u10))
+            srh_l2 = ((u925_corr - ustm_i) * (v850_corr - v925_corr) -
+                      (v925_corr - vstm_i) * (u850_corr - u925_corr))
+            srh_rtma = np.clip(np.abs(srh_l1 + srh_l2),
+                               0.0, 1200.0).astype(np.float32)
+            method = '2-layer-fallback'
 
         if srh1_i is not None:
             out['srh1'] = (0.5 * srh_rtma + 0.5 * srh1_i).astype(np.float32)
-            log.info(f'[srh1] RTMA decay-corrected (50/50 blend): '
+            log.info(f'[srh1] RTMA decay-corrected ({method}, 50/50 blend): '
                      f'max={float(out["srh1"].max()):.0f} '
                      f'rtma_max={float(srh_rtma.max()):.0f} '
                      f'rap_max={float(srh1_i.max()):.0f}')
         else:
             out['srh1'] = srh_rtma
-            log.info(f'[srh1] RTMA-only (RAP SRH unavailable): '
-                     f'max={float(srh_rtma.max()):.0f}')
+            log.info(f'[srh1] RTMA-only ({method}): max={float(srh_rtma.max()):.0f}')
 
     elif srh1_i is not None:
         out['srh1'] = srh1_i
-        log.warning('[srh1] using raw RAP SRH '
-                    '(ustm/vstm or 925/850mb winds missing)')
+        log.warning('[srh1] using raw RAP SRH (ustm/vstm or 925/850mb winds missing)')
     else:
         log.warning('blend: srh1 skipped (all SRH sources missing)')
 
-    # --- 0-6km BWD: two-layer approximation using 850mb + 500mb + 10m --------
-    # Layer 1: 10m → 850mb (~1500m AGL) captures low-level hodograph curvature
-    # Layer 2: 850mb → 500mb (~1500m → 5500m AGL) captures mid-level shear
-    # Sum of vector magnitudes approximates total 0-6km BWD, handling the
-    # curvature common in LJ environments and QLCS setups better than a
-    # single 500mb-10m difference.
-    # Falls back to single-layer 500mb-10m if 850mb is missing.
-    # Gate: values below 30 m/s are zeroed — iOS renderer skips 0-value cells,
-    # so only operationally significant shear (≥30 m/s) produces contours.
+    # --- 0-6km BWD: pure bulk vector difference (V500mb − V10m_RTMA) ---------
+    # Breaking into sub-layers and summing magnitudes computes total hodograph
+    # length (path), not bulk shear. A curved hodograph inflates sub-layer sums
+    # far above the true bulk vector, driving the STP shear term to its 1.5 cap
+    # everywhere and making it useless as a discriminator.
+    # Fix: single pure vector difference per Thompson et al. (2003) definition.
     BWD6_MIN = 15.0   # m/s — display gate
     if u500_i is not None and v500_i is not None:
-        if u850_i is not None and v850_i is not None:
-            # Two-layer: |V850-V10| + |V500-V850|
-            layer1 = np.sqrt((u850_i - u10)**2 + (v850_i - v10)**2)
-            layer2 = np.sqrt((u500_i - u850_i)**2 + (v500_i - v850_i)**2)
-            raw = (layer1 + layer2).astype(np.float32)
-            log.info('bwd6: two-layer (10m→850mb→500mb) — surface layer from RTMA 2.5km winds (u10/v10)')
-        else:
-            # Fallback: single-layer 500mb-10m
-            raw = np.sqrt((u500_i - u10)**2 + (v500_i - v10)**2).astype(np.float32)
-            log.warning('bwd6: fallback to single-layer (u850/v850 missing)')
+        raw = np.sqrt((u500_i - u10)**2 + (v500_i - v10)**2).astype(np.float32)
         out['bwd6'] = np.where(raw >= BWD6_MIN, raw, 0.0).astype(np.float32)
-        log.info(f'bwd6: gate={BWD6_MIN}m/s, active={int((raw >= BWD6_MIN).sum())} cells')
+        log.info(f'bwd6: pure vector |V500−V10_RTMA|, '
+                 f'gate={BWD6_MIN}m/s, active={int((raw >= BWD6_MIN).sum())} cells')
     else:
         log.warning('blend: bwd6 skipped (u500/v500 missing)')
 
-    # --- LCL height: Bolton (1980) using RTMA T/Td ----------------------
+    # --- LCL height: log-form approximation using RTMA T/Td ---------------
+    # The classic Espy 125×depression breaks down at small (<2K) or large
+    # (>15K) dewpoint depressions. The denominator form is numerically better:
+    #   LCL = (T_C − Td_C) / (0.0012 + 0.00012 × T_C)
+    # Denominator zeroes at T_C = −10°C; clamp to 1e-4 to avoid division error.
     # Uses TPW-corrected td2m if tpw_data was provided above.
-    lcl = 125.0 * (t2m - td2m)    # meters AGL, float64 intermediate OK
+    _t2m_c  = t2m  - 273.15
+    _td2m_c = td2m - 273.15
+    _lcl_denom = np.maximum(0.0012 + 0.00012 * _t2m_c, 1e-4)
+    lcl = (_t2m_c - _td2m_c) / _lcl_denom   # meters AGL
 
     # --- Fixed-layer STP (Thompson et al. 2003) -------------------------
+    # Shear normalization: 20 m/s (≈38.8 kt) is the correct dimensional value
+    # for the bulk shear term. The previous 10.288 was a knot→m/s conversion
+    # artefact from an older formulation and inflated the shear term ~2×.
     if 'sbcape' in out and 'srh1' in out and 'bwd6' in out:
         cape_term  = out['sbcape'] / 1500.0
-        lcl_term = np.clip((2000.0 - lcl) / 1000.0, 0.0, 1.0).astype(np.float32)
+        lcl_term   = np.clip((2000.0 - lcl) / 1000.0, 0.0, 1.0).astype(np.float32)
         srh_term   = out['srh1'] / 150.0
-        shear_term = np.minimum(1.5, out['bwd6'] / 10.288)
-        out['stp'] = np.maximum(0, cape_term * lcl_term * srh_term * shear_term).astype(np.float32)
+        shear_term = np.minimum(1.5, out['bwd6'] / 20.0)
+        raw_stp    = cape_term * lcl_term * srh_term * shear_term
+        out['stp'] = np.nan_to_num(
+            np.maximum(0, raw_stp), nan=0.0, posinf=0.0, neginf=0.0,
+        ).astype(np.float32)
     else:
         log.warning('blend: stp skipped (sbcape, srh1, or bwd6 missing)')
 

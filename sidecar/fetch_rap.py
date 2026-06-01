@@ -22,6 +22,8 @@ def rap_main_url(dt: datetime) -> str:
         'lev_700_mb':            'on',
         'lev_850_mb':            'on',
         'lev_925_mb':            'on',
+        'lev_950_mb':            'on',
+        'lev_975_mb':            'on',
         'lev_10_m_above_ground': 'on',
         'lev_2_m_above_ground':  'on',
         'dir': f'/rap.{ymd}',
@@ -188,7 +190,19 @@ def _extract_rap(main_path: Path,
     _get(main_path, {'discipline': 0, 'parameterCategory': 0, 'parameterNumber': 0,
                      'typeOfLevel': 'isobaricInhPa', 'level': 925}, 't925')
 
-    # U/V at 925mb (~750m AGL) — used as ~1km AGL proxy for RTMA-corrected SRH
+    # U/V at 975mb (~250m AGL) — SRH integration intermediate level 1
+    _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 2,
+                     'typeOfLevel': 'isobaricInhPa', 'level': 975}, 'u975')
+    _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 3,
+                     'typeOfLevel': 'isobaricInhPa', 'level': 975}, 'v975')
+
+    # U/V at 950mb (~500m AGL) — SRH integration intermediate level 2
+    _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 2,
+                     'typeOfLevel': 'isobaricInhPa', 'level': 950}, 'u950')
+    _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 3,
+                     'typeOfLevel': 'isobaricInhPa', 'level': 950}, 'v950')
+
+    # U/V at 925mb (~750m AGL)
     _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 2,
                      'typeOfLevel': 'isobaricInhPa', 'level': 925}, 'u925')
     _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 3,
