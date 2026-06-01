@@ -61,12 +61,15 @@ CONUS_LAT_MAX = 53.297
 CONUS_LON_MIN = -135.038
 CONUS_LON_MAX = -59.975
 
-# Output pixel dimensions. Width drives everything; height is derived from
-# the bbox aspect ratio so pixels are approximately square at mid-latitudes.
-OUT_WIDTH  = 5000
-OUT_HEIGHT = int(OUT_WIDTH * (CONUS_LAT_MAX - CONUS_LAT_MIN) /
-                             (CONUS_LON_MAX - CONUS_LON_MIN) * 1.35)
-# ≈ 5000 × 3015 — close to source resolution, well under 3 MB at q=85
+# Output pixel dimensions in Web Mercator.
+# Height is derived from the Mercator y-range so that one pixel represents
+# the same Mercator unit in both axes — required for correct tile slicing.
+OUT_WIDTH = 5000
+_MERC_MAX = np.log(np.tan(np.pi / 4 + CONUS_LAT_MAX * np.pi / 180 / 2))
+_MERC_MIN = np.log(np.tan(np.pi / 4 + CONUS_LAT_MIN * np.pi / 180 / 2))
+OUT_HEIGHT = int(OUT_WIDTH * (_MERC_MAX - _MERC_MIN) /
+                 ((CONUS_LON_MAX - CONUS_LON_MIN) * np.pi / 180))
+# ≈ 5000 × 3356 for the CONUS bbox
 
 JPEG_QUALITY = 85
 
@@ -97,10 +100,11 @@ def _build_mercator_to_abi_lut() -> tuple[np.ndarray, np.ndarray]:
 
     lon_rad = (CONUS_LON_MIN + u_out * (CONUS_LON_MAX - CONUS_LON_MIN)) * np.pi / 180
 
-    # Mercator inverse: v=0 → top → lat_max
-    lat_frac = 1.0 - v_out
-    lat_deg  = CONUS_LAT_MIN + lat_frac * (CONUS_LAT_MAX - CONUS_LAT_MIN)
-    lat_rad  = lat_deg * np.pi / 180
+    # Web Mercator inverse: v=0 → north (lat_max), v=1 → south (lat_min)
+    merc_max = np.log(np.tan(np.pi / 4 + CONUS_LAT_MAX * np.pi / 180 / 2))
+    merc_min = np.log(np.tan(np.pi / 4 + CONUS_LAT_MIN * np.pi / 180 / 2))
+    merc_y   = merc_max - v_out * (merc_max - merc_min)  # v=0 → north
+    lat_rad  = 2 * np.arctan(np.exp(merc_y)) - np.pi / 2
 
     # Broadcast to 2D grids
     lat2d = lat_rad[:, np.newaxis]   # (H, 1)
