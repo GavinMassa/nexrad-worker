@@ -35,6 +35,7 @@ const https = require('https');
 const fs    = require('fs');
 const path  = require('path');
 const os    = require('os');
+const zlib  = require('zlib');
 const { spawn } = require('child_process');
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -595,9 +596,9 @@ async function handle(req, res) {
     }
 
     // ── GET /rap/blend/all ───────────────────────────────────────────────────
-    // Proxy to the Python sidecar's /blend/all endpoint with in-process caching.
-    // SIDECAR_URL must be set in the Node service environment variables:
-    //   SIDECAR_URL = http://<internal-hostname>:4000
+    // Proxy to the Python sidecar's /blend/all endpoint with in-process caching
+    // and gzip compression (level 1 — fast, ~4-6× size reduction on float32 grids).
+    // Cache stores compressed bytes so cache hits are a single res.end() call.
     if (p === '/blend/all') {
         if (!SIDECAR_URL) {
             res.writeHead(503, { 'Content-Type': 'application/json' });
@@ -605,29 +606,30 @@ async function handle(req, res) {
             return true;
         }
 
-        // Cache hit — serve immediately without touching the sidecar.
-        // Content-Length is known so iOS gets a clean non-chunked response.
+        // Cache hit — serve compressed bytes immediately, no sidecar round-trip.
         if (blendCache && Date.now() - blendCache.fetchedAt < BLEND_CACHE_TTL) {
             res.writeHead(200, {
                 'Content-Type':                  'application/octet-stream',
+                'Content-Encoding':              'gzip',
+                'Content-Length':                String(blendCache.body.length),
                 'X-Meso-Meta':                   blendCache.meta,
                 'Access-Control-Allow-Origin':   '*',
                 'Access-Control-Expose-Headers': 'X-Meso-Meta',
                 'Cache-Control':                 'no-store',
-                'Content-Length':                String(blendCache.body.length),
             });
             res.end(blendCache.body);
             return true;
         }
 
-        // Cache miss — fetch from sidecar, stream to client, populate cache.
-        // Streaming with getReader() avoids a single large arrayBuffer()
-        // allocation; instead chunks (~64 KB each) are forwarded as they arrive
-        // and simultaneously accumulated to fill the cache for future requests.
+        // Cache miss — fetch from sidecar, buffer, compress, cache, send.
+        // Buffering (rather than streaming) is required to know Content-Length
+        // before headers are written and to feed gzip in one shot.
         try {
+            const t0 = Date.now();
             const upstream = await fetch(`${SIDECAR_URL}/blend/all`, {
                 signal: AbortSignal.timeout(120_000),
             });
+            console.log(`[blend] sidecar fetch headers: ${Date.now() - t0}ms`);
             if (!upstream.ok) {
                 res.writeHead(upstream.status, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: `sidecar returned ${upstream.status}` }));
@@ -635,27 +637,28 @@ async function handle(req, res) {
             }
             const meta = upstream.headers.get('x-meso-meta') || '{}';
 
-            // Write headers before streaming — no Content-Length yet (chunked TE).
+            const rawBuf = Buffer.from(await upstream.arrayBuffer());
+            console.log(`[blend] sidecar buffer read: ${Date.now() - t0}ms  raw=${(rawBuf.length/1024/1024).toFixed(1)}MB`);
+
+            const compressed = await new Promise((resolve, reject) =>
+                zlib.gzip(rawBuf, { level: 1 }, (err, result) => err ? reject(err) : resolve(result))
+            );
+            console.log(`[blend] gzip done: ${Date.now() - t0}ms  compressed=${(compressed.length/1024/1024).toFixed(1)}MB  ratio=${(rawBuf.length/compressed.length).toFixed(1)}x`);
+
+            // Cache compressed bytes — hits pay zero compression cost.
+            blendCache = { body: compressed, meta, fetchedAt: Date.now() };
+
             res.writeHead(200, {
                 'Content-Type':                  'application/octet-stream',
+                'Content-Encoding':              'gzip',
+                'Content-Length':                String(compressed.length),
                 'X-Meso-Meta':                   meta,
                 'Access-Control-Allow-Origin':   '*',
                 'Access-Control-Expose-Headers': 'X-Meso-Meta',
                 'Cache-Control':                 'no-store',
             });
-            const chunks = [];
-            const reader = upstream.body.getReader();
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                chunks.push(Buffer.from(value));
-                res.write(value);
-            }
-            res.end();
-
-            // Assemble and cache the full body for subsequent requests this cycle.
-            blendCache = { body: Buffer.concat(chunks), meta, fetchedAt: Date.now() };
-            console.log(`[rap] blend cache updated: ${blendCache.body.length} bytes`);
+            res.end(compressed);
+            console.log(`[blend] sent: ${Date.now() - t0}ms total`);
         } catch (e) {
             if (!res.headersSent) {
                 res.writeHead(502, { 'Content-Type': 'application/json' });
