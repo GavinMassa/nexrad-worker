@@ -321,6 +321,8 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
     v10_rap  = interp(rap.get('v10'),      'v10_rap')
     u925_i   = interp(rap.get('u925'),     'u925')
     v925_i   = interp(rap.get('v925'),     'v925')
+    ustm_i   = interp(rap.get('ustm'),     'ustm')
+    vstm_i   = interp(rap.get('vstm'),     'vstm')
     t2m_rap  = interp(rap.get('t2m_rap'),  't2m_rap')
     td2m_rap = interp(rap.get('td2m_rap'), 'td2m_rap')
     log.info('Interpolation complete. Deriving blended parameters...')
@@ -375,60 +377,67 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
     else:
         log.warning('blend: sbcin skipped (cin missing)')
 
-    # --- 0-1km SRH: RTMA surface wind + RAP 925mb proxy ----------------
-    # RAP's native SRH uses its own coarse 13km surface winds which miss
-    # boundary-layer wind shifts near drylines, outflow boundaries, and
-    # terrain features. Substituting RTMA 10m winds into the hodograph
-    # gives 2.5km resolution SRH that resolves mesoscale features.
+    # --- 0-1km SRH: exponential-decay RTMA wind correction ---------------
+    # Method:
+    #   1. Compute surface wind anomaly: RTMA - RAP at 10m
+    #   2. Apply exponential decay through the boundary layer:
+    #      V_corrected(z) = V_RAP(z) + anomaly * exp(-z / z0)
+    #      where z0 = 500m (typical BL scale height)
+    #   3. Integrate SRH across corrected 3-layer hodograph:
+    #      surface(RTMA) → 925mb corrected → 850mb corrected
+    #   4. Use RAP native USTM/VSTM for storm motion (no manual Bunkers)
+    #   5. Blend 50/50 with RAP native SRH as backstop for data-sparse regions
     #
-    # Two-layer hodograph: surface (RTMA 10m) → ~1km AGL (RAP 925mb proxy)
-    # Storm motion: Bunkers right-mover approximation using the mean wind
-    # and the 0-1km shear vector.
-    #
-    # Formula: SRH ≈ (V_sfc - C) × (V_1km - V_sfc)
-    #   where C = storm motion (Bunkers right-mover)
-    #   cross product in 2D: (u_sfc - u_c)*(v_1km - v_sfc) - (v_sfc - v_c)*(u_1km - u_sfc)
-    if u925_i is not None and v925_i is not None and u850_i is not None and u500_i is not None:
-        # Deep-layer mean wind for Bunkers (4-layer: 10m, 925mb, 850mb, 500mb)
-        # Guard ensures all four layers are present before computing.
-        u_mean_deep = (u10 + u925_i + u850_i + u500_i) / 4.0
-        v_mean_deep = (v10 + v925_i + v850_i + v500_i) / 4.0
+    # Heights AGL for decay weights:
+    #   10m   → exp(-10/500)   ≈ 0.98  (full RTMA correction at surface)
+    #   925mb → exp(-750/500)  ≈ 0.22
+    #   850mb → exp(-1500/500) ≈ 0.05
+    if (u925_i is not None and v925_i is not None and
+            u850_i is not None and v850_i is not None and
+            ustm_i is not None and vstm_i is not None):
 
-        # 0-6km shear for Bunkers deviation (surface → 500mb)
-        du_shear6 = u500_i - u10
-        dv_shear6 = v500_i - v10
-        shear6_mag = np.sqrt(du_shear6**2 + dv_shear6**2) + 1e-6
+        z0 = 500.0  # boundary layer scale height (metres)
 
-        # Bunkers right-mover: deviate 7.5 m/s to the right of 0-6km shear
-        u_storm = u_mean_deep + 7.5 * dv_shear6 / shear6_mag
-        v_storm = v_mean_deep - 7.5 * du_shear6 / shear6_mag
+        # Surface wind anomaly: RTMA minus RAP at 10m
+        du_anom = u10 - u10_rap if u10_rap is not None else np.zeros_like(u10)
+        dv_anom = v10 - v10_rap if v10_rap is not None else np.zeros_like(v10)
 
-        # 2D SRH from two-layer hodograph (storm-relative)
-        srh_rtma = ((u10 - u_storm) * (v925_i - v10) -
-                    (v10 - v_storm) * (u925_i - u10))
+        # Exponentially decayed correction at each pressure level
+        w_925 = np.exp(-750.0  / z0)   # ≈ 0.22
+        w_850 = np.exp(-1500.0 / z0)   # ≈ 0.05
 
-        # SRH is negative for cyclonic in standard convention; take absolute value
-        # for display (consistent with RAP HLCY which is always positive).
-        # Clamp to physically realistic range.
-        srh_rtma = np.clip(np.abs(srh_rtma), 0.0, 1200.0).astype(np.float32)
+        u925_corr = u925_i + du_anom * w_925
+        v925_corr = v925_i + dv_anom * w_925
+        u850_corr = u850_i + du_anom * w_850
+        v850_corr = v850_i + dv_anom * w_850
 
-        # Blend with RAP SRH: weight RTMA-derived version 0.7, RAP 0.3.
-        # Pure RTMA-only can be noisy in data-sparse regions (mountains, coasts)
-        # where RAP's synoptic-scale SRH is more reliable. The blend retains
-        # RTMA sharpness over the Plains while keeping RAP as a backstop.
+        # Three-layer SRH integration using corrected hodograph + RAP storm motion
+        # Layer 1: surface → 925mb (~750m AGL)
+        srh_l1 = ((u10       - ustm_i) * (v925_corr - v10)       -
+                  (v10       - vstm_i) * (u925_corr - u10))
+        # Layer 2: 925mb → 850mb (~750m → 1500m AGL)
+        srh_l2 = ((u925_corr - ustm_i) * (v850_corr - v925_corr) -
+                  (v925_corr - vstm_i) * (u850_corr - u925_corr))
+
+        srh_rtma = np.clip(np.abs(srh_l1 + srh_l2), 0.0, 1200.0).astype(np.float32)
+
         if srh1_i is not None:
             out['srh1'] = (0.5 * srh_rtma + 0.5 * srh1_i).astype(np.float32)
-            log.info(f'[srh1] RTMA-blended: max={float(out["srh1"].max()):.0f} '
+            log.info(f'[srh1] RTMA decay-corrected (50/50 blend): '
+                     f'max={float(out["srh1"].max()):.0f} '
                      f'rtma_max={float(srh_rtma.max()):.0f} '
                      f'rap_max={float(srh1_i.max()):.0f}')
         else:
             out['srh1'] = srh_rtma
-            log.info(f'[srh1] RTMA-only (RAP SRH unavailable): max={float(srh_rtma.max()):.0f}')
+            log.info(f'[srh1] RTMA-only (RAP SRH unavailable): '
+                     f'max={float(srh_rtma.max()):.0f}')
+
     elif srh1_i is not None:
         out['srh1'] = srh1_i
-        log.warning('[srh1] falling back to raw RAP SRH (u925/v925 missing)')
+        log.warning('[srh1] using raw RAP SRH '
+                    '(ustm/vstm or 925/850mb winds missing)')
     else:
-        log.warning('blend: srh1 skipped (hlcy and u925/v925 both missing)')
+        log.warning('blend: srh1 skipped (all SRH sources missing)')
 
     # --- 0-6km BWD: two-layer approximation using 850mb + 500mb + 10m --------
     # Layer 1: 10m → 850mb (~1500m AGL) captures low-level hodograph curvature
@@ -463,17 +472,7 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
     # --- Fixed-layer STP (Thompson et al. 2003) -------------------------
     if 'sbcape' in out and 'srh1' in out and 'bwd6' in out:
         cape_term  = out['sbcape'] / 1500.0
-        # LCL term: SPC fixed-layer formulation (Thompson et al. 2003/2012).
-        # ≤1000m → 1.0 (capped), 1000–2000m → linear ramp, ≥2000m → 0.0.
-        # Outer condition checks ≥2000m first so the linear branch is
-        # only evaluated in the valid 1000–2000m range.
-        lcl_term = np.where(
-            lcl >= 2000.0, 0.0,
-            np.where(
-                lcl <= 1000.0, 1.0,
-                (2000.0 - lcl) / 1000.0
-            )
-        ).astype(np.float32)
+        lcl_term = np.clip((2000.0 - lcl) / 1000.0, 0.0, 1.0).astype(np.float32)
         srh_term   = out['srh1'] / 150.0
         shear_term = np.minimum(1.5, out['bwd6'] / 10.288)
         out['stp'] = np.maximum(0, cape_term * lcl_term * srh_term * shear_term).astype(np.float32)
