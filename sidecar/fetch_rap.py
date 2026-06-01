@@ -32,15 +32,35 @@ def rap_hlcy_url(dt: datetime) -> str:
     ymd = dt.strftime('%Y%m%d')
     hh  = dt.strftime('%H')
     params = {
-        'file':     f'rap.t{hh}z.awp130pgrbf00.grib2',
-        'var_HLCY': 'on',
-        'var_USTM': 'on',
-        'var_VSTM': 'on',
-        'var_PWAT': 'on',
+        'file':                      f'rap.t{hh}z.awp130pgrbf00.grib2',
+        'var_HLCY':                  'on',
         'lev_3000-0_m_above_ground': 'on',
         'lev_1000-0_m_above_ground': 'on',
+        'dir': f'/rap.{ymd}',
+    }
+    return NOMADS_RAP + '?' + '&'.join(f'{k}={v}' for k, v in params.items())
+
+def rap_stm_url(dt: datetime) -> str:
+    """USTM/VSTM storm motion — fetched separately, optional."""
+    ymd = dt.strftime('%Y%m%d')
+    hh  = dt.strftime('%H')
+    params = {
+        'file':                      f'rap.t{hh}z.awp130pgrbf00.grib2',
+        'var_USTM':                  'on',
+        'var_VSTM':                  'on',
         'lev_6000-0_m_above_ground': 'on',
-        'lev_entire_atmosphere':     'on',
+        'dir': f'/rap.{ymd}',
+    }
+    return NOMADS_RAP + '?' + '&'.join(f'{k}={v}' for k, v in params.items())
+
+def rap_pwat_url(dt: datetime) -> str:
+    """PWAT precipitable water — fetched separately, optional."""
+    ymd = dt.strftime('%Y%m%d')
+    hh  = dt.strftime('%H')
+    params = {
+        'file':     f'rap.t{hh}z.awp130pgrbf00.grib2',
+        'var_PWAT': 'on',
+        'lev_entire_atmosphere_(considered_as_a_single_layer)': 'on',
         'dir': f'/rap.{ymd}',
     }
     return NOMADS_RAP + '?' + '&'.join(f'{k}={v}' for k, v in params.items())
@@ -63,9 +83,11 @@ async def _download(url: str, dest: Path, client: httpx.AsyncClient) -> bool:
 
 async def fetch_rap(cycle_dt: datetime) -> dict | None:
     """
-    Fetch RAP main + HLCY files for cycle_dt (try up to 4 hours back).
+    Fetch RAP main + HLCY + optional STM/PWAT files for cycle_dt
+    (tries up to 4 hours back). STM and PWAT are optional — a 500 from
+    NOMADS on those URLs does not abort the cycle.
     Returns dict with keys: cape, cin, srh1, u500, v500, u10, v10,
-    t2m_rap, td2m_rap, lats_rap, lons_rap
+    t2m_rap, td2m_rap, lats_rap, lons_rap, [ustm, vstm, pwat]
     All arrays float32, shape (337, 451) — RAP native grid, row-major.
     Returns None if no run available.
     """
@@ -75,33 +97,49 @@ async def fetch_rap(cycle_dt: datetime) -> dict | None:
             stamp     = dt.strftime('%Y%m%d_%H')
             main_dest = TMP_DIR / f'rap_main_{stamp}.grib2'
             hlcy_dest = TMP_DIR / f'rap_hlcy_{stamp}.grib2'
+            stm_dest  = TMP_DIR / f'rap_stm_{stamp}.grib2'
+            pwat_dest = TMP_DIR / f'rap_pwat_{stamp}.grib2'
 
-            ok_main, ok_hlcy = await asyncio.gather(
-                _download(rap_main_url(dt), main_dest, client),
-                _download(rap_hlcy_url(dt), hlcy_dest, client),
+            ok_main, ok_hlcy, ok_stm, ok_pwat = await asyncio.gather(
+                _download(rap_main_url(dt),  main_dest, client),
+                _download(rap_hlcy_url(dt),  hlcy_dest, client),
+                _download(rap_stm_url(dt),   stm_dest,  client),
+                _download(rap_pwat_url(dt),  pwat_dest, client),
             )
             if not ok_main:
                 log.warning(f'RAP main not available for {dt.strftime("%H")}Z')
-                for p in (main_dest, hlcy_dest):
+                for p in (main_dest, hlcy_dest, stm_dest, pwat_dest):
                     p.unlink(missing_ok=True)
                 continue
 
-            log.info(f'RAP downloaded for {dt.strftime("%H")}Z: '
-                     f'main={main_dest.stat().st_size/1e6:.1f}MB '
-                     f'hlcy={hlcy_dest.stat().st_size/1e6:.1f}MB')
+            log.info(
+                f'RAP downloaded for {dt.strftime("%H")}Z: '
+                f'main={main_dest.stat().st_size/1e6:.1f}MB '
+                f'hlcy={"%.1fMB" % (hlcy_dest.stat().st_size/1e6) if ok_hlcy else "N/A"} '
+                f'stm={"ok" if ok_stm else "N/A"} '
+                f'pwat={"ok" if ok_pwat else "N/A"}'
+            )
             try:
-                result = _extract_rap(main_dest, hlcy_dest)
+                result = _extract_rap(
+                    main_dest,
+                    hlcy_dest if ok_hlcy else None,
+                    stm_dest  if ok_stm  else None,
+                    pwat_dest if ok_pwat else None,
+                )
                 return result
             except Exception as e:
                 log.error(f'RAP extraction failed: {e}', exc_info=True)
                 return None
             finally:
-                main_dest.unlink(missing_ok=True)
-                hlcy_dest.unlink(missing_ok=True)
+                for p in (main_dest, hlcy_dest, stm_dest, pwat_dest):
+                    p.unlink(missing_ok=True)
 
     return None
 
-def _extract_rap(main_path: Path, hlcy_path: Path) -> dict:
+def _extract_rap(main_path: Path,
+                 hlcy_path: Path | None,
+                 stm_path:  Path | None = None,
+                 pwat_path: Path | None = None) -> dict:
     """Extract all needed fields from RAP GRIB2 files using cfgrib."""
     result = {}
 
@@ -121,6 +159,8 @@ def _extract_rap(main_path: Path, hlcy_path: Path) -> dict:
         except Exception as e:
             log.warning(f'  RAP {key} extraction failed: {e}')
             result[key] = None
+
+    # ── Main file ─────────────────────────────────────────────────────────────
 
     # CAPE and CIN at surface (awp130p stores these at typeOfLevel=surface)
     _get(main_path, {'discipline': 0, 'parameterCategory': 7, 'parameterNumber': 6,
@@ -154,19 +194,6 @@ def _extract_rap(main_path: Path, hlcy_path: Path) -> dict:
     _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 3,
                      'typeOfLevel': 'isobaricInhPa', 'level': 925}, 'v925')
 
-    # USTM/VSTM: RAP native Bunkers storm motion (0-6000m above ground layer)
-    # Confirmed at records 240.1/240.2 in awp130pgrbf00 inventory.
-    # typeOfLevel='heightAboveGroundLayer' covers the 0–6000m layer.
-    _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 27,
-                     'typeOfLevel': 'heightAboveGroundLayer'}, 'ustm')
-    _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 28,
-                     'typeOfLevel': 'heightAboveGroundLayer'}, 'vstm')
-
-    # PWAT: real precipitable water (entire atmosphere column, kg/m²)
-    # Replaces the Bolton Td approximation when available.
-    _get(main_path, {'discipline': 0, 'parameterCategory': 1, 'parameterNumber': 3,
-                     'typeOfLevel': 'atmosphereSingleLayer'}, 'pwat_real')
-
     # U/V at 10m AGL
     _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 2,
                      'typeOfLevel': 'heightAboveGround', 'level': 10}, 'u10')
@@ -178,6 +205,8 @@ def _extract_rap(main_path: Path, hlcy_path: Path) -> dict:
                      'typeOfLevel': 'heightAboveGround', 'level': 2}, 't2m_rap')
     _get(main_path, {'discipline': 0, 'parameterCategory': 0, 'parameterNumber': 6,
                      'typeOfLevel': 'heightAboveGround', 'level': 2}, 'td2m_rap')
+
+    # ── Derived fields ────────────────────────────────────────────────────────
 
     # td700: derive from t700 + surface Td depression scaling
     # 700mb dewpoint not available in filtered awp130p — approximate from
@@ -192,25 +221,11 @@ def _extract_rap(main_path: Path, hlcy_path: Path) -> dict:
         result['td700'] = None
         log.warning('  RAP td700: skipped (t700 or surface T/Td missing)')
 
-    # pwat: use real GRIB2 field when available; fall back to Bolton approximation.
-    if result.get('pwat_real') is not None:
-        result['pwat'] = result.pop('pwat_real')
-        log.info(f"  RAP pwat: real GRIB2 field, "
-                 f"sample={result['pwat'].flat[0]:.2f}kg/m^2")
-    elif result.get('td2m_rap') is not None:
-        td_c = result['td2m_rap'] - 273.15
-        e_s = 6.112 * np.exp(17.67 * td_c / (td_c + 243.5))
-        result['pwat'] = (2.0 * e_s).astype(np.float32)
-        log.info(f"  RAP pwat: derived from surface Td (PWAT field unavailable), "
-                 f"sample={result['pwat'].flat[0]:.2f}mm")
-    else:
-        result['pwat'] = None
-        log.warning('  RAP pwat: skipped (td2m_rap missing)')
-
-    # HLCY: try all datasets, pick the first 337×451 array (0-1km layer).
+    # ── HLCY file ─────────────────────────────────────────────────────────────
+    # Try all datasets, pick the first 337×451 array (0-1km layer).
     # Use a finally block to guarantee ALL dataset handles are closed even if
     # an exception occurs mid-loop or before ds.close() is reached.
-    if hlcy_path.exists() and hlcy_path.stat().st_size > 1000:
+    if hlcy_path is not None and hlcy_path.exists() and hlcy_path.stat().st_size > 1000:
         try:
             datasets = cfgrib.open_datasets(str(hlcy_path))
             log.info(f'  RAP HLCY datasets: {len(datasets)}')
@@ -251,15 +266,44 @@ def _extract_rap(main_path: Path, hlcy_path: Path) -> dict:
         log.warning('RAP HLCY file missing or too small')
         result['srh1'] = None
 
-    # USTM/VSTM fallback: if main file extraction failed, try the HLCY file.
-    # These fields co-locate with HLCY (records 238-241) in the RAP inventory.
-    if result.get('ustm') is None and hlcy_path.exists() and hlcy_path.stat().st_size > 1000:
-        _get(hlcy_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 27,
-                         'typeOfLevel': 'heightAboveGroundLayer'}, 'ustm')
-    if result.get('vstm') is None and hlcy_path.exists() and hlcy_path.stat().st_size > 1000:
-        _get(hlcy_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 28,
-                         'typeOfLevel': 'heightAboveGroundLayer'}, 'vstm')
+    # ── STM file (optional) — USTM/VSTM storm motion ─────────────────────────
+    if stm_path is not None and stm_path.exists() and stm_path.stat().st_size > 1000:
+        _get(stm_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 27,
+                        'typeOfLevel': 'heightAboveGroundLayer'}, 'ustm')
+        _get(stm_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 28,
+                        'typeOfLevel': 'heightAboveGroundLayer'}, 'vstm')
+    else:
+        result['ustm'] = None
+        result['vstm'] = None
+        if stm_path is not None:
+            log.warning('RAP STM file missing or too small — ustm/vstm unavailable')
 
+    # ── PWAT file (optional) — precipitable water ─────────────────────────────
+    # Use real GRIB2 field when available; fall back to Bolton approximation.
+    pwat_loaded = False
+    if pwat_path is not None and pwat_path.exists() and pwat_path.stat().st_size > 1000:
+        _get(pwat_path, {'discipline': 0, 'parameterCategory': 1, 'parameterNumber': 3,
+                         'typeOfLevel': 'atmosphereSingleLayer'}, 'pwat_real')
+        if result.get('pwat_real') is not None:
+            result['pwat'] = result.pop('pwat_real')
+            log.info(f"  RAP pwat: real GRIB2 field, "
+                     f"sample={result['pwat'].flat[0]:.2f}kg/m^2")
+            pwat_loaded = True
+        else:
+            log.warning('RAP PWAT file present but extraction failed — falling back to Bolton')
+
+    if not pwat_loaded:
+        if result.get('td2m_rap') is not None:
+            td_c = result['td2m_rap'] - 273.15
+            e_s = 6.112 * np.exp(17.67 * td_c / (td_c + 243.5))
+            result['pwat'] = (2.0 * e_s).astype(np.float32)
+            log.info(f"  RAP pwat: derived from surface Td (PWAT field unavailable), "
+                     f"sample={result['pwat'].flat[0]:.2f}mm")
+        else:
+            result['pwat'] = None
+            log.warning('  RAP pwat: skipped (td2m_rap missing)')
+
+    # ── Summary ───────────────────────────────────────────────────────────────
     extracted = [k for k, v in result.items()
                  if k not in ('lats_rap', 'lons_rap') and v is not None]
     log.info(f'RAP extraction done: {extracted}')
