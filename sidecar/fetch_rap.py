@@ -17,6 +17,8 @@ def rap_main_url(dt: datetime) -> str:
         'var_CAPE': 'on', 'var_CIN': 'on',
         'var_UGRD': 'on', 'var_VGRD': 'on',
         'var_TMP':  'on', 'var_DPT':  'on',
+        'var_USTM': 'on', 'var_VSTM': 'on',
+        'var_PWAT': 'on',
         'lev_surface':           'on',
         'lev_500_mb':            'on',
         'lev_700_mb':            'on',
@@ -24,6 +26,8 @@ def rap_main_url(dt: datetime) -> str:
         'lev_925_mb':            'on',
         'lev_10_m_above_ground': 'on',
         'lev_2_m_above_ground':  'on',
+        'lev_6000-0_m_above_ground': 'on',
+        'lev_entire_atmosphere_(considered_as_a_single_layer)': 'on',
         'dir': f'/rap.{ymd}',
     }
     return NOMADS_RAP + '?' + '&'.join(f'{k}={v}' for k, v in params.items())
@@ -34,6 +38,8 @@ def rap_hlcy_url(dt: datetime) -> str:
     params = {
         'file':     f'rap.t{hh}z.awp130pgrbf00.grib2',
         'var_HLCY': 'on',
+        'var_USTM': 'on', 'var_VSTM': 'on',
+        'lev_6000-0_m_above_ground': 'on',
         'dir': f'/rap.{ymd}',
     }
     return NOMADS_RAP + '?' + '&'.join(f'{k}={v}' for k, v in params.items())
@@ -147,6 +153,19 @@ def _extract_rap(main_path: Path, hlcy_path: Path) -> dict:
     _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 3,
                      'typeOfLevel': 'isobaricInhPa', 'level': 925}, 'v925')
 
+    # USTM/VSTM: RAP native Bunkers storm motion (0-6000m above ground layer)
+    # Confirmed at records 240.1/240.2 in awp130pgrbf00 inventory.
+    # typeOfLevel='heightAboveGroundLayer' covers the 0–6000m layer.
+    _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 27,
+                     'typeOfLevel': 'heightAboveGroundLayer'}, 'ustm')
+    _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 28,
+                     'typeOfLevel': 'heightAboveGroundLayer'}, 'vstm')
+
+    # PWAT: real precipitable water (entire atmosphere column, kg/m²)
+    # Replaces the Bolton Td approximation when available.
+    _get(main_path, {'discipline': 0, 'parameterCategory': 1, 'parameterNumber': 3,
+                     'typeOfLevel': 'atmosphereSingleLayer'}, 'pwat_real')
+
     # U/V at 10m AGL
     _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 2,
                      'typeOfLevel': 'heightAboveGround', 'level': 10}, 'u10')
@@ -172,14 +191,16 @@ def _extract_rap(main_path: Path, hlcy_path: Path) -> dict:
         result['td700'] = None
         log.warning('  RAP td700: skipped (t700 or surface T/Td missing)')
 
-    # pwat: derive from surface Td using Bolton approximation
-    # PWAT not filterable from awp130p — estimate from surface mixing ratio.
-    # Accuracy ±25%, adequate for BACI moisture threshold (10-25mm range).
-    if result.get('td2m_rap') is not None:
+    # pwat: use real GRIB2 field when available; fall back to Bolton approximation.
+    if result.get('pwat_real') is not None:
+        result['pwat'] = result.pop('pwat_real')
+        log.info(f"  RAP pwat: real GRIB2 field, "
+                 f"sample={result['pwat'].flat[0]:.2f}kg/m^2")
+    elif result.get('td2m_rap') is not None:
         td_c = result['td2m_rap'] - 273.15
         e_s = 6.112 * np.exp(17.67 * td_c / (td_c + 243.5))
         result['pwat'] = (2.0 * e_s).astype(np.float32)
-        log.info(f"  RAP pwat: derived from surface Td, "
+        log.info(f"  RAP pwat: derived from surface Td (PWAT field unavailable), "
                  f"sample={result['pwat'].flat[0]:.2f}mm")
     else:
         result['pwat'] = None
@@ -228,6 +249,15 @@ def _extract_rap(main_path: Path, hlcy_path: Path) -> dict:
     else:
         log.warning('RAP HLCY file missing or too small')
         result['srh1'] = None
+
+    # USTM/VSTM fallback: if main file extraction failed, try the HLCY file.
+    # These fields co-locate with HLCY (records 238-241) in the RAP inventory.
+    if result.get('ustm') is None and hlcy_path.exists() and hlcy_path.stat().st_size > 1000:
+        _get(hlcy_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 27,
+                         'typeOfLevel': 'heightAboveGroundLayer'}, 'ustm')
+    if result.get('vstm') is None and hlcy_path.exists() and hlcy_path.stat().st_size > 1000:
+        _get(hlcy_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 28,
+                         'typeOfLevel': 'heightAboveGroundLayer'}, 'vstm')
 
     extracted = [k for k, v in result.items()
                  if k not in ('lats_rap', 'lons_rap') and v is not None]
