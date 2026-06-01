@@ -48,7 +48,7 @@ def rap_stm_url(dt: datetime) -> str:
         'file':                      f'rap.t{hh}z.awp130pgrbf00.grib2',
         'var_USTM':                  'on',
         'var_VSTM':                  'on',
-        'lev_6000-0_m_above_ground': 'on',
+        'lev_0-6000_m_above_ground': 'on',
         'dir': f'/rap.{ymd}',
     }
     return NOMADS_RAP + '?' + '&'.join(f'{k}={v}' for k, v in params.items())
