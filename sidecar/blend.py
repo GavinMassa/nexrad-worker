@@ -347,10 +347,16 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
 
     out: dict = {}
 
+    # Shared surface-T delta — used by both SBCAPE and SBCIN corrections.
+    # Computed here so both blocks can reference it without duplication.
+    if t2m_rap is not None:
+        delta_t_clamped = np.clip(t2m - t2m_rap, -2.0, 2.0)
+    else:
+        delta_t_clamped = np.zeros_like(t2m)
+
     # --- SBCAPE: RAP CAPE corrected by RTMA vs RAP surface-T delta -------
     SBCAPE_MIN = 150.0   # J/kg — display gate
     if cape_i is not None and t2m_rap is not None:
-        delta_t_clamped  = np.clip(t2m - t2m_rap, -2.0, 2.0)
         sbcape_corrected = np.maximum(0, cape_i + delta_t_clamped * 180.0)
         cape_mask        = cape_i < 50.0
         raw_sbcape       = np.where(cape_mask, np.maximum(0, cape_i), sbcape_corrected).astype(np.float32)
@@ -362,18 +368,47 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
     else:
         log.warning('blend: sbcape skipped (cape missing)')
 
-    # --- SBCIN: interpolated RAP CIN ------------------------------------
-    if cin_i is not None:
+    # --- SBCIN: RAP CIN with RTMA thermal nudging -----------------------
+    # CIN is sensitive to BL modifications — a warmer RTMA surface shrinks
+    # the negative area under the LFC (cap erodes), a cooler surface
+    # amplifies it. Apply exponential scaling using the same delta_t used
+    # for SBCAPE. exp(-delta_t/2) gives ~0.37 multiplier at +2K warming
+    # (cap eroded by 63%) and ~2.7 at -2K cooling (cap amplified by 170%).
+    # CIN is negative in GRIB2; multiplier preserves sign correctly.
+    # Clamp multiplier to [0.1, 3.0] to prevent pathological values at
+    # grid edges where delta_t interpolation may produce large anomalies.
+    if cin_i is not None and t2m_rap is not None:
+        # delta_t_clamped already computed above for SBCAPE
+        cin_multiplier = np.clip(np.exp(-delta_t_clamped / 2.0), 0.1, 3.0)
+        out['sbcin'] = (cin_i * cin_multiplier).astype(np.float32)
+        log.info(f'[sbcin] thermally nudged: min={float(out["sbcin"].min()):.0f} '
+                 f'multiplier range=[{float(cin_multiplier.min()):.2f}, '
+                 f'{float(cin_multiplier.max()):.2f}]')
+    elif cin_i is not None:
         out['sbcin'] = cin_i
+        log.warning('blend: sbcin has no thermal nudge (t2m_rap missing)')
     else:
         log.warning('blend: sbcin skipped (cin missing)')
+
+    # --- LCL height: log-form approximation using RTMA T/Td ---------------
+    # Computed here (before SRH) so z0 can use LCL as the mixed-layer
+    # depth proxy, and so STP can reference lcl without recomputing.
+    # The classic Espy 125×depression breaks down at small (<2K) or large
+    # (>15K) dewpoint depressions. The denominator form is numerically better:
+    #   LCL = (T_C − Td_C) / (0.0012 + 0.00012 × T_C)
+    # Denominator zeroes at T_C = −10°C; clamp to 1e-4 to avoid division error.
+    # Uses TPW-corrected td2m if tpw_data was provided above.
+    _t2m_c  = t2m  - 273.15
+    _td2m_c = td2m - 273.15
+    _lcl_denom = np.maximum(0.0012 + 0.00012 * _t2m_c, 1e-4)
+    lcl = (_t2m_c - _td2m_c) / _lcl_denom   # meters AGL
 
     # --- 0-1km SRH: exponential-decay RTMA wind correction ---------------
     # Method:
     #   1. Surface anomaly: RTMA 10m − RAP 10m
     #   2. Exponential decay through BL: V_corr(z) = V_RAP(z) + Δ·exp(−z/z0)
-    #      z0 = 500m; weights: 950mb(~500m) ≈ 0.37, 925mb(~750m) ≈ 0.22,
-    #                          850mb(~1500m) ≈ 0.05
+    #      z0 = clip(LCL, 400, 1200m) — deeper mixed layers allow the surface
+    #      anomaly to propagate higher; weights vary spatially with LCL.
     #   3. 4-layer hodograph integral: surface(RTMA) → 950mb → 925mb → 850mb
     #      Falls back to 2-layer (sfc→925→850) if 950mb unavailable.
     #   4. RAP native USTM/VSTM for storm motion (no manual Bunkers)
@@ -382,7 +417,11 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
     if (u850_i is not None and v850_i is not None and
             ustm_i is not None and vstm_i is not None):
 
-        z0 = 500.0  # BL scale height (m)
+        # Dynamic BL scale height: use LCL as proxy for mixed layer depth.
+        # Deep mixed layers (High Plains summer) → larger z0 → anomaly
+        # propagates higher. Shallow marine layers → smaller z0 → anomaly
+        # stays near surface. Clamp to physically realistic range [400, 1200m].
+        z0 = np.clip(lcl, 400.0, 1200.0)
 
         du_anom = u10 - u10_rap if u10_rap is not None else np.zeros_like(u10)
         dv_anom = v10 - v10_rap if v10_rap is not None else np.zeros_like(v10)
@@ -464,32 +503,57 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
     else:
         log.warning('blend: bwd6 skipped (u500/v500 missing)')
 
-    # --- LCL height: log-form approximation using RTMA T/Td ---------------
-    # The classic Espy 125×depression breaks down at small (<2K) or large
-    # (>15K) dewpoint depressions. The denominator form is numerically better:
-    #   LCL = (T_C − Td_C) / (0.0012 + 0.00012 × T_C)
-    # Denominator zeroes at T_C = −10°C; clamp to 1e-4 to avoid division error.
-    # Uses TPW-corrected td2m if tpw_data was provided above.
-    _t2m_c  = t2m  - 273.15
-    _td2m_c = td2m - 273.15
-    _lcl_denom = np.maximum(0.0012 + 0.00012 * _t2m_c, 1e-4)
-    lcl = (_t2m_c - _td2m_c) / _lcl_denom   # meters AGL
-
-    # --- Fixed-layer STP (Thompson et al. 2003) -------------------------
-    # Shear normalization: 20 m/s (≈38.8 kt) is the correct dimensional value
-    # for the bulk shear term. The previous 10.288 was a knot→m/s conversion
-    # artefact from an older formulation and inflated the shear term ~2×.
+    # --- CIN-gated STP (Thompson et al. 2003 + 2012 CIN gate) -----------
+    # CIN gate smoothly suppresses STP in heavily capped environments:
+    #   SBCIN >= -50 J/kg  → gate = 1.0 (no suppression, cap easily broken)
+    #   SBCIN <= -200 J/kg → gate = 0.0 (full suppression, cap unbreakable)
+    #   Between -50 and -200 → linear ramp
+    # Uses thermally-nudged SBCIN so the gate responds to real-time surface
+    # modifications, not just the coarse RAP cap estimate.
     if 'sbcape' in out and 'srh1' in out and 'bwd6' in out:
         cape_term  = out['sbcape'] / 1500.0
         lcl_term   = np.clip((2000.0 - lcl) / 1000.0, 0.0, 1.0).astype(np.float32)
         srh_term   = out['srh1'] / 150.0
         shear_term = np.minimum(1.5, out['bwd6'] / 20.0)
-        raw_stp    = cape_term * lcl_term * srh_term * shear_term
+
+        # CIN gate term
+        if 'sbcin' in out:
+            cin_gate = np.where(
+                out['sbcin'] >= -50.0,  1.0,
+                np.where(
+                    out['sbcin'] <= -200.0, 0.0,
+                    (200.0 + out['sbcin']) / 150.0
+                )
+            ).astype(np.float32)
+        else:
+            cin_gate = np.ones_like(cape_term)
+
+        raw_stp = cape_term * cin_gate * lcl_term * srh_term * shear_term
         out['stp'] = np.nan_to_num(
             np.maximum(0, raw_stp), nan=0.0, posinf=0.0, neginf=0.0,
         ).astype(np.float32)
+        log.info(f'[stp] max={float(out["stp"].max()):.2f} '
+                 f'cin_gate_min={float(cin_gate.min()):.2f}')
     else:
         log.warning('blend: stp skipped (sbcape, srh1, or bwd6 missing)')
+
+    # --- Supercell Composite Parameter (SCP) ----------------------------
+    # SCP = (SBCAPE/1000) * (SRH1/50) * (BWD6/20)
+    # Gate: BWD6 < 10 m/s → SCP = 0 (no kinematic organization)
+    # Gate: SBCAPE < 100 J/kg → SCP = 0 (no thermodynamic support)
+    # Normalizations per SPC operational SCP documentation.
+    # SCP highlights where rotating storms are favored BEFORE tornado
+    # potential — complements STP which focuses on tornado environments.
+    if 'sbcape' in out and 'srh1' in out and 'bwd6' in out:
+        scp_raw = (out['sbcape'] / 1000.0) * (out['srh1'] / 50.0) * (out['bwd6'] / 20.0)
+        scp_raw = np.where(out['bwd6']   <  10.0, 0.0, scp_raw)
+        scp_raw = np.where(out['sbcape'] < 100.0, 0.0, scp_raw)
+        out['scp'] = np.nan_to_num(
+            np.maximum(0, scp_raw), nan=0.0, posinf=0.0, neginf=0.0,
+        ).astype(np.float32)
+        log.info(f'[scp] max={float(out["scp"].max()):.2f}')
+    else:
+        log.warning('blend: scp skipped (sbcape, srh1, or bwd6 missing)')
 
     # --- Surface relative vorticity: dv/dx - du/dy (s⁻¹) ----------------
     # Cyclonic (counterclockwise) vorticity is positive in the N. hemisphere.
