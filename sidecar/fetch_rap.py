@@ -17,8 +17,6 @@ def rap_main_url(dt: datetime) -> str:
         'var_CAPE': 'on', 'var_CIN': 'on',
         'var_UGRD': 'on', 'var_VGRD': 'on',
         'var_TMP':  'on', 'var_DPT':  'on',
-        'var_USTM': 'on', 'var_VSTM': 'on',
-        'var_PWAT': 'on',
         'lev_surface':           'on',
         'lev_500_mb':            'on',
         'lev_700_mb':            'on',
@@ -26,8 +24,6 @@ def rap_main_url(dt: datetime) -> str:
         'lev_925_mb':            'on',
         'lev_10_m_above_ground': 'on',
         'lev_2_m_above_ground':  'on',
-        'lev_6000-0_m_above_ground': 'on',
-        'lev_entire_atmosphere_(considered_as_a_single_layer)': 'on',
         'dir': f'/rap.{ymd}',
     }
     return NOMADS_RAP + '?' + '&'.join(f'{k}={v}' for k, v in params.items())
@@ -38,8 +34,13 @@ def rap_hlcy_url(dt: datetime) -> str:
     params = {
         'file':     f'rap.t{hh}z.awp130pgrbf00.grib2',
         'var_HLCY': 'on',
-        'var_USTM': 'on', 'var_VSTM': 'on',
+        'var_USTM': 'on',
+        'var_VSTM': 'on',
+        'var_PWAT': 'on',
+        'lev_3000-0_m_above_ground': 'on',
+        'lev_1000-0_m_above_ground': 'on',
         'lev_6000-0_m_above_ground': 'on',
+        'lev_entire_atmosphere':     'on',
         'dir': f'/rap.{ymd}',
     }
     return NOMADS_RAP + '?' + '&'.join(f'{k}={v}' for k, v in params.items())
