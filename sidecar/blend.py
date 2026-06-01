@@ -555,17 +555,38 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
     else:
         log.warning('blend: scp skipped (sbcape, srh1, or bwd6 missing)')
 
-    # --- Surface relative vorticity: dv/dx - du/dy (s⁻¹) ----------------
-    # Cyclonic (counterclockwise) vorticity is positive in the N. hemisphere.
-    dvdx = np.gradient(v10, axis=1) / RTMA_DX
-    dudy = np.gradient(u10, axis=0) / RTMA_DY
-    out['vort'] = (dvdx - dudy).astype(np.float32)
+    # --- Surface relative vorticity and convergence ----------------------
+    # Smooth RTMA winds before differencing to suppress sub-mesoscale
+    # observation noise from individual stations (buildings, trees, gusts).
+    # sigma=1.5 at 2.5km spacing → ~4km effective smoothing — preserves
+    # mesoscale features (fronts, outflows) while removing station noise.
+    from scipy.ndimage import gaussian_filter
+    u10_smooth = gaussian_filter(u10.astype(np.float64), sigma=1.5).astype(np.float32)
+    v10_smooth = gaussian_filter(v10.astype(np.float64), sigma=1.5).astype(np.float32)
 
-    # --- Surface convergence: -(du/dx + dv/dy) ---------------------------
-    # Positive = convergent (inflow).
-    dudx = np.gradient(u10, axis=1) / RTMA_DX
-    dvdy = np.gradient(v10, axis=0) / RTMA_DY
-    out['conv'] = (-(dudx + dvdy)).astype(np.float32)
+    # numpy.gradient on 2D array returns [d/dy, d/dx] for axis 0 and 1.
+    du_dy = np.gradient(u10_smooth, RTMA_DY, axis=0)
+    du_dx = np.gradient(u10_smooth, RTMA_DX, axis=1)
+    dv_dy = np.gradient(v10_smooth, RTMA_DY, axis=0)
+    dv_dx = np.gradient(v10_smooth, RTMA_DX, axis=1)
+
+    # Scale to 10^-5 s^-1 (standard operational vorticity units).
+    # Raw values at 2.5km grid are ~1e-4 s^-1 for strong fronts;
+    # multiplying by 1e5 brings them to ~10 in display units.
+    VORT_SCALE = 1e5
+
+    # Cyclonic vorticity (positive = counterclockwise in N. hemisphere)
+    vort_raw = (dv_dx - du_dy) * VORT_SCALE
+    out['vort'] = np.where(vort_raw >= 2.0, vort_raw, 0.0).astype(np.float32)
+
+    # Convergence: positive = inflow
+    conv_raw = (-(du_dx + dv_dy)) * VORT_SCALE
+    out['conv'] = np.where(conv_raw >= 2.0, conv_raw, 0.0).astype(np.float32)
+
+    log.info(f'vort: max={float(out["vort"].max()):.1f}×10⁻⁵ s⁻¹ '
+             f'active={int((out["vort"] > 0).sum())} cells')
+    log.info(f'conv: max={float(out["conv"].max()):.1f}×10⁻⁵ s⁻¹ '
+             f'active={int((out["conv"] > 0).sum())} cells')
 
     # --- Td depression: T - Td (K) ---------------------------------------
     # Lower values = more moist; useful as a dryline proxy.
