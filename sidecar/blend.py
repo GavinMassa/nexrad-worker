@@ -388,20 +388,20 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
     # Formula: SRH ≈ (V_sfc - C) × (V_1km - V_sfc)
     #   where C = storm motion (Bunkers right-mover)
     #   cross product in 2D: (u_sfc - u_c)*(v_1km - v_sfc) - (v_sfc - v_c)*(u_1km - u_sfc)
-    if u925_i is not None and v925_i is not None:
-        # Mean wind (simple average of surface and 1km AGL layers)
-        u_mean = 0.5 * (u10 + u925_i)
-        v_mean = 0.5 * (v10 + v925_i)
+    if u925_i is not None and v925_i is not None and u850_i is not None and u500_i is not None:
+        # Deep-layer mean wind for Bunkers (4-layer: 10m, 925mb, 850mb, 500mb)
+        # Guard ensures all four layers are present before computing.
+        u_mean_deep = (u10 + u925_i + u850_i + u500_i) / 4.0
+        v_mean_deep = (v10 + v925_i + v850_i + v500_i) / 4.0
 
-        # 0-1km shear vector
-        du_shear = u925_i - u10
-        dv_shear = v925_i - v10
-        shear_mag = np.sqrt(du_shear**2 + dv_shear**2) + 1e-6
+        # 0-6km shear for Bunkers deviation (surface → 500mb)
+        du_shear6 = u500_i - u10
+        dv_shear6 = v500_i - v10
+        shear6_mag = np.sqrt(du_shear6**2 + dv_shear6**2) + 1e-6
 
-        # Bunkers right-mover: deviate 7.5 m/s to the right of shear vector
-        # Right deviation: rotate shear vector 90° clockwise
-        u_storm = u_mean + 7.5 * dv_shear / shear_mag
-        v_storm = v_mean - 7.5 * du_shear / shear_mag
+        # Bunkers right-mover: deviate 7.5 m/s to the right of 0-6km shear
+        u_storm = u_mean_deep + 7.5 * dv_shear6 / shear6_mag
+        v_storm = v_mean_deep - 7.5 * du_shear6 / shear6_mag
 
         # 2D SRH from two-layer hodograph (storm-relative)
         srh_rtma = ((u10 - u_storm) * (v925_i - v10) -
@@ -417,7 +417,7 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
         # where RAP's synoptic-scale SRH is more reliable. The blend retains
         # RTMA sharpness over the Plains while keeping RAP as a backstop.
         if srh1_i is not None:
-            out['srh1'] = (0.7 * srh_rtma + 0.3 * srh1_i).astype(np.float32)
+            out['srh1'] = (0.5 * srh_rtma + 0.5 * srh1_i).astype(np.float32)
             log.info(f'[srh1] RTMA-blended: max={float(out["srh1"].max()):.0f} '
                      f'rtma_max={float(srh_rtma.max()):.0f} '
                      f'rap_max={float(srh1_i.max()):.0f}')
@@ -463,17 +463,15 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
     # --- Fixed-layer STP (Thompson et al. 2003) -------------------------
     if 'sbcape' in out and 'srh1' in out and 'bwd6' in out:
         cape_term  = out['sbcape'] / 1500.0
-        # LCL term: linear ramp 0→1 from 2000m→1000m, then
-        # additional suppression above 1500m for high-LCL environments.
-        # Thompson et al. (2012) showed EF2+ tornado probability drops sharply
-        # when LCL > 1200m — this piecewise term captures that non-linearity.
+        # LCL term: SPC fixed-layer formulation (Thompson et al. 2003/2012).
+        # ≤1000m → 1.0 (capped), 1000–2000m → linear ramp, ≥2000m → 0.0.
+        # Outer condition checks ≥2000m first so the linear branch is
+        # only evaluated in the valid 1000–2000m range.
         lcl_term = np.where(
-            lcl <= 1000.0,
-            1.0,
+            lcl >= 2000.0, 0.0,
             np.where(
-                lcl <= 2000.0,
-                np.clip((2000.0 - lcl) / 1000.0, 0.0, 1.0),
-                0.0   # LCL > 2000m → zero tornado contribution
+                lcl <= 1000.0, 1.0,
+                (2000.0 - lcl) / 1000.0
             )
         ).astype(np.float32)
         srh_term   = out['srh1'] / 150.0
