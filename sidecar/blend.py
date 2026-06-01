@@ -327,6 +327,7 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
     vstm_i   = interp(rap.get('vstm'),     'vstm')
     t2m_rap  = interp(rap.get('t2m_rap'),  't2m_rap')
     td2m_rap = interp(rap.get('td2m_rap'), 'td2m_rap')
+    cape3k_i = interp(rap.get('cape3k'),   'cape3k')
     log.info('Interpolation complete. Deriving blended parameters...')
 
     # RTMA surface fields — already on 2.5km grid
@@ -389,6 +390,21 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
         log.warning('blend: sbcin has no thermal nudge (t2m_rap missing)')
     else:
         log.warning('blend: sbcin skipped (cin missing)')
+
+    # --- 0-3km CAPE: low-level buoyancy from RAP lev_0-3000_m layer ------
+    # No RTMA correction applied — the layer-mean CAPE is not sensitive to the
+    # surface-skin T anomaly the way surface-based CAPE is. Pass through with
+    # floor clamp and display gate only.
+    CAPE3K_MIN = 50.0   # J/kg — display gate (remove noise)
+    if cape3k_i is not None:
+        out['cape3k'] = np.where(
+            np.maximum(0.0, cape3k_i) >= CAPE3K_MIN,
+            np.maximum(0.0, cape3k_i), 0.0,
+        ).astype(np.float32)
+        log.info(f'[cape3k] max={float(out["cape3k"].max()):.0f} J/kg '
+                 f'active={int((out["cape3k"] > 0).sum())} cells')
+    else:
+        log.warning('blend: cape3k skipped (RAP 0-3km CAPE not available)')
 
     # --- LCL height: log-form approximation using RTMA T/Td ---------------
     # Computed here (before SRH) so z0 can use LCL as the mixed-layer
@@ -555,6 +571,24 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
     else:
         log.warning('blend: scp skipped (sbcape, srh1, or bwd6 missing)')
 
+    # --- EHI: Energy-Helicity Index -------------------------------------
+    # EHI = (SBCAPE × 0-1km SRH) / 160000  (Thompson et al. 1998).
+    # EHI > 1: rotating thunderstorm favored.
+    # EHI > 2.5: significant tornado environment.
+    # Gate: SBCAPE < 100 J/kg or SRH1 < 25 m²/s² → EHI = 0.
+    if 'sbcape' in out and 'srh1' in out:
+        ehi_raw = (out['sbcape'] * out['srh1']) / 160000.0
+        ehi_raw = np.maximum(0.0, ehi_raw)
+        ehi_raw = np.where(out['sbcape'] < 100.0, 0.0, ehi_raw)
+        ehi_raw = np.where(out['srh1']   <  25.0, 0.0, ehi_raw)
+        out['ehi'] = np.nan_to_num(
+            ehi_raw, nan=0.0, posinf=0.0, neginf=0.0,
+        ).astype(np.float32)
+        log.info(f'[ehi] max={float(out["ehi"].max()):.2f} '
+                 f'active={int((out["ehi"] > 0).sum())} cells')
+    else:
+        log.warning('blend: ehi skipped (sbcape or srh1 missing)')
+
     # --- Surface relative vorticity and convergence ----------------------
     # Smooth RTMA winds before differencing to suppress sub-mesoscale
     # observation noise from individual stations (buildings, trees, gusts).
@@ -587,6 +621,39 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
              f'active={int((out["vort"] > 0).sum())} cells')
     log.info(f'conv: max={float(out["conv"].max()):.1f}×10⁻⁵ s⁻¹ '
              f'active={int((out["conv"] > 0).sum())} cells')
+
+    # --- SRV: Streamwise horizontal vorticity from 0-1km wind shear ------
+    # Horizontal vorticity vector (from vertical wind shear, 10m → 850mb):
+    #   ωx = −∂v/∂z ≈ −(v850 − v10) / 1500m
+    #   ωy =  ∂u/∂z ≈  (u850 − u10) / 1500m
+    # Streamwise component = projection onto storm-relative wind direction:
+    #   SRV = (ωx·u_sr + ωy·v_sr) / |SR_wind|
+    # Physical interpretation: positive SRV → horizontal vorticity tilts
+    # into vertical rotation by the updraft (Rasmussen & Davies-Jones 1982).
+    # Scale: output in 10^-3 s^-1; strong environments yield 5–20.
+    # Uses u10_smooth/v10_smooth (already computed above for vort/conv).
+    if (u850_i is not None and v850_i is not None and
+            ustm_i is not None and vstm_i is not None):
+        # Horizontal vorticity from 10m → 850mb layer (Δz ≈ 1500m)
+        omega_x = -(v850_i - v10_smooth) / 1500.0   # s⁻¹
+        omega_y =  (u850_i - u10_smooth) / 1500.0   # s⁻¹
+
+        # Storm-relative wind at surface (unit vector)
+        u_sr   = u10_smooth - ustm_i
+        v_sr   = v10_smooth - vstm_i
+        sr_spd = np.maximum(np.sqrt(u_sr**2 + v_sr**2), 1e-3)
+
+        # Streamwise projection
+        srv_raw = (omega_x * u_sr + omega_y * v_sr) / sr_spd   # s⁻¹
+
+        # Keep only positive (cyclonically favoured) values; scale to 10^-3 s^-1
+        SRV_SCALE = 1e3
+        srv_scaled = np.maximum(0.0, srv_raw) * SRV_SCALE
+        out['srv'] = np.where(srv_scaled >= 2.0, srv_scaled, 0.0).astype(np.float32)
+        log.info(f'[srv] max={float(out["srv"].max()):.1f}×10⁻³ s⁻¹ '
+                 f'active={int((out["srv"] > 0).sum())} cells')
+    else:
+        log.warning('blend: srv skipped (u850/v850 or ustm/vstm missing)')
 
     # --- Td depression: T - Td (K) ---------------------------------------
     # Lower values = more moist; useful as a dryline proxy.

@@ -102,7 +102,7 @@ async def mesonet_worker():
             # At 1350 stations on a 1597×2345 grid that's ~20GB — OOM on Railway Hobby.
             # Slice the front of the list; stations are already spatially distributed
             # by the thinning loop so the cap preserves geographic spread.
-            MAX_STATIONS = 900
+            MAX_STATIONS = 700
             if len(thinned) > MAX_STATIONS:
                 thinned = thinned[:MAX_STATIONS]
                 log.info(f'[mesonet] capped to {MAX_STATIONS} stations (memory limit)')

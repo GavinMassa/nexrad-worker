@@ -204,6 +204,12 @@ def _extract_rap(main_path: Path,
         log.warning(f'  RAP cape3k extraction failed: {e}')
         result['cape3k'] = None
 
+    # Force GC immediately after open_datasets — cfgrib holds C-level GRIB handles
+    # that the Python reference counter doesn't release until a full collection.
+    # Without this, all 354 dataset objects stay live through the isobaric wind
+    # open below, doubling peak RSS from ~2GB to ~4GB.
+    import gc; gc.collect()
+
     # ── Isobaric U/V winds — all pressure levels in one cfgrib open ──────────
     # Filtering once by typeOfLevel+shortName avoids 8 separate file opens and
     # prevents mismatched u/v if any individual per-level filter fails.
