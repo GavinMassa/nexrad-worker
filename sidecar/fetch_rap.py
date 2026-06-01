@@ -18,7 +18,7 @@ def rap_main_url(dt: datetime) -> str:
         'var_UGRD': 'on', 'var_VGRD': 'on',
         'var_TMP':  'on', 'var_DPT':  'on',
         'lev_surface':              'on',
-        'lev_3000-0_m_above_ground': 'on',
+        'lev_0-3000_m_above_ground': 'on',
         'lev_500_mb':            'on',
         'lev_700_mb':            'on',
         'lev_850_mb':            'on',
@@ -171,42 +171,38 @@ def _extract_rap(main_path: Path,
                      'typeOfLevel': 'surface'}, 'cin')
 
     # 0-3km CAPE — low-level buoyancy, highly correlated with low-level
-    # stretching and tornadogenesis. Confirmed at record 295 in RAP inventory:
-    # "0-3000 m above ground | CAPE [J/kg]"
-    # typeOfLevel='heightAboveGroundLayer', bottomLevel=0, topLevel=3000
-    _get(main_path, {'discipline': 0, 'parameterCategory': 7, 'parameterNumber': 6,
-                     'typeOfLevel': 'heightAboveGroundLayer',
-                     'bottomLevel': 0, 'topLevel': 3000}, 'cape3k')
-    if result.get('cape3k') is None:
-        # cfgrib may not expose bottomLevel/topLevel directly — fall back to
-        # opening the full heightAboveGroundLayer dataset and slicing by coord.
+    # stretching and tornadogenesis. Fetched via lev_0-3000_m_above_ground.
+    # Use open_datasets() so cfgrib splits the file by typeOfLevel — surface
+    # CAPE and 0-3km CAPE land in separate datasets, avoiding multi-layer
+    # indexing ambiguity that breaks _get() and single-dataset xarray opens.
+    try:
+        datasets = cfgrib.open_datasets(str(main_path))
+        cape3k_found = False
         try:
-            import xarray as xr
-            ds_c3k = xr.open_dataset(str(main_path), engine='cfgrib',
-                backend_kwargs={'filter_by_keys': {
-                    'typeOfLevel': 'heightAboveGroundLayer',
-                    'parameterNumber': 6,
-                }})
-            try:
-                if 'cape' in ds_c3k.data_vars:
-                    arr = ds_c3k['cape'].values
-                    if arr.ndim == 3:
-                        hgl = ds_c3k.get('heightAboveGroundLayer', None)
-                        if hgl is not None:
-                            idx = int(np.argmax(hgl.values == 3000))
-                            result['cape3k'] = arr[idx].astype(np.float32)
-                        else:
-                            result['cape3k'] = arr[-1].astype(np.float32)
-                    else:
+            for ds in datasets:
+                if 'cape' not in ds.data_vars:
+                    continue
+                arr = ds['cape'].values
+                # heightAboveGroundLayer datasets have shape (337, 451).
+                # Surface CAPE is typeOfLevel=surface (different dataset).
+                if arr.shape == (337, 451):
+                    if ('heightAboveGroundLayer' in str(ds.coords) or
+                            'heightAboveGroundLayer' in str(ds.dims)):
                         result['cape3k'] = arr.astype(np.float32)
-                    log.info(f'  RAP cape3k (xr fallback): shape={result["cape3k"].shape} '
-                             f'sample={result["cape3k"].flat[0]:.2f}')
-                else:
-                    log.warning('  RAP cape3k: not found in heightAboveGroundLayer dataset')
-            finally:
-                ds_c3k.close()
-        except Exception as e:
-            log.warning(f'  RAP cape3k xarray fallback failed: {e}')
+                        log.info(f'  RAP cape3k: shape={arr.shape} '
+                                 f'sample={arr.flat[0]:.2f}')
+                        cape3k_found = True
+                        break
+        finally:
+            for ds in datasets:
+                try: ds.close()
+                except Exception: pass
+        if not cape3k_found:
+            result['cape3k'] = None
+            log.warning('  RAP cape3k: not found in any dataset')
+    except Exception as e:
+        log.warning(f'  RAP cape3k extraction failed: {e}')
+        result['cape3k'] = None
 
     # ── Isobaric U/V winds — all pressure levels in one cfgrib open ──────────
     # Filtering once by typeOfLevel+shortName avoids 8 separate file opens and
