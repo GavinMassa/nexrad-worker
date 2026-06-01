@@ -141,6 +141,12 @@ def _extract_rap(main_path: Path, hlcy_path: Path) -> dict:
     _get(main_path, {'discipline': 0, 'parameterCategory': 0, 'parameterNumber': 0,
                      'typeOfLevel': 'isobaricInhPa', 'level': 925}, 't925')
 
+    # U/V at 925mb (~750m AGL) — used as ~1km AGL proxy for RTMA-corrected SRH
+    _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 2,
+                     'typeOfLevel': 'isobaricInhPa', 'level': 925}, 'u925')
+    _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 3,
+                     'typeOfLevel': 'isobaricInhPa', 'level': 925}, 'v925')
+
     # U/V at 10m AGL
     _get(main_path, {'discipline': 0, 'parameterCategory': 2, 'parameterNumber': 2,
                      'typeOfLevel': 'heightAboveGround', 'level': 10}, 'u10')
