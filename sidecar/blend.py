@@ -270,14 +270,18 @@ def compute_baci(
     return baci_out
 
 
-def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
+def blend(rtma: dict, rap: dict, tpw_data: dict | None = None,
+          hrrr_hlcy: dict | None = None) -> dict:
     """
     Blend RTMA 2.5km surface fields with RAP 13km upper-air fields.
 
-    rtma:     output of fetch_rtma  — t2m, td2m, u10, v10, lats, lons
-    rap:      output of fetch_rap   — cape, cin, srh1, u500, v500, u850, v850,
-                                      u10, v10, t2m_rap, td2m_rap, lats_rap, lons_rap
-    tpw_data: output of fetch_tpw   — tpw, lats, lons (float32 2D arrays); or None
+    rtma:      output of fetch_rtma   — t2m, td2m, u10, v10, lats, lons
+    rap:       output of fetch_rap    — cape, cin, srh1, u500, v500, u850, v850,
+                                        u10, v10, t2m_rap, td2m_rap, lats_rap, lons_rap
+    tpw_data:  output of fetch_tpw    — tpw, lats, lons (float32 2D arrays); or None
+    hrrr_hlcy: output of fetch_hrrr_hlcy — hlcy, lats, lons (float32 2D arrays); or None
+               HRRR 0-1km SRH at native 3km resolution; used as second backstop
+               in the SRH blend. Failure to provide this does not abort the blend.
 
     Returns dict of float32 grids on the RTMA 2.5km grid, plus lats/lons.
     Missing inputs produce a warning and the dependent params are omitted
@@ -328,6 +332,28 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
     t2m_rap  = interp(rap.get('t2m_rap'),  't2m_rap')
     td2m_rap = interp(rap.get('td2m_rap'), 'td2m_rap')
     cape3k_i = interp(rap.get('cape3k'),   'cape3k')
+
+    # Interpolate HRRR 0-1km HLCY to RTMA grid (optional — 3km → 2.5km).
+    # HRRR uses Lambert Conformal like RAP but at 3km resolution; the same
+    # _interp_to_rtma() bilinear interpolator handles it without modification.
+    # HRRR lons are native -180..180 so no normalisation is needed.
+    hrrr_srh_i = None
+    if hrrr_hlcy is not None:
+        try:
+            hrrr_srh_i = _interp_to_rtma(
+                hrrr_hlcy['hlcy'],
+                hrrr_hlcy['lats'],
+                hrrr_hlcy['lons'],
+                rtma_lats,
+                rtma_lons,
+            )
+            log.info(f'[hrrr] hlcy interpolated to RTMA grid: '
+                     f'max={float(hrrr_srh_i.max()):.0f} '
+                     f'shape={hrrr_srh_i.shape}')
+        except Exception as e:
+            log.warning(f'[hrrr] hlcy interpolation failed: {e}')
+            hrrr_srh_i = None
+
     log.info('Interpolation complete. Deriving blended parameters...')
 
     # RTMA surface fields — already on 2.5km grid
@@ -492,19 +518,51 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
             log.info(f'[srh1] 1-layer fallback (925/950mb unavail): sfc→850mb, '
                      f'raw_max={float(srh_rtma.max()):.0f}')
 
-        if srh1_i is not None:
+        if hrrr_srh_i is not None and srh1_i is not None:
+            # 3-way blend: RTMA-corrected 40%, HRRR 3km native 40%, RAP 13km 20%.
+            # HRRR captures mesoscale SRH gradients near boundaries better than
+            # RAP (3km vs 13km); the RTMA component adds the surface wind
+            # correction that neither model has below 3km resolution.
+            out['srh1'] = (0.4 * srh_rtma +
+                           0.4 * hrrr_srh_i +
+                           0.2 * srh1_i).astype(np.float32)
+            log.info(f'[srh1] 3-way blend (RTMA 40% + HRRR 40% + RAP 20%): '
+                     f'max={float(out["srh1"].max()):.0f} '
+                     f'rtma_max={float(srh_rtma.max()):.0f} '
+                     f'hrrr_max={float(hrrr_srh_i.max()):.0f} '
+                     f'rap_max={float(srh1_i.max()):.0f}')
+
+        elif hrrr_srh_i is not None:
+            # HRRR available but no RAP HLCY: 50/50 RTMA + HRRR
+            out['srh1'] = (0.5 * srh_rtma + 0.5 * hrrr_srh_i).astype(np.float32)
+            log.info(f'[srh1] RTMA+HRRR (no RAP HLCY): '
+                     f'max={float(out["srh1"].max()):.0f} '
+                     f'rtma_max={float(srh_rtma.max()):.0f} '
+                     f'hrrr_max={float(hrrr_srh_i.max()):.0f}')
+
+        elif srh1_i is not None:
+            # No HRRR: original 50/50 RTMA + RAP
             out['srh1'] = (0.5 * srh_rtma + 0.5 * srh1_i).astype(np.float32)
-            log.info(f'[srh1] 50/50 blend with RAP native: '
+            log.info(f'[srh1] 50/50 blend RTMA+RAP (HRRR unavailable): '
                      f'max={float(out["srh1"].max()):.0f} '
                      f'rtma_max={float(srh_rtma.max()):.0f} '
                      f'rap_max={float(srh1_i.max()):.0f}')
-        else:
-            out['srh1'] = srh_rtma
-            log.info(f'[srh1] RTMA-only: max={float(srh_rtma.max()):.0f}')
 
+        else:
+            # Fallback: RTMA-only
+            out['srh1'] = srh_rtma
+            log.info(f'[srh1] RTMA-only (all backstops missing): '
+                     f'max={float(srh_rtma.max()):.0f}')
+
+    elif hrrr_srh_i is not None and srh1_i is not None:
+        out['srh1'] = (0.5 * hrrr_srh_i + 0.5 * srh1_i).astype(np.float32)
+        log.warning('[srh1] HRRR+RAP blend (no RTMA correction — ustm/vstm missing)')
+    elif hrrr_srh_i is not None:
+        out['srh1'] = hrrr_srh_i
+        log.warning('[srh1] HRRR-only (no RTMA correction, no RAP HLCY)')
     elif srh1_i is not None:
         out['srh1'] = srh1_i
-        log.warning('[srh1] using raw RAP SRH (ustm/vstm or 850mb winds missing)')
+        log.warning('[srh1] RAP-only (ustm/vstm missing, HRRR unavailable)')
     else:
         log.warning('blend: srh1 skipped (all SRH sources missing)')
 
