@@ -250,9 +250,24 @@ async def run_cycle():
                                              dtype=np.float32).reshape(ny_c, nx_c)
                         dtd  = np.frombuffer(MESONET_DTD_PATH.read_bytes(),
                                              dtype=np.float32).reshape(ny_c, nx_c)
-                        # Upsample correction to full RTMA resolution, crop ±1px
+                        # Guard against stale correction from a previous RTMA domain
+                        # size (e.g. after a deploy that changes DOWNSAMPLE_FACTOR).
+                        # The correction is at FACTOR=0.5 resolution; upsampled back
+                        # to full RTMA must yield exactly ny_full×nx_full after crop.
+                        # If the correction's compressed dimensions don't match the
+                        # current RTMA shape when upsampled, discard and skip.
                         UP = 1.0 / FACTOR
                         ny_full, nx_full = rtma['t2m'].shape
+                        ny_corr_up = round(ny_c * UP)
+                        nx_corr_up = round(nx_c * UP)
+                        if abs(ny_corr_up - ny_full) > 4 or abs(nx_corr_up - nx_full) > 4:
+                            log.warning(
+                                f'[mesonet] correction shape mismatch: '
+                                f'correction={ny_c}×{nx_c} → upsampled={ny_corr_up}×{nx_corr_up} '
+                                f'vs RTMA={ny_full}×{nx_full} — discarding stale correction'
+                            )
+                            raise ValueError('shape mismatch')
+                        # Upsample correction to full RTMA resolution, crop ±1px
                         dt_full  = ndimage_zoom(dt,  UP, order=1)[:ny_full, :nx_full]
                         dtd_full = ndimage_zoom(dtd, UP, order=1)[:ny_full, :nx_full]
                         rtma = dict(rtma)

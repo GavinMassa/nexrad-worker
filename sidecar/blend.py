@@ -653,11 +653,13 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
         # Streamwise projection
         srv_raw = (omega_x * u_sr + omega_y * v_sr) / sr_spd   # s⁻¹
 
-        # Keep only positive (cyclonically favoured) values; scale to 10^-3 s^-1
-        SRV_SCALE = 1e3
+        # Keep only positive (cyclonically favoured) values; scale to 10^-5 s^-1
+        # (same unit convention as vort/conv so the iOS color table and legend
+        # are consistent across all three fields).
+        SRV_SCALE = 1e5
         srv_scaled = np.maximum(0.0, srv_raw) * SRV_SCALE
         out['srv'] = np.where(srv_scaled >= 2.0, srv_scaled, 0.0).astype(np.float32)
-        log.info(f'[srv] max={float(out["srv"].max()):.1f}×10⁻³ s⁻¹ '
+        log.info(f'[srv] max={float(out["srv"].max()):.1f}×10⁻⁵ s⁻¹ '
                  f'active={int((out["srv"] > 0).sum())} cells')
     else:
         log.warning('blend: srv skipped (u850/v850 or ustm/vstm missing)')
