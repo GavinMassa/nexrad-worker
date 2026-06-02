@@ -7,7 +7,8 @@ log = logging.getLogger(__name__)
 TMP_DIR = Path(tempfile.gettempdir()) / 'sidecar-cache'
 TMP_DIR.mkdir(exist_ok=True)
 
-NOMADS_RAP = 'https://nomads.ncep.noaa.gov/cgi-bin/filter_rap.pl'
+NOMADS_RAP  = 'https://nomads.ncep.noaa.gov/cgi-bin/filter_rap.pl'
+NOMADS_HRRR = 'https://nomads.ncep.noaa.gov/cgi-bin/filter_hrrr_2d.pl'
 
 def rap_main_url(dt: datetime) -> str:
     ymd = dt.strftime('%Y%m%d')
@@ -66,6 +67,18 @@ def rap_pwat_url(dt: datetime) -> str:
         'dir': f'/rap.{ymd}',
     }
     return NOMADS_RAP + '?' + '&'.join(f'{k}={v}' for k, v in params.items())
+
+def hrrr_hlcy_url(dt: datetime) -> str:
+    """HRRR 0-1km HLCY — native 3km grid, sharper than RAP near boundaries."""
+    ymd = dt.strftime('%Y%m%d')
+    hh  = dt.strftime('%H')
+    params = {
+        'file':                      f'hrrr.t{hh}z.wrfsfcf00.grib2',
+        'var_HLCY':                  'on',
+        'lev_0-1000_m_above_ground': 'on',
+        'dir': f'/hrrr.{ymd}/conus',
+    }
+    return NOMADS_HRRR + '?' + '&'.join(f'{k}={v}' for k, v in params.items())
 
 async def _download(url: str, dest: Path, client: httpx.AsyncClient) -> bool:
     """Download url to dest. Returns True on success."""
@@ -137,6 +150,99 @@ async def fetch_rap(cycle_dt: datetime) -> dict | None:
                     p.unlink(missing_ok=True)
 
     return None
+
+async def fetch_hrrr_hlcy(cycle_dt: datetime) -> dict | None:
+    """
+    Fetch HRRR 0-1km storm-relative helicity for the given cycle.
+    Tries current hour and up to 2 hours back.
+
+    Returns dict with keys: hlcy (float32, shape ~1059×1799),
+                             lats (float32, same shape),
+                             lons (float32, same shape)
+    on the HRRR native 3km grid, or None if unavailable.
+    Failure is non-fatal — the caller should treat None as "HRRR unavailable."
+    """
+    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+        for offset in range(3):
+            dt    = cycle_dt - timedelta(hours=offset)
+            stamp = dt.strftime('%Y%m%d_%H')
+            dest  = TMP_DIR / f'hrrr_hlcy_{stamp}.grib2'
+
+            ok = await _download(hrrr_hlcy_url(dt), dest, client)
+            if not ok:
+                log.info(f'[hrrr] hlcy not available for {dt.strftime("%H")}Z')
+                dest.unlink(missing_ok=True)
+                continue
+
+            log.info(f'[hrrr] hlcy downloaded for {dt.strftime("%H")}Z: '
+                     f'{dest.stat().st_size/1e3:.0f}KB')
+            try:
+                result = _extract_hrrr_hlcy(dest)
+                return result
+            except Exception as e:
+                log.warning(f'[hrrr] hlcy extraction failed: {e}')
+                return None
+            finally:
+                dest.unlink(missing_ok=True)
+
+    log.warning('[hrrr] hlcy unavailable for all offsets')
+    return None
+
+
+def _extract_hrrr_hlcy(path: Path) -> dict | None:
+    """
+    Extract 0-1km HLCY from HRRR wrfsfcf00 GRIB2.
+
+    HRRR encodes HLCY at typeOfLevel='heightAboveGroundLayer' with
+    topLevel=1000, bottomLevel=0. cfgrib may stack it with the 0-3km layer
+    in a 3D array — we always take index 0 (0-1km, shorter layer first).
+
+    Returns dict with keys: hlcy (float32, shape ~1059×1799),
+                             lats (float32, same shape),
+                             lons (float32, same shape)
+    Returns None on extraction failure.
+    """
+    import gc
+    try:
+        datasets = cfgrib.open_datasets(str(path))
+        hlcy_arr = lats_arr = lons_arr = None
+        try:
+            for ds in datasets:
+                if 'hlcy' not in ds.data_vars:
+                    continue
+                arr = ds['hlcy'].values
+                # cfgrib may stack 0-1km and 0-3km → shape (2, ny, nx); take index 0.
+                if arr.ndim == 3:
+                    hlcy_arr = arr[0].astype(np.float32)
+                    log.info(f'[hrrr] hlcy stacked (2, ny, nx) → using [0] (0-1km) '
+                             f'shape={hlcy_arr.shape}')
+                elif arr.ndim == 2:
+                    hlcy_arr = arr.astype(np.float32)
+                    log.info(f'[hrrr] hlcy 2D shape={hlcy_arr.shape}')
+                else:
+                    continue
+                lats_arr = ds['latitude'].values.astype(np.float32)
+                lons_arr = ds['longitude'].values.astype(np.float32)
+                log.info(f'[hrrr] hlcy sample={hlcy_arr.flat[0]:.2f} '
+                         f'lat={lats_arr.min():.1f}–{lats_arr.max():.1f} '
+                         f'lon={lons_arr.min():.1f}–{lons_arr.max():.1f}')
+                break
+        finally:
+            for ds in datasets:
+                try: ds.close()
+                except Exception: pass
+
+        if hlcy_arr is None:
+            log.warning('[hrrr] hlcy not found in any dataset')
+            return None
+
+        gc.collect()   # release C-level eccodes handles before caller continues
+        return {'hlcy': hlcy_arr, 'lats': lats_arr, 'lons': lons_arr}
+
+    except Exception as e:
+        log.warning(f'[hrrr] extraction error: {e}')
+        return None
+
 
 def _extract_rap(main_path: Path,
                  hlcy_path: Path | None,
