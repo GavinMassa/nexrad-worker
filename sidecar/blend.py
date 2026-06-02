@@ -375,19 +375,22 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
     # Uses additive (not multiplicative) approach because CIN is a negative
     # energy quantity — exponential multipliers on negative numbers produce
     # unbounded amplification when delta_t is negative (cold air advection).
-    # Clamp to [-600, 0] — physically realistic operational range.
+    # Clamp to [-300, 0] — operationally, CIN below −300 J/kg is "fully capped"
+    # regardless of exact value (no surface parcel breaks it). Clamping at −300
+    # prevents stable non-convective regimes (Rockies, polar air) from producing
+    # extreme negative values that drag the CIN gate down to zero everywhere.
     if cin_i is not None:
         if t2m_rap is not None:
             cin_correction = delta_t_clamped * 40.0
             out['sbcin'] = np.clip(
-                cin_i + cin_correction, -600.0, 0.0
+                cin_i + cin_correction, -300.0, 0.0
             ).astype(np.float32)
             log.info(f'[sbcin] linear thermal correction: '
                      f'min={float(out["sbcin"].min()):.0f} '
                      f'correction range=[{float(cin_correction.min()):.0f}, '
                      f'{float(cin_correction.max()):.0f}] J/kg')
         else:
-            out['sbcin'] = np.clip(cin_i, -600.0, 0.0).astype(np.float32)
+            out['sbcin'] = np.clip(cin_i, -300.0, 0.0).astype(np.float32)
             log.warning('blend: sbcin has no thermal correction (t2m_rap missing)')
     else:
         log.warning('blend: sbcin skipped (cin missing)')
@@ -653,13 +656,15 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
         # Streamwise projection
         srv_raw = (omega_x * u_sr + omega_y * v_sr) / sr_spd   # s⁻¹
 
-        # Keep only positive (cyclonically favoured) values; scale to 10^-5 s^-1
-        # (same unit convention as vort/conv so the iOS color table and legend
-        # are consistent across all three fields).
-        SRV_SCALE = 1e5
+        # Keep only positive (cyclonically favoured) values.
+        # SRV from vertical wind shear (10m→850mb, Δz≈1500m) is inherently
+        # ~100× larger than surface relative vorticity from horizontal gradients.
+        # Scale by 1e3 → display values in ×10⁻³ s⁻¹; strong environments
+        # yield 5–20, fitting the 0–30 iOS range. The legend label reflects this.
+        SRV_SCALE = 1e3
         srv_scaled = np.maximum(0.0, srv_raw) * SRV_SCALE
         out['srv'] = np.where(srv_scaled >= 2.0, srv_scaled, 0.0).astype(np.float32)
-        log.info(f'[srv] max={float(out["srv"].max()):.1f}×10⁻⁵ s⁻¹ '
+        log.info(f'[srv] max={float(out["srv"].max()):.1f}×10⁻³ s⁻¹ '
                  f'active={int((out["srv"] > 0).sum())} cells')
     else:
         log.warning('blend: srv skipped (u850/v850 or ustm/vstm missing)')
