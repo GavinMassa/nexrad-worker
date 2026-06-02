@@ -1,11 +1,12 @@
-import json, logging
+import json, logging, shutil
 import numpy as np
 from pathlib import Path
 from datetime import datetime
 from scipy.ndimage import zoom
 
 log = logging.getLogger(__name__)
-OUT_DIR = Path('/app/sidecar-out')
+OUT_DIR       = Path('/app/sidecar-out')
+ARCHIVE_HOURS = 6          # retain the last N hourly blend cycles
 OUT_DIR.mkdir(exist_ok=True)
 
 # Downsample factor applied to all param grids before writing.
@@ -140,3 +141,56 @@ def write_output(grids: dict, cycle_dt: datetime) -> None:
     log.info(f'meta bbox: lat {lat_min:.2f}–{lat_max:.2f}, lon {lon_min:.2f}–{lon_max:.2f}, '
              f'nx={nx_new}, ny={ny_new}')
     log.info(f'Wrote {len(params)} grids ({ny_new}×{nx_new}) to {OUT_DIR}: {params}')
+
+    # ── Archive this cycle ────────────────────────────────────────────────────
+    # Copies the freshly-written flat files into OUT_DIR/YYYYMMDDHH/ so the
+    # Node.js server can serve historical cycles at GET /rap/blend/YYYYMMDDHH.
+    # The flat files in OUT_DIR remain untouched — existing /rap/blend/all
+    # endpoint continues to serve the latest cycle with zero disruption.
+    hour_key  = cycle_dt.strftime('%Y%m%d%H')
+    cycle_dir = OUT_DIR / hour_key
+    cycle_dir.mkdir(exist_ok=True)
+
+    for param in params:
+        src = OUT_DIR / f'{param}.bin'
+        dst = cycle_dir / f'{param}.bin'
+        tmp = cycle_dir / f'{param}.bin.tmp'
+        shutil.copy2(str(src), str(tmp))
+        tmp.replace(dst)
+
+    cycle_meta_tmp   = cycle_dir / 'meta.json.tmp'
+    cycle_meta_final = cycle_dir / 'meta.json'
+    cycle_meta_tmp.write_text(json.dumps(meta))
+    cycle_meta_tmp.replace(cycle_meta_final)
+
+    log.info(f'Archived cycle {hour_key} → {cycle_dir} ({len(params)} params × {ny_new}×{nx_new})')
+
+    # ── Prune cycles beyond ARCHIVE_HOURS ────────────────────────────────────
+    # Dirs are named YYYYMMDDHH (10 digits); lexicographic sort = time order.
+    existing_dirs = sorted(
+        [d for d in OUT_DIR.iterdir()
+         if d.is_dir() and len(d.name) == 10 and d.name.isdigit()],
+        key=lambda d: d.name,
+    )
+    while len(existing_dirs) > ARCHIVE_HOURS:
+        oldest = existing_dirs.pop(0)
+        shutil.rmtree(str(oldest), ignore_errors=True)
+        log.info(f'Pruned old archive dir: {oldest.name}')
+
+    # ── history.json ──────────────────────────────────────────────────────────
+    # Written atomically so Node.js can return available hours without listing
+    # the filesystem on every request.
+    available = sorted(
+        d.name for d in OUT_DIR.iterdir()
+        if d.is_dir() and len(d.name) == 10 and d.name.isdigit()
+    )
+    history = {
+        'hours':      available,
+        'current':    hour_key,
+        'updated_at': cycle_dt.isoformat(),
+    }
+    hist_tmp   = OUT_DIR / 'history.json.tmp'
+    hist_final = OUT_DIR / 'history.json'
+    hist_tmp.write_text(json.dumps(history))
+    hist_tmp.replace(hist_final)
+    log.info(f'history.json: {len(available)} hours available — {available}')
