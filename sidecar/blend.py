@@ -524,42 +524,18 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None) -> dict:
         log.warning('blend: bwd6 skipped (u500/v500 missing)')
 
     # --- CIN-gated STP (Thompson et al. 2003 + 2012 CIN gate) -----------
-    # CIN gate smoothly suppresses STP in heavily capped environments:
-    #   SBCIN >= -50 J/kg  → gate = 1.0 (no suppression, cap easily broken)
-    #   SBCIN <= -200 J/kg → gate = 0.0 (full suppression, cap unbreakable)
-    #   Between -50 and -200 → linear ramp
-    # Uses thermally-nudged SBCIN so the gate responds to real-time surface
-    # modifications, not just the coarse RAP cap estimate.
+    # CIN gate removed temporarily for diagnostic purposes.
     if 'sbcape' in out and 'srh1' in out and 'bwd6' in out:
         cape_term  = out['sbcape'] / 1500.0
         lcl_term   = np.clip((2000.0 - lcl) / 1000.0, 0.0, 1.0).astype(np.float32)
         srh_term   = out['srh1'] / 150.0
         shear_term = np.minimum(1.5, out['bwd6'] / 20.0)
 
-        # CIN gate term
-        if 'sbcin' in out:
-            # Looser CIN gate matching Thompson et al. operational thresholds:
-            # >= -50  J/kg → 1.0 (no suppression, cap easily broken)
-            # <= -400 J/kg → 0.0 (full suppression, cap unbreakable)
-            # Linear ramp between -50 and -400. With SBCIN clamped to -300 max,
-            # the effective ramp spans -50 to -300, which covers the full
-            # realistic range without collapsing STP over the warm sector.
-            cin_gate = np.where(
-                out['sbcin'] >= -50.0,  1.0,
-                np.where(
-                    out['sbcin'] <= -400.0, 0.0,
-                    (400.0 + out['sbcin']) / 350.0
-                )
-            ).astype(np.float32)
-        else:
-            cin_gate = np.ones_like(cape_term)
-
-        raw_stp = cape_term * cin_gate * lcl_term * srh_term * shear_term
+        raw_stp = cape_term * lcl_term * srh_term * shear_term
         out['stp'] = np.nan_to_num(
             np.maximum(0, raw_stp), nan=0.0, posinf=0.0, neginf=0.0,
         ).astype(np.float32)
-        log.info(f'[stp] max={float(out["stp"].max()):.2f} '
-                 f'cin_gate_min={float(cin_gate.min()):.2f}')
+        log.info(f'[stp] max={float(out["stp"].max()):.2f} (no CIN gate)')
     else:
         log.warning('blend: stp skipped (sbcape, srh1, or bwd6 missing)')
 
