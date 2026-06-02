@@ -192,7 +192,7 @@ async def run_cycle():
             rtma_task = asyncio.create_task(fetch_rtma(now))
             rap_task  = asyncio.create_task(fetch_rap(now))
             tpw_task  = asyncio.create_task(fetch_latest_tpw(now))
-            hrrr_task = fetch_hrrr_hlcy(cycle_dt)
+            hrrr_task = fetch_hrrr_hlcy(now)
             rtma, rap, tpw_data, hrrr_hlcy = await asyncio.gather(
                 rtma_task, rap_task, tpw_task, hrrr_task
             )
