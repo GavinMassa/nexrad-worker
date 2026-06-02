@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from scipy.ndimage import zoom as ndimage_zoom
 from fetch_rtma import fetch_rtma
-from fetch_rap import fetch_rap
+from fetch_rap import fetch_rap, fetch_hrrr_hlcy
 from fetch_tpw import fetch_latest_tpw
 from mesonet import fetch_mesonet_obs, compute_correction
 from blend import blend as do_blend
@@ -192,7 +192,15 @@ async def run_cycle():
             rtma_task = asyncio.create_task(fetch_rtma(now))
             rap_task  = asyncio.create_task(fetch_rap(now))
             tpw_task  = asyncio.create_task(fetch_latest_tpw(now))
-            rtma, rap, tpw_data = await asyncio.gather(rtma_task, rap_task, tpw_task)
+            hrrr_task = fetch_hrrr_hlcy(cycle_dt)
+            rtma, rap, tpw_data, hrrr_hlcy = await asyncio.gather(
+                rtma_task, rap_task, tpw_task, hrrr_task
+            )
+            if hrrr_hlcy is not None:
+                log.info(f'[hrrr] hlcy available: shape={hrrr_hlcy["hlcy"].shape} '
+                         f'max={float(hrrr_hlcy["hlcy"].max()):.0f}')
+            else:
+                log.info('[hrrr] hlcy not available this cycle — using RAP+RTMA only')
 
             if rtma is None:
                 log.warning('RTMA fetch returned None — skipping cycle')
@@ -291,7 +299,7 @@ async def run_cycle():
             # tpw_data is passed as third positional arg; blend() defaults to
             # None if not available so this is safe when TPW fetch failed.
             blended = await loop.run_in_executor(
-                _thread_pool, do_blend, rtma, rap, tpw_data
+                _thread_pool, do_blend, rtma, rap, tpw_data, hrrr_hlcy
             )
             write_output(blended, now)
 
