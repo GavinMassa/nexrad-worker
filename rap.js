@@ -71,6 +71,11 @@ const SIDECAR_URL = process.env.SIDECAR_URL || null;
 let blendCache = { raw: null, compressed: null, metaHeader: null, expires: 0 };
 const BLEND_CACHE_TTL = 45 * 60 * 1000;   // 45 min — refresh before next sidecar cycle
 
+// Archived hour blend cache — immutable once fetched (past cycles never change).
+// Grows to at most ARCHIVE_HOURS (6) entries × ~13 MB compressed each ≈ 80 MB.
+// key: "YYYYMMDDHH" → { compressed: Buffer, metaHeader: string }
+const hourBlendCache = new Map();
+
 async function getBlendAll() {
     const now = Date.now();
     if (blendCache.compressed && now < blendCache.expires) {
@@ -614,6 +619,89 @@ async function handle(req, res) {
             } : null,
         }));
         return true;
+    }
+
+    // ── GET /rap/blend/history ───────────────────────────────────────────────
+    // Returns history.json from the sidecar — list of available archived hours.
+    if (p === '/blend/history') {
+        if (!SIDECAR_URL) {
+            res.writeHead(503, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'SIDECAR_URL env var not set' }));
+            return true;
+        }
+        try {
+            const r = await fetch(`${SIDECAR_URL}/blend/history`);
+            const body = await r.text();
+            res.writeHead(r.status, {
+                'Content-Type':                'application/json',
+                'Cache-Control':               'no-cache',
+                'Access-Control-Allow-Origin': '*',
+            });
+            return res.end(body);
+        } catch (err) {
+            res.writeHead(503, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ error: err.message }));
+        }
+    }
+
+    // ── GET /rap/blend/:hour ─────────────────────────────────────────────────
+    // Serves an archived blend cycle for a specific hour (YYYYMMDDHH).
+    // Immutable once fetched — cached forever in hourBlendCache (no TTL).
+    // Must appear BEFORE /blend/all so the regex never matches "all".
+    const m = p.match(/^\/blend\/(\d{10})$/);
+    if (m) {
+        const hour = m[1];
+        if (!SIDECAR_URL) {
+            res.writeHead(503, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'SIDECAR_URL env var not set' }));
+            return true;
+        }
+        try {
+            // Serve from in-process cache when available (immutable — past hours never change).
+            if (hourBlendCache.has(hour)) {
+                const cached = hourBlendCache.get(hour);
+                res.writeHead(200, {
+                    'Content-Type':                  'application/octet-stream',
+                    'Content-Encoding':              'gzip',
+                    'Content-Length':                String(cached.compressed.length),
+                    'X-Meso-Meta':                   cached.metaHeader,
+                    'Access-Control-Allow-Origin':   '*',
+                    'Access-Control-Expose-Headers': 'X-Meso-Meta',
+                    'Cache-Control':                 'public, max-age=86400',
+                });
+                return res.end(cached.compressed);
+            }
+            // Cache miss — fetch from sidecar, compress, cache.
+            const r = await fetch(`${SIDECAR_URL}/blend/${hour}`, {
+                signal: AbortSignal.timeout(60_000),
+            });
+            if (!r.ok) {
+                res.writeHead(r.status);
+                return res.end(`Hour ${hour} not available`);
+            }
+            const metaHeader = r.headers.get('x-meso-meta') || '{}';
+            const raw = Buffer.from(await r.arrayBuffer());
+            const compressed = await new Promise((resolve, reject) =>
+                zlib.gzip(raw, { level: 1 }, (err, result) =>
+                    err ? reject(err) : resolve(result))
+            );
+            hourBlendCache.set(hour, { compressed, metaHeader });
+            console.log(`[blend] cached hour ${hour}: ${(compressed.length / 1024 / 1024).toFixed(1)}MB`);
+            res.writeHead(200, {
+                'Content-Type':                  'application/octet-stream',
+                'Content-Encoding':              'gzip',
+                'Content-Length':                String(compressed.length),
+                'X-Meso-Meta':                   metaHeader,
+                'Access-Control-Allow-Origin':   '*',
+                'Access-Control-Expose-Headers': 'X-Meso-Meta',
+                'Cache-Control':                 'public, max-age=86400',
+            });
+            return res.end(compressed);
+        } catch (err) {
+            console.error(`[blend] hour ${hour} error:`, err.message);
+            if (!res.headersSent) { res.writeHead(503); res.end(err.message); }
+            return true;
+        }
     }
 
     // ── GET /rap/blend/all ───────────────────────────────────────────────────
