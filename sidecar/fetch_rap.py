@@ -9,6 +9,7 @@ TMP_DIR.mkdir(exist_ok=True)
 
 NOMADS_RAP  = 'https://nomads.ncep.noaa.gov/cgi-bin/filter_rap.pl'
 NOMADS_HRRR = 'https://nomads.ncep.noaa.gov/cgi-bin/filter_hrrr_2d.pl'
+HRRR_BASE   = 'https://nomads.ncep.noaa.gov/pub/data/nccf/com/hrrr/prod'
 
 def rap_main_url(dt: datetime) -> str:
     ymd = dt.strftime('%Y%m%d')
@@ -68,17 +69,69 @@ def rap_pwat_url(dt: datetime) -> str:
     }
     return NOMADS_RAP + '?' + '&'.join(f'{k}={v}' for k, v in params.items())
 
-def hrrr_hlcy_url(dt: datetime) -> str:
-    """HRRR 0-1km HLCY — native 3km grid, sharper than RAP near boundaries."""
+def _hrrr_grib2_url(dt: datetime) -> str:
     ymd = dt.strftime('%Y%m%d')
     hh  = dt.strftime('%H')
-    params = {
-        'file':                      f'hrrr.t{hh}z.wrfsfcf00.grib2',
-        'var_HLCY':                  'on',
-        'lev_0-1000_m_above_ground': 'on',
-        'dir': f'/hrrr.{ymd}/conus',
-    }
-    return NOMADS_HRRR + '?' + '&'.join(f'{k}={v}' for k, v in params.items())
+    return f'{HRRR_BASE}/hrrr.{ymd}/conus/hrrr.t{hh}z.wrfsfcf00.grib2'
+
+async def _hrrr_range_download(dt: datetime, dest: Path,
+                               client: httpx.AsyncClient) -> bool:
+    """
+    Download just the HLCY:1000-0 m above ground record from the HRRR GRIB2.
+
+    Uses the .idx sidecar file to find the exact byte range, then issues an
+    HTTP Range request against the raw .grib2 on the NOAA public server.
+    This bypasses the NOMADS CGI filter (which silently returns 0 bytes for
+    HRRR level params that differ in naming from RAP).
+    """
+    idx_url = _hrrr_grib2_url(dt) + '.idx'
+    try:
+        r = await client.get(idx_url)
+        if r.status_code == 404:
+            return False
+        r.raise_for_status()
+    except Exception as e:
+        log.warning(f'[hrrr] idx fetch failed for {dt.strftime("%H")}Z: {e}')
+        return False
+
+    # Parse idx lines: "num:byte_offset:d=YYYYMMDDHH:VAR:level:anl:"
+    lines = r.text.splitlines()
+    start_byte: int | None = None
+    end_byte:   int | None = None
+    for i, line in enumerate(lines):
+        if 'HLCY:1000-0 m above ground' in line:
+            parts = line.split(':')
+            start_byte = int(parts[1])
+            if i + 1 < len(lines):
+                next_parts = lines[i + 1].split(':')
+                end_byte = int(next_parts[1]) - 1
+            break
+
+    if start_byte is None:
+        log.warning(f'[hrrr] HLCY:1000-0 m above ground not in idx for '
+                    f'{dt.strftime("%H")}Z')
+        return False
+
+    range_hdr = (f'bytes={start_byte}-{end_byte}'
+                 if end_byte is not None else f'bytes={start_byte}-')
+    log.debug(f'[hrrr] range request {range_hdr} for {dt.strftime("%H")}Z')
+    try:
+        async with client.stream('GET', _hrrr_grib2_url(dt),
+                                 headers={'Range': range_hdr}) as r:
+            if r.status_code not in (200, 206):
+                log.warning(f'[hrrr] range request returned {r.status_code}')
+                return False
+            with open(dest, 'wb') as f:
+                async for chunk in r.aiter_bytes(65536):
+                    f.write(chunk)
+        size = dest.stat().st_size
+        if size < 1000:
+            log.warning(f'[hrrr] range download suspiciously small: {size} B')
+            return False
+        return True
+    except Exception as e:
+        log.warning(f'[hrrr] range download failed: {e}')
+        return False
 
 async def _download(url: str, dest: Path, client: httpx.AsyncClient) -> bool:
     """Download url to dest. Returns True on success."""
@@ -168,7 +221,7 @@ async def fetch_hrrr_hlcy(cycle_dt: datetime) -> dict | None:
             stamp = dt.strftime('%Y%m%d_%H')
             dest  = TMP_DIR / f'hrrr_hlcy_{stamp}.grib2'
 
-            ok = await _download(hrrr_hlcy_url(dt), dest, client)
+            ok = await _hrrr_range_download(dt, dest, client)
             if not ok:
                 log.info(f'[hrrr] hlcy not available for {dt.strftime("%H")}Z')
                 dest.unlink(missing_ok=True)
