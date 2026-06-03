@@ -448,6 +448,7 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None,
     _td2m_c = td2m - 273.15
     _lcl_denom = np.maximum(0.0012 + 0.00012 * _t2m_c, 1e-4)
     lcl = (_t2m_c - _td2m_c) / _lcl_denom   # meters AGL
+    out['lcl'] = np.clip(lcl, 0.0, 4000.0).astype(np.float32)
 
     # --- 0-1km SRH: exponential-decay RTMA wind correction ---------------
     # Method:
