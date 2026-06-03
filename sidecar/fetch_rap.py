@@ -135,6 +135,7 @@ async def _hrrr_range_download(dt: datetime, dest: Path,
 
 async def _download(url: str, dest: Path, client: httpx.AsyncClient) -> bool:
     """Download url to dest. Returns True on success."""
+    dest.unlink(missing_ok=True)   # remove stale file from a previous failed attempt
     try:
         head = await client.head(url)
         if head.status_code == 404:

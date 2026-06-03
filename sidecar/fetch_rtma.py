@@ -1,6 +1,6 @@
 import asyncio, logging, tempfile
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import httpx
 import cfgrib
 import numpy as np
@@ -36,7 +36,7 @@ async def fetch_rtma(cycle_dt: datetime) -> dict | None:
     """
     # Try current hour, fall back to previous hour if not available.
     for offset_h in [0, 1]:
-        dt = cycle_dt.replace(hour=max(0, cycle_dt.hour - offset_h))
+        dt = cycle_dt - timedelta(hours=offset_h)
         url  = rtma_url(dt)
         dest = TMP_DIR / f'rtma_{dt.strftime("%Y%m%d_%H")}.grib2'
 
@@ -61,8 +61,7 @@ async def fetch_rtma(cycle_dt: datetime) -> dict | None:
         except Exception as e:
             log.warning(f'RTMA fetch failed for {dt.strftime("%H")}Z: {e}')
             dest.unlink(missing_ok=True)
-            if offset_h == 1:
-                return None
+            continue
     else:
         # Both offsets exhausted without a break.
         return None
