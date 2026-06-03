@@ -20,7 +20,8 @@ def rap_main_url(dt: datetime) -> str:
         'var_UGRD': 'on', 'var_VGRD': 'on',
         'var_TMP':  'on', 'var_DPT':  'on',
         'lev_surface':              'on',
-        'lev_0-3000_m_above_ground': 'on',
+        'lev_0-3000_m_above_ground':  'on',
+        'lev_180-0_mb_above_ground': 'on',   # MUCAPE search layer
         'lev_500_mb':            'on',
         'lev_700_mb':            'on',
         'lev_850_mb':            'on',
@@ -363,6 +364,49 @@ def _extract_rap(main_path: Path,
     except Exception as e:
         log.warning(f'  RAP cape3k extraction failed: {e}')
         result['cape3k'] = None
+
+    # MUCAPE — most unstable parcel CAPE (180-0mb search layer).
+    # Lives in a pressureFromGroundLayer dataset, separate from surface CAPE.
+    # cfgrib may stack 90-0mb (MLCAPE) and 180-0mb (MUCAPE) on a dim — log
+    # the coordinate values on first extraction so index order can be verified.
+    try:
+        _mu_datasets = cfgrib.open_datasets(str(main_path))
+        mucape_found = False
+        try:
+            for _ds in _mu_datasets:
+                if 'cape' not in _ds.data_vars:
+                    continue
+                arr = _ds['cape'].values
+                if arr.shape[-2:] != (337, 451):
+                    continue
+                coords_str = str(_ds.coords) + str(_ds.dims)
+                if 'pressureFromGroundLayer' not in coords_str:
+                    continue
+                # Log coordinate values so index → layer mapping can be verified.
+                if 'pressureFromGroundLayer' in _ds.coords:
+                    pgl_vals = _ds.coords['pressureFromGroundLayer'].values
+                    log.info(f'  RAP mucape: pressureFromGroundLayer coords={pgl_vals}')
+                if arr.ndim == 3:
+                    # cfgrib sorts layers ascending by pressureFromGroundLayer.
+                    # 90 Pa < 180 Pa → index 0 = 90mb (MLCAPE), index 1 = 180mb (MUCAPE).
+                    result['mucape'] = arr[1].astype(np.float32)
+                    log.info(f'  RAP mucape: stacked shape={arr.shape} → using [1] (180mb layer)')
+                else:
+                    result['mucape'] = arr.astype(np.float32)
+                    log.info(f'  RAP mucape: single layer shape={arr.shape}')
+                log.info(f'  RAP mucape: sample={result["mucape"].flat[0]:.2f}')
+                mucape_found = True
+                break
+        finally:
+            for _ds in _mu_datasets:
+                try: _ds.close()
+                except Exception: pass
+        if not mucape_found:
+            result['mucape'] = None
+            log.warning('  RAP mucape: not found in pressureFromGroundLayer datasets')
+    except Exception as e:
+        log.warning(f'  RAP mucape extraction failed: {e}')
+        result['mucape'] = None
 
     # Force GC immediately after open_datasets — cfgrib holds C-level GRIB handles
     # that the Python reference counter doesn't release until a full collection.

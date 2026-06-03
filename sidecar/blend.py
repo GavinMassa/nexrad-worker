@@ -332,6 +332,8 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None,
     t2m_rap  = interp(rap.get('t2m_rap'),  't2m_rap')
     td2m_rap = interp(rap.get('td2m_rap'), 'td2m_rap')
     cape3k_i = interp(rap.get('cape3k'),   'cape3k')
+    mucape_i = interp(rap.get('mucape'),   'mucape')
+    t700_i   = interp(rap.get('t700'),     't700')
 
     # Interpolate HRRR 0-1km HLCY to RTMA grid (optional — 3km → 2.5km).
     # HRRR uses Lambert Conformal like RAP but at 3km resolution; the same
@@ -436,6 +438,20 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None,
     else:
         log.warning('blend: cape3k skipped (RAP 0-3km CAPE not available)')
 
+    # --- MUCAPE: most unstable parcel CAPE (180-0mb search layer) -----------
+    # No RTMA surface correction — MU parcel is elevated, not surface-based.
+    # Same display gate as SBCAPE (150 J/kg) to suppress noise.
+    MUCAPE_MIN = 150.0
+    if mucape_i is not None:
+        out['mucape'] = np.where(
+            np.maximum(0.0, mucape_i) >= MUCAPE_MIN,
+            np.maximum(0.0, mucape_i), 0.0,
+        ).astype(np.float32)
+        log.info(f'[mucape] max={float(out["mucape"].max()):.0f} J/kg '
+                 f'active={int((out["mucape"] > 0).sum())} cells')
+    else:
+        log.warning('blend: mucape skipped (RAP MUCAPE not available)')
+
     # --- LCL height: log-form approximation using RTMA T/Td ---------------
     # Computed here (before SRH) so z0 can use LCL as the mixed-layer
     # depth proxy, and so STP can reference lcl without recomputing.
@@ -449,6 +465,20 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None,
     _lcl_denom = np.maximum(0.0012 + 0.00012 * _t2m_c, 1e-4)
     lcl = (_t2m_c - _td2m_c) / _lcl_denom   # meters AGL
     out['lcl'] = np.clip(lcl, 0.0, 4000.0).astype(np.float32)
+
+    # --- 0-3km lapse rate: (T_sfc − T_700) / ~3km --------------------------
+    # 700mb ≈ 3000m MSL; using T_sfc (RTMA K) − T_700 (RAP K) as a proxy for
+    # the 0-3km environmental lapse rate. Strong lapse rates (≥7 K/km) combined
+    # with significant SRH indicate a classic tornado setup even when CAPE is
+    # modest. No RTMA thermal correction on T_700 — the sfc T correction
+    # already propagates into sbcape/STP; correcting both would double-count.
+    if t700_i is not None:
+        lr_km = (t2m - t700_i) / 3.0          # K/km, positive = unstable
+        out['lapse3km'] = np.clip(lr_km, 0.0, 12.0).astype(np.float32)
+        log.info(f'[lapse3km] max={float(out["lapse3km"].max()):.1f} K/km '
+                 f'active={int((out["lapse3km"] >= 7.0).sum())} cells ≥7 K/km')
+    else:
+        log.warning('blend: lapse3km skipped (t700 missing)')
 
     # --- 0-1km SRH: exponential-decay RTMA wind correction ---------------
     # Method:
