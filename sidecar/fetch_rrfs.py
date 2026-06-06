@@ -1,19 +1,14 @@
 """
 fetch_rrfs.py — RRFS upper-air fields via HTTP Range requests.
 
-Replaces fetch_rap.py for all upper-air fields.  Never downloads the full
-GRIB2: fetches the small .idx text file, parses byte offsets, then issues
-one HTTP Range request per field.  All fields are fetched concurrently.
+Never downloads a full GRIB2: fetches the small .idx text files, parses
+byte offsets, then issues one HTTP Range request per field.  All fields
+are fetched concurrently.
 
-URL strategy (S3 rrfs_a, valid through ~June 9 2026):
-  GRIB2: https://noaa-rrfs-pds.s3.amazonaws.com/rrfs_a/rrfs_a.{YYYYMMDD}/{HH}/control/
-             rrfs.t{HH}z.prslev.f001.conus.grib2
-  IDX:   same + ".idx"
-
-Post-June-9 NOMADS stub (commented out — uncomment when operational):
-  GRIB2: https://nomads.ncep.noaa.gov/pub/data/nccf/com/rrfs/prod/
-             rrfs.{YYYYMMDD}/{HH}/rrfs.t{HH}z.prslev.3km.f000.conus.grib2
-  IDX:   same + ".idx"
+URL strategy (rrfs_public bucket, f000 products):
+  prslev: https://noaa-rrfs-pds.s3.amazonaws.com/rrfs_public/
+              rrfs.{YYYYMMDD}/{HH}/rrfs.t{HH}z.prslev.3km.f000.conus.grib2
+  twodfd: same prefix / rrfs.t{HH}z.2dfld.3km.f000.conus.grib2
 """
 import asyncio, gc, logging, tempfile
 from pathlib import Path
@@ -23,59 +18,58 @@ import httpx, cfgrib, numpy as np
 
 log = logging.getLogger(__name__)
 
-TMP_DIR     = Path(tempfile.gettempdir()) / 'sidecar-cache'
+TMP_DIR      = Path(tempfile.gettempdir()) / 'sidecar-cache'
 TMP_DIR.mkdir(exist_ok=True)
 COORDS_CACHE = TMP_DIR / 'rrfs_grid_coords.npz'
 
-RRFS_S3_BASE = 'https://noaa-rrfs-pds.s3.amazonaws.com/rrfs_a'
+RRFS_PUBLIC_BASE = 'https://noaa-rrfs-pds.s3.amazonaws.com/rrfs_public'
 
 # RRFS 3km CONUS grid dimensions
 RRFS_NY, RRFS_NX = 1059, 1799
 
-# ── Post-June-9 NOMADS URLs (uncomment when operational) ─────────────────────
-# RRFS_NOMADS_BASE = 'https://nomads.ncep.noaa.gov/pub/data/nccf/com/rrfs/prod'
-#
-# def _rrfs_urls(dt: datetime) -> tuple[str, str]:
-#     ymd = dt.strftime('%Y%m%d'); hh = dt.strftime('%H')
-#     base = (f'{RRFS_NOMADS_BASE}/rrfs.{ymd}/{hh}/'
-#             f'rrfs.t{hh}z.prslev.3km.f000.conus.grib2')
-#     return base, base + '.idx'
-# ─────────────────────────────────────────────────────────────────────────────
 
-def _rrfs_urls(dt: datetime) -> tuple[str, str]:
-    """Return (grib2_url, idx_url) for the S3 rrfs_a f001 product."""
-    ymd = dt.strftime('%Y%m%d')
-    hh  = dt.strftime('%H')
-    base = (f'{RRFS_S3_BASE}/rrfs_a.{ymd}/{hh}/control/'
-            f'rrfs.t{hh}z.prslev.f001.conus.grib2')
-    return base, base + '.idx'
+# ── URL builder ───────────────────────────────────────────────────────────────
+
+def _source_urls(ymd: str, hh: str) -> tuple[str, str, str, str]:
+    """Return (prslev_grib, prslev_idx, twodfd_grib, twodfd_idx) for f000."""
+    base    = f'{RRFS_PUBLIC_BASE}/rrfs.{ymd}/{hh}/'
+    prslev  = base + f'rrfs.t{hh}z.prslev.3km.f000.conus.grib2'
+    twodfd  = base + f'rrfs.t{hh}z.2dfld.3km.f000.conus.grib2'
+    return prslev, prslev + '.idx', twodfd, twodfd + '.idx'
 
 
 # ── Field patterns ────────────────────────────────────────────────────────────
-# Each value is a substring matched against wgrib2 idx lines:
-#   <rec>:<byte_offset>:<d=YYYYMMDDHH>:<VAR>:<LEVEL>:<TYPE>:
+# Each value is a substring matched against wgrib2 idx lines.
 # Patterns include surrounding colons to avoid partial matches.
 
-FIELD_PATTERNS: dict[str, str] = {
-    'cape':   ':CAPE:surface:',
-    'cin':    ':CIN:surface:',
-    'mucape': ':CAPE:180-0 mb above ground:',
-    'cape3k': ':CAPE:0-3000 m above ground:',
-    'srh1':   ':HLCY:1000-0 m above ground:',
-    'ustm':   ':USTM:1000-0 m above ground:',
-    'vstm':   ':VSTM:1000-0 m above ground:',
-    'u500':   ':UGRD:500 mb:',
-    'v500':   ':VGRD:500 mb:',
-    'u850':   ':UGRD:850 mb:',
-    'v850':   ':VGRD:850 mb:',
-    'u925':   ':UGRD:925 mb:',
-    'v925':   ':VGRD:925 mb:',
-    'u950':   ':UGRD:950 mb:',
-    'v950':   ':VGRD:950 mb:',
-    't700':   ':TMP:700 mb:',
-    't925':   ':TMP:925 mb:',
-    'pwat':   ':PWAT:entire atmosphere',  # no trailing colon — suffix varies
-}
+# Pressure-level fields — prslev file
+FIELDS_PRSLEV: list[tuple[str, str]] = [
+    ('u500', ':UGRD:500 mb:'),
+    ('v500', ':VGRD:500 mb:'),
+    ('u850', ':UGRD:850 mb:'),
+    ('v850', ':VGRD:850 mb:'),
+    ('u925', ':UGRD:925 mb:'),
+    ('v925', ':VGRD:925 mb:'),
+    ('u950', ':UGRD:950 mb:'),
+    ('v950', ':VGRD:950 mb:'),
+    ('t700', ':TMP:700 mb:'),
+    ('t925', ':TMP:925 mb:'),
+]
+
+# Surface / derived fields — 2dfld file
+FIELDS_2DFLD: list[tuple[str, str]] = [
+    ('cape',   ':CAPE:surface:'),
+    ('cin',    ':CIN:surface:'),
+    ('mucape', ':CAPE:180-0 mb above ground:'),
+    ('cape3k', ':CAPE:0-3000 m above ground:'),
+    ('srh1',   ':HLCY:1000-0 m above ground:'),
+    ('ustm',   ':USTM:6000-0 m above ground:'),
+    ('vstm',   ':VSTM:6000-0 m above ground:'),
+    ('pwat',   ':PWAT:entire atmosphere (considered as a single layer):'),
+]
+
+# All fields combined (for result initialisation)
+ALL_FIELDS: list[tuple[str, str]] = FIELDS_PRSLEV + FIELDS_2DFLD
 
 # If any of these are absent the whole cycle is skipped.
 CRITICAL_FIELDS = frozenset({
@@ -88,16 +82,14 @@ CRITICAL_FIELDS = frozenset({
 # ── IDX parsing ───────────────────────────────────────────────────────────────
 
 def _parse_idx(idx_text: str,
-               patterns: dict[str, str]) -> dict[str, tuple[int, int | None]]:
+               patterns: list[tuple[str, str]]) -> dict[str, tuple[int, int | None]]:
     """
     Parse wgrib2 .idx text and return {key: (start_byte, end_byte)} for
     each pattern.  end_byte is None for the last record (read to EOF).
 
     Format: <rec>:<byte_offset>:<d=YYYYMMDDHH>:<VAR>:<LEVEL>:<TYPE>:
-    Each pattern is matched as a substring of the full idx line.
     The first matching line wins (handles duplicates gracefully).
     """
-    # Build sorted list of (byte_offset, raw_line)
     records: list[tuple[int, str]] = []
     for line in idx_text.splitlines():
         line = line.strip()
@@ -113,7 +105,7 @@ def _parse_idx(idx_text: str,
     records.sort(key=lambda x: x[0])
 
     result: dict[str, tuple[int, int | None]] = {}
-    for key, pattern in patterns.items():
+    for key, pattern in patterns:
         for i, (offset, line) in enumerate(records):
             if pattern in line:
                 end = records[i + 1][0] - 1 if i + 1 < len(records) else None
@@ -169,7 +161,6 @@ async def _fetch_and_extract(
                 lons     = ds['longitude'].values.astype(np.float32)
 
                 if arr.ndim == 3:
-                    # Log every non-spatial coord so stacking order is auditable.
                     spatial = {'latitude', 'longitude', 'valid_time', 'time', 'step'}
                     for c in ds.coords:
                         if c not in spatial:
@@ -211,8 +202,7 @@ def _get_grid_coords(
     Preference order:
       1. live_lats/live_lons extracted from cfgrib this cycle (most accurate)
       2. Cached .npz from a previous successful cycle
-      3. Linspace approximation (last resort — coarser but correct enough for
-         bilinear interpolation to the RTMA 2.5km grid)
+      3. Linspace approximation (last resort)
     """
     if live_lats is not None and live_lons is not None:
         if live_lats.shape == (RRFS_NY, RRFS_NX):
@@ -248,58 +238,85 @@ async def fetch_rrfs(cycle_dt: datetime) -> dict | None:
     """
     Fetch RRFS upper-air fields for cycle_dt using HTTP Range requests.
 
-    Uses the f001 product so valid_time == cycle_dt.  The run time is
-    therefore cycle_dt − 1h; tries up to 4 hourly runs back if the
-    most recent is not yet available.
+    Uses f000 products (valid_time == run_time).  Tries up to 3 hourly
+    runs back starting from cycle_dt rounded to the hour.
 
     Returns a dict with keys matching the fetch_rap output convention:
       cape, cin, mucape, cape3k, srh1, ustm, vstm,
       u500, v500, u850, v850, u925, v925, u950, v950,
       t700, t925, pwat, lats_rap, lons_rap
 
-    Non-critical fields (mucape, cape3k, ustm, vstm, u950, v950, t925)
-    are set to None rather than aborting the cycle when missing.
-
-    Returns None if no RRFS cycle is available within 4 hours back.
+    Non-critical fields are set to None rather than aborting the cycle.
+    Returns None if no RRFS cycle is available within 3 hours back.
     """
+    # Round cycle_dt to the hour (drop sub-hour resolution)
+    run_base = cycle_dt.replace(minute=0, second=0, microsecond=0)
+
     async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-        for offset in range(4):
-            run_dt    = cycle_dt - timedelta(hours=offset + 1)
+        for offset in range(3):
+            run_dt    = run_base - timedelta(hours=offset)
+            ymd       = run_dt.strftime('%Y%m%d')
+            hh        = run_dt.strftime('%H')
             run_stamp = run_dt.strftime('%Y%m%d_%H')
-            valid_hh  = (run_dt + timedelta(hours=1)).strftime('%H')
 
-            grib_url, idx_url = _rrfs_urls(run_dt)
-            log.info(f'[rrfs] trying run {run_stamp} '
-                     f'(f001 valid at {valid_hh}Z) → {idx_url}')
+            prslev_url, prslev_idx_url, twodfd_url, twodfd_idx_url = (
+                _source_urls(ymd, hh)
+            )
+            log.info(f'[rrfs] trying run {run_stamp} → {prslev_idx_url}')
 
-            # ── Fetch and parse idx ───────────────────────────────────────────
+            # ── Fetch both idx files concurrently ─────────────────────────────
             try:
-                r = await client.get(idx_url)
-                if r.status_code == 404:
-                    log.info(f'[rrfs] {run_stamp}: idx 404 — run not yet posted')
-                    continue
-                r.raise_for_status()
-                idx_text = r.text
+                prslev_r, twodfd_r = await asyncio.gather(
+                    client.get(prslev_idx_url),
+                    client.get(twodfd_idx_url),
+                )
             except Exception as e:
                 log.warning(f'[rrfs] {run_stamp}: idx fetch failed: {e}')
                 continue
 
-            ranges = _parse_idx(idx_text, FIELD_PATTERNS)
-            log.info(f'[rrfs] {run_stamp}: idx parsed — '
-                     f'{len(ranges)}/{len(FIELD_PATTERNS)} fields located')
+            if prslev_r.status_code == 404:
+                log.info(f'[rrfs] {run_stamp}: prslev idx 404 '
+                         f'({prslev_idx_url}) — run not posted')
+                continue
+            if twodfd_r.status_code == 404:
+                log.info(f'[rrfs] {run_stamp}: 2dfld idx 404 '
+                         f'({twodfd_idx_url}) — run not posted')
+                continue
+            try:
+                prslev_r.raise_for_status()
+                twodfd_r.raise_for_status()
+            except Exception as e:
+                log.warning(f'[rrfs] {run_stamp}: idx HTTP error: {e}')
+                continue
 
-            # Bail early if critical fields are missing from the idx itself.
-            missing_critical = CRITICAL_FIELDS - set(ranges.keys())
+            # ── Parse both idx files ──────────────────────────────────────────
+            prslev_ranges = _parse_idx(prslev_r.text, FIELDS_PRSLEV)
+            twodfd_ranges = _parse_idx(twodfd_r.text, FIELDS_2DFLD)
+
+            n_found = len(prslev_ranges) + len(twodfd_ranges)
+            log.info(f'[rrfs] {run_stamp}: idx parsed — '
+                     f'{n_found}/{len(ALL_FIELDS)} fields located '
+                     f'(prslev={len(prslev_ranges)}, 2dfld={len(twodfd_ranges)})')
+
+            # Bail early if critical fields are absent from idx
+            all_ranges = {**prslev_ranges, **twodfd_ranges}
+            missing_critical = CRITICAL_FIELDS - set(all_ranges.keys())
             if missing_critical:
                 log.warning(f'[rrfs] {run_stamp}: critical fields absent from idx: '
                              f'{sorted(missing_critical)} — skipping run')
                 continue
 
-            # ── Concurrent range fetch + extract ─────────────────────────────
-            tasks = [
-                _fetch_and_extract(key, start, end, grib_url, run_stamp, client)
-                for key, (start, end) in ranges.items()
-            ]
+            # ── Concurrent range fetch + extract ──────────────────────────────
+            tasks = []
+            for key, (start, end) in prslev_ranges.items():
+                tasks.append(
+                    _fetch_and_extract(key, start, end, prslev_url, run_stamp, client)
+                )
+            for key, (start, end) in twodfd_ranges.items():
+                tasks.append(
+                    _fetch_and_extract(key, start, end, twodfd_url, run_stamp, client)
+                )
+
             raw_results: list[tuple[str, np.ndarray | None,
                                     np.ndarray | None, np.ndarray | None]] = (
                 await asyncio.gather(*tasks)
@@ -313,11 +330,11 @@ async def fetch_rrfs(cycle_dt: datetime) -> dict | None:
                 if live_lats is None and lats is not None:
                     live_lats, live_lons = lats, lons
 
-            # Fields requested but absent from idx → ensure None in dict
-            for key in FIELD_PATTERNS:
+            # Fields not found in idx → ensure None in dict
+            for key, _ in ALL_FIELDS:
                 data.setdefault(key, None)
 
-            # Check critical fields
+            # Check critical fields extracted successfully
             failed_critical = [k for k in CRITICAL_FIELDS if data.get(k) is None]
             if failed_critical:
                 log.warning(f'[rrfs] {run_stamp}: critical fields failed extraction: '
@@ -332,8 +349,8 @@ async def fetch_rrfs(cycle_dt: datetime) -> dict | None:
             n_loaded = sum(1 for k, v in data.items()
                            if k not in ('lats_rap', 'lons_rap') and v is not None)
             log.info(f'[rrfs] {run_stamp}: OK — '
-                     f'{n_loaded}/{len(FIELD_PATTERNS)} fields loaded')
+                     f'{n_loaded}/{len(ALL_FIELDS)} fields loaded')
             return data
 
-    log.warning('[rrfs] no RRFS cycle available within 4 hours back')
+    log.warning('[rrfs] no RRFS cycle available within 3 hours back')
     return None
