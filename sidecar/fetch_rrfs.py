@@ -31,10 +31,10 @@ RRFS_NY, RRFS_NX = 1059, 1799
 # ── URL builder ───────────────────────────────────────────────────────────────
 
 def _source_urls(ymd: str, hh: str) -> tuple[str, str, str, str]:
-    """Return (prslev_grib, prslev_idx, twodfd_grib, twodfd_idx) for f000."""
+    """Return (prslev_grib, prslev_idx, twodfd_grib, twodfd_idx)."""
     base    = f'{RRFS_PUBLIC_BASE}/rrfs.{ymd}/{hh}/'
     prslev  = base + f'rrfs.t{hh}z.prslev.3km.f000.conus.grib2'
-    twodfd  = base + f'rrfs.t{hh}z.2dfld.3km.f000.conus.grib2'
+    twodfd  = base + f'rrfs.t{hh}z.2dfld.3km.subh.f001.conus.grib2'
     return prslev, prslev + '.idx', twodfd, twodfd + '.idx'
 
 
@@ -247,13 +247,13 @@ async def fetch_rrfs(cycle_dt: datetime) -> dict | None:
       t700, t925, pwat, lats_rap, lons_rap
 
     Non-critical fields are set to None rather than aborting the cycle.
-    Returns None if no RRFS cycle is available within 3 hours back.
+    Returns None if no RRFS cycle is available within 12 hours back.
     """
     # Round cycle_dt to the hour (drop sub-hour resolution)
     run_base = cycle_dt.replace(minute=0, second=0, microsecond=0)
 
     async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-        for offset in range(3):
+        for offset in range(12):
             run_dt    = run_base - timedelta(hours=offset)
             ymd       = run_dt.strftime('%Y%m%d')
             hh        = run_dt.strftime('%H')
@@ -352,5 +352,5 @@ async def fetch_rrfs(cycle_dt: datetime) -> dict | None:
                      f'{n_loaded}/{len(ALL_FIELDS)} fields loaded')
             return data
 
-    log.warning('[rrfs] no RRFS cycle available within 3 hours back')
+    log.warning('[rrfs] no RRFS cycle available within 12 hours back')
     return None
