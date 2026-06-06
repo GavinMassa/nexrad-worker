@@ -270,6 +270,24 @@ def compute_baci(
     return baci_out
 
 
+def _rtma_scale_factor(lats_deg: np.ndarray) -> np.ndarray:
+    """
+    Lambert Conformal Conic map scale factor for the RTMA 2.5km grid.
+    RTMA LCC parameters: lon0=-95°, lat0=25°, lat1=25°, lat2=25° (single SP).
+    m(lat) = cos(lat1) / cos(lat) * (tan(π/4 + lat/2) / tan(π/4 + lat1/2))^n
+    where n = sin(lat1) for a tangent cone (lat1=lat2).
+    Returns array same shape as lats_deg. Values ~0.86 at 50°N, ~1.0 at 25°N.
+    """
+    lat1_rad = np.radians(25.0)   # RTMA standard parallel
+    n = np.sin(lat1_rad)           # cone constant for tangent LCC
+    lat_rad = np.radians(lats_deg)
+    # Ratio of map distances at lat vs. standard parallel
+    scale = (np.cos(lat1_rad) / np.cos(lat_rad)) * \
+            (np.tan(np.pi / 4 + lat_rad / 2) /
+             np.tan(np.pi / 4 + lat1_rad / 2)) ** n
+    return scale.astype(np.float32)
+
+
 def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
           hrrr_hlcy: dict | None = None) -> dict:
     """
@@ -423,6 +441,19 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
             log.warning('blend: sbcin has no thermal correction (t2m_rap missing)')
     else:
         log.warning('blend: sbcin skipped (cin missing)')
+
+    # Physical consistency: a parcel cannot carry significant CAPE through
+    # an unbreakable cap. If SBCIN is pegged at the -300 J/kg clamp AND
+    # corrected SBCAPE is positive, the linear correction has produced an
+    # inconsistent state — zero out SBCAPE for those gridpoints.
+    if 'sbcin' in out and 'sbcape' in out:
+        hard_capped = (out['sbcin'] <= -299.0)
+        inconsistent = hard_capped & (out['sbcape'] > 0.0)
+        if inconsistent.any():
+            n_zeroed = int(inconsistent.sum())
+            out['sbcape'] = np.where(inconsistent, 0.0, out['sbcape']).astype(np.float32)
+            log.info(f'[sbcape] capped {n_zeroed} cells where CIN=-300 clamp '
+                     f'produced CAPE/CIN inconsistency')
 
     # --- 0-3km CAPE: low-level buoyancy from RAP lev_0-3000_m layer ------
     # No RTMA correction applied — the layer-mean CAPE is not sensitive to the
@@ -675,10 +706,17 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
     v10_smooth = gaussian_filter(v10.astype(np.float64), sigma=1.5).astype(np.float32)
 
     # numpy.gradient on 2D array returns [d/dy, d/dx] for axis 0 and 1.
-    du_dy = np.gradient(u10_smooth, RTMA_DY, axis=0)
-    du_dx = np.gradient(u10_smooth, RTMA_DX, axis=1)
-    dv_dy = np.gradient(v10_smooth, RTMA_DY, axis=0)
-    dv_dx = np.gradient(v10_smooth, RTMA_DX, axis=1)
+    # Compute once per cycle — shape matches RTMA grid (1597, 2345)
+    m = _rtma_scale_factor(rtma_lats)
+
+    # True physical spacing accounts for LCC map scale factor:
+    # actual_dx(i,j) = RTMA_DX / m(i,j)
+    # np.gradient with variable spacing requires 1D coordinate arrays,
+    # so we apply the correction post-hoc by dividing by m.
+    du_dy = np.gradient(u10_smooth, RTMA_DY, axis=0) * m
+    du_dx = np.gradient(u10_smooth, RTMA_DX, axis=1) * m
+    dv_dy = np.gradient(v10_smooth, RTMA_DY, axis=0) * m
+    dv_dx = np.gradient(v10_smooth, RTMA_DX, axis=1) * m
 
     # Scale to 10^-5 s^-1 (standard operational vorticity units).
     # Raw values at 2.5km grid are ~1e-4 s^-1 for strong fronts;
@@ -697,6 +735,8 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
              f'active={int((out["vort"] > 0).sum())} cells')
     log.info(f'conv: max={float(out["conv"].max()):.1f}×10⁻⁵ s⁻¹ '
              f'active={int((out["conv"] > 0).sum())} cells')
+    log.info(f'[vort/conv] LCC scale factor applied: '
+             f'min={float(m.min()):.3f} max={float(m.max()):.3f}')
 
     # --- Td depression: T - Td (K) ---------------------------------------
     # Lower values = more moist; useful as a dryline proxy.
