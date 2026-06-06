@@ -6,6 +6,7 @@ from datetime import datetime, timezone, timedelta
 from scipy.ndimage import zoom as ndimage_zoom
 from fetch_rtma import fetch_rtma
 from fetch_rap import fetch_rap, fetch_hrrr_hlcy
+from fetch_rrfs import fetch_rrfs
 from fetch_tpw import fetch_latest_tpw
 from mesonet import fetch_mesonet_obs, compute_correction
 from blend import blend as do_blend
@@ -189,25 +190,34 @@ async def run_cycle():
         return
     async with _cycle_lock:
         try:
-            rtma_task = asyncio.create_task(fetch_rtma(now))
-            rap_task  = asyncio.create_task(fetch_rap(now))
-            tpw_task  = asyncio.create_task(fetch_latest_tpw(now))
-            hrrr_task = fetch_hrrr_hlcy(now)
-            rtma, rap, tpw_data, hrrr_hlcy = await asyncio.gather(
-                rtma_task, rap_task, tpw_task, hrrr_task
+            # Run RRFS in parallel with RTMA/TPW/HRRR — no added latency when
+            # RRFS succeeds. RAP fallback is only awaited when RRFS returns None.
+            rtma_task  = asyncio.create_task(fetch_rtma(now))
+            rrfs_task  = asyncio.create_task(fetch_rrfs(now))
+            tpw_task   = asyncio.create_task(fetch_latest_tpw(now))
+            hrrr_task  = fetch_hrrr_hlcy(now)
+            rtma, rrfs_result, tpw_data, hrrr_hlcy = await asyncio.gather(
+                rtma_task, rrfs_task, tpw_task, hrrr_task
             )
             if hrrr_hlcy is not None:
                 log.info(f'[hrrr] hlcy available: shape={hrrr_hlcy["hlcy"].shape} '
                          f'max={float(hrrr_hlcy["hlcy"].max()):.0f}')
             else:
-                log.info('[hrrr] hlcy not available this cycle — using RAP+RTMA only')
+                log.info('[hrrr] hlcy not available this cycle — using RRFS+RTMA only')
+
+            if rrfs_result is not None:
+                upper_air = rrfs_result
+                log.info('[pipeline] using RRFS upper-air fields')
+            else:
+                log.warning('[pipeline] RRFS unavailable — falling back to RAP')
+                upper_air = await fetch_rap(now)
+
+            if upper_air is None:
+                log.error('[pipeline] both RRFS and RAP failed — skipping cycle')
+                return
 
             if rtma is None:
                 log.warning('RTMA fetch returned None — skipping cycle')
-                return
-            if rap is None:
-                log.warning('RAP fetch returned None — writing RTMA-only output')
-                write_output(rtma, now)
                 return
 
             FACTOR = 0.5
@@ -299,13 +309,13 @@ async def run_cycle():
             # tpw_data is passed as third positional arg; blend() defaults to
             # None if not available so this is safe when TPW fetch failed.
             blended = await loop.run_in_executor(
-                _thread_pool, do_blend, rtma, rap, tpw_data, hrrr_hlcy
+                _thread_pool, do_blend, rtma, upper_air, tpw_data, hrrr_hlcy
             )
             write_output(blended, now)
 
             # Explicit cleanup — cfgrib/xarray leave internal references that
             # prevent the GC from collecting large numpy arrays promptly.
-            del rtma, rap, tpw_data, blended
+            del rtma, upper_air, tpw_data, blended
             try:
                 import cfgrib.messages
                 cfgrib.messages.EMPTY_HEADER_ERRORS.clear()
