@@ -34,7 +34,7 @@ def _source_urls(ymd: str, hh: str) -> tuple[str, str, str, str]:
     """Return (prslev_grib, prslev_idx, twodfd_grib, twodfd_idx)."""
     base    = f'{RRFS_PUBLIC_BASE}/rrfs.{ymd}/{hh}/'
     prslev  = base + f'rrfs.t{hh}z.prslev.3km.f000.conus.grib2'
-    twodfd  = base + f'rrfs.t{hh}z.2dfld.3km.subh.f001.conus.grib2'
+    twodfd  = base + f'rrfs.t{hh}z.2dfld.3km.f000.conus.grib2'
     return prslev, prslev + '.idx', twodfd, twodfd + '.idx'
 
 
