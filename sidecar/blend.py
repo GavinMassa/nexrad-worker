@@ -270,18 +270,19 @@ def compute_baci(
     return baci_out
 
 
-def blend(rtma: dict, rap: dict, tpw_data: dict | None = None,
+def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
           hrrr_hlcy: dict | None = None) -> dict:
     """
-    Blend RTMA 2.5km surface fields with RAP 13km upper-air fields.
+    Blend RTMA 2.5km surface fields with upper-air model fields.
 
-    rtma:      output of fetch_rtma   — t2m, td2m, u10, v10, lats, lons
-    rap:       output of fetch_rap    — cape, cin, srh1, u500, v500, u850, v850,
-                                        u10, v10, t2m_rap, td2m_rap, lats_rap, lons_rap
-    tpw_data:  output of fetch_tpw    — tpw, lats, lons (float32 2D arrays); or None
-    hrrr_hlcy: output of fetch_hrrr_hlcy — hlcy, lats, lons (float32 2D arrays); or None
-               HRRR 0-1km SRH at native 3km resolution; used as second backstop
-               in the SRH blend. Failure to provide this does not abort the blend.
+    rtma:       output of fetch_rtma    — t2m, td2m, u10, v10, lats, lons
+    upper_air:  output of fetch_rrfs (or fetch_rap) — cape, cin, srh1,
+                u500, v500, u850, v850, u925, v925, u950, v950,
+                ustm, vstm, mucape, cape3k, t700, t925, pwat, lats_rap, lons_rap
+    tpw_data:   output of fetch_tpw    — tpw, lats, lons (float32 2D arrays); or None
+    hrrr_hlcy:  output of fetch_hrrr_hlcy — hlcy, lats, lons (float32 2D arrays); or None
+                HRRR 0-1km SRH at native 3km resolution; used as second backstop
+                in the SRH blend. Failure to provide this does not abort the blend.
 
     Returns dict of float32 grids on the RTMA 2.5km grid, plus lats/lons.
     Missing inputs produce a warning and the dependent params are omitted
@@ -289,8 +290,8 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None,
     """
     rtma_lats = rtma['lats']    # (1597, 2345)
     rtma_lons = rtma['lons']    # (1597, 2345)
-    rap_lats  = rap['lats_rap']
-    rap_lons  = rap['lons_rap']
+    rap_lats  = upper_air['lats_rap']
+    rap_lons  = upper_air['lons_rap']
 
     def interp(field, name):
         """Interpolate one RAP field; return None and warn on failure."""
@@ -313,27 +314,27 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None,
              f'monotonic={bool(np.all(np.diff(_lons_1d) > 0) or np.all(np.diff(_lons_1d) < 0))}')
     log.info(f'[blend] RTMA lats: min={rtma_lats.min():.2f} max={rtma_lats.max():.2f}')
     log.info(f'[blend] RTMA lons: min={rtma_lons.min():.2f} max={rtma_lons.max():.2f}')
-    log.info('Interpolating RAP fields to RTMA 2.5km grid...')
-    cape_i   = interp(rap.get('cape'),     'cape')
-    cin_i    = interp(rap.get('cin'),      'cin')
-    srh1_i   = interp(rap.get('srh1'),     'srh1')
-    u500_i   = interp(rap.get('u500'),     'u500')
-    v500_i   = interp(rap.get('v500'),     'v500')
-    u850_i   = interp(rap.get('u850'),     'u850')
-    v850_i   = interp(rap.get('v850'),     'v850')
-    u10_rap  = interp(rap.get('u10'),      'u10_rap')
-    v10_rap  = interp(rap.get('v10'),      'v10_rap')
-    u925_i   = interp(rap.get('u925'),     'u925')
-    v925_i   = interp(rap.get('v925'),     'v925')
-    u950_i   = interp(rap.get('u950'),     'u950')
-    v950_i   = interp(rap.get('v950'),     'v950')
-    ustm_i   = interp(rap.get('ustm'),     'ustm')
-    vstm_i   = interp(rap.get('vstm'),     'vstm')
-    t2m_rap  = interp(rap.get('t2m_rap'),  't2m_rap')
-    td2m_rap = interp(rap.get('td2m_rap'), 'td2m_rap')
-    cape3k_i = interp(rap.get('cape3k'),   'cape3k')
-    mucape_i = interp(rap.get('mucape'),   'mucape')
-    t700_i   = interp(rap.get('t700'),     't700')
+    log.info('Interpolating upper-air fields to RTMA 2.5km grid...')
+    cape_i   = interp(upper_air.get('cape'),     'cape')
+    cin_i    = interp(upper_air.get('cin'),      'cin')
+    srh1_i   = interp(upper_air.get('srh1'),     'srh1')
+    u500_i   = interp(upper_air.get('u500'),     'u500')
+    v500_i   = interp(upper_air.get('v500'),     'v500')
+    u850_i   = interp(upper_air.get('u850'),     'u850')
+    v850_i   = interp(upper_air.get('v850'),     'v850')
+    u10_rap  = interp(upper_air.get('u10'),      'u10_rap')
+    v10_rap  = interp(upper_air.get('v10'),      'v10_rap')
+    u925_i   = interp(upper_air.get('u925'),     'u925')
+    v925_i   = interp(upper_air.get('v925'),     'v925')
+    u950_i   = interp(upper_air.get('u950'),     'u950')
+    v950_i   = interp(upper_air.get('v950'),     'v950')
+    ustm_i   = interp(upper_air.get('ustm'),     'ustm')
+    vstm_i   = interp(upper_air.get('vstm'),     'vstm')
+    t2m_rap  = interp(upper_air.get('t2m_rap'),  't2m_rap')
+    td2m_rap = interp(upper_air.get('td2m_rap'), 'td2m_rap')
+    cape3k_i = interp(upper_air.get('cape3k'),   'cape3k')
+    mucape_i = interp(upper_air.get('mucape'),   'mucape')
+    t700_i   = interp(upper_air.get('t700'),     't700')
 
     # Interpolate HRRR 0-1km HLCY to RTMA grid (optional — 3km → 2.5km).
     # HRRR uses Lambert Conformal like RAP but at 3km resolution; the same
@@ -550,34 +551,34 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None,
                      f'raw_max={float(srh_rtma.max()):.0f}')
 
         if hrrr_srh_i is not None and srh1_i is not None:
-            # 3-way blend: RTMA-corrected 40%, HRRR 3km native 40%, RAP 13km 20%.
-            # HRRR captures mesoscale SRH gradients near boundaries better than
-            # RAP (3km vs 13km); the RTMA component adds the surface wind
-            # correction that neither model has below 3km resolution.
-            out['srh1'] = (0.4 * srh_rtma +
+            # 3-way blend: RTMA-corrected 30%, HRRR 3km native 40%, RRFS 13km 30%.
+            # HRRR captures mesoscale SRH gradients near boundaries best (3km);
+            # RRFS improves on RAP in the mesoscale with hourly DA cycling;
+            # RTMA adds the surface wind correction below 3km model resolution.
+            out['srh1'] = (0.3 * srh_rtma +
                            0.4 * hrrr_srh_i +
-                           0.2 * srh1_i).astype(np.float32)
-            log.info(f'[srh1] 3-way blend (RTMA 40% + HRRR 40% + RAP 20%): '
+                           0.3 * srh1_i).astype(np.float32)
+            log.info(f'[srh1] 3-way blend (RTMA 30% + HRRR 40% + RRFS 30%): '
                      f'max={float(out["srh1"].max()):.0f} '
                      f'rtma_max={float(srh_rtma.max()):.0f} '
                      f'hrrr_max={float(hrrr_srh_i.max()):.0f} '
-                     f'rap_max={float(srh1_i.max()):.0f}')
+                     f'rrfs_max={float(srh1_i.max()):.0f}')
 
         elif hrrr_srh_i is not None:
-            # HRRR available but no RAP HLCY: 50/50 RTMA + HRRR
+            # HRRR available but no RRFS HLCY: 50/50 RTMA + HRRR
             out['srh1'] = (0.5 * srh_rtma + 0.5 * hrrr_srh_i).astype(np.float32)
-            log.info(f'[srh1] RTMA+HRRR (no RAP HLCY): '
+            log.info(f'[srh1] RTMA+HRRR (no RRFS HLCY): '
                      f'max={float(out["srh1"].max()):.0f} '
                      f'rtma_max={float(srh_rtma.max()):.0f} '
                      f'hrrr_max={float(hrrr_srh_i.max()):.0f}')
 
         elif srh1_i is not None:
-            # No HRRR: original 50/50 RTMA + RAP
+            # No HRRR: 50/50 RTMA + RRFS
             out['srh1'] = (0.5 * srh_rtma + 0.5 * srh1_i).astype(np.float32)
-            log.info(f'[srh1] 50/50 blend RTMA+RAP (HRRR unavailable): '
+            log.info(f'[srh1] 50/50 blend RTMA+RRFS (HRRR unavailable): '
                      f'max={float(out["srh1"].max()):.0f} '
                      f'rtma_max={float(srh_rtma.max()):.0f} '
-                     f'rap_max={float(srh1_i.max()):.0f}')
+                     f'rrfs_max={float(srh1_i.max()):.0f}')
 
         else:
             # Fallback: RTMA-only
@@ -587,13 +588,13 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None,
 
     elif hrrr_srh_i is not None and srh1_i is not None:
         out['srh1'] = (0.5 * hrrr_srh_i + 0.5 * srh1_i).astype(np.float32)
-        log.warning('[srh1] HRRR+RAP blend (no RTMA correction — ustm/vstm missing)')
+        log.warning('[srh1] HRRR+RRFS blend (no RTMA correction — ustm/vstm missing)')
     elif hrrr_srh_i is not None:
         out['srh1'] = hrrr_srh_i
-        log.warning('[srh1] HRRR-only (no RTMA correction, no RAP HLCY)')
+        log.warning('[srh1] HRRR-only (no RTMA correction, no RRFS HLCY)')
     elif srh1_i is not None:
         out['srh1'] = srh1_i
-        log.warning('[srh1] RAP-only (ustm/vstm missing, HRRR unavailable)')
+        log.warning('[srh1] RRFS-only (ustm/vstm missing, HRRR unavailable)')
     else:
         log.warning('blend: srh1 skipped (all SRH sources missing)')
 
@@ -697,55 +698,10 @@ def blend(rtma: dict, rap: dict, tpw_data: dict | None = None,
     log.info(f'conv: max={float(out["conv"].max()):.1f}×10⁻⁵ s⁻¹ '
              f'active={int((out["conv"] > 0).sum())} cells')
 
-    # --- SRV: Streamwise horizontal vorticity from 0-1km wind shear ------
-    # Horizontal vorticity vector (from vertical wind shear, 10m → 850mb):
-    #   ωx = −∂v/∂z ≈ −(v850 − v10) / 1500m
-    #   ωy =  ∂u/∂z ≈  (u850 − u10) / 1500m
-    # Streamwise component = projection onto storm-relative wind direction:
-    #   SRV = (ωx·u_sr + ωy·v_sr) / |SR_wind|
-    # Physical interpretation: positive SRV → horizontal vorticity tilts
-    # into vertical rotation by the updraft (Rasmussen & Davies-Jones 1982).
-    # Scale: output in 10^-3 s^-1; strong environments yield 5–20.
-    # Uses u10_smooth/v10_smooth (already computed above for vort/conv).
-    if (u850_i is not None and v850_i is not None and
-            ustm_i is not None and vstm_i is not None):
-        # Horizontal vorticity from 10m → 850mb layer (Δz ≈ 1500m)
-        omega_x = -(v850_i - v10_smooth) / 1500.0   # s⁻¹
-        omega_y =  (u850_i - u10_smooth) / 1500.0   # s⁻¹
-
-        # Storm-relative wind at surface (unit vector)
-        u_sr   = u10_smooth - ustm_i
-        v_sr   = v10_smooth - vstm_i
-        sr_spd = np.maximum(np.sqrt(u_sr**2 + v_sr**2), 1e-3)
-
-        # Streamwise projection
-        srv_raw = (omega_x * u_sr + omega_y * v_sr) / sr_spd   # s⁻¹
-
-        # Keep only positive (cyclonically favoured) values.
-        # SRV from vertical wind shear (10m→850mb, Δz≈1500m) is inherently
-        # ~100× larger than surface relative vorticity from horizontal gradients.
-        # Scale by 1e3 → display values in ×10⁻³ s⁻¹; strong environments
-        # yield 5–20, fitting the 0–30 iOS range. The legend label reflects this.
-        SRV_SCALE = 1e3
-        srv_scaled = np.maximum(0.0, srv_raw) * SRV_SCALE
-        out['srv'] = np.where(srv_scaled >= 2.0, srv_scaled, 0.0).astype(np.float32)
-        log.info(f'[srv] max={float(out["srv"].max()):.1f}×10⁻³ s⁻¹ '
-                 f'active={int((out["srv"] > 0).sum())} cells')
-    else:
-        log.warning('blend: srv skipped (u850/v850 or ustm/vstm missing)')
-
     # --- Td depression: T - Td (K) ---------------------------------------
     # Lower values = more moist; useful as a dryline proxy.
     # Uses TPW-corrected td2m if tpw_data was provided above.
     out['td_dep'] = (t2m - td2m).astype(np.float32)
-
-    # --- BACI: Bay Area Convection Index --------------------------------
-    # Regional parameter — non-zero only within lat 36.5–38.5, lon -123 to -120.
-    out['baci'] = compute_baci(
-        rtma=rtma, rap=rap,
-        rap_lats=rap_lats, rap_lons=rap_lons,
-        rtma_lats=rtma_lats, rtma_lons=rtma_lons,
-    )
 
     # Pass grid coordinates through for writer.py bbox calculation
     out['lats'] = rtma_lats
