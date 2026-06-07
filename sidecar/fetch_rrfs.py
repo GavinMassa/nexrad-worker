@@ -232,13 +232,39 @@ def _get_grid_coords(
     return lats_2d, lons_2d
 
 
+# ── Run completeness check ───────────────────────────────────────────────────
+
+async def _run_is_complete(
+    client: httpx.AsyncClient, ymd: str, hh: str
+) -> bool:
+    """
+    HEAD-check all 4 required RRFS files concurrently.
+    Returns True only if every file returns HTTP 200.
+    Uses HEAD (headers only) so no data is transferred.
+    """
+    prslev_url, prslev_idx_url, twodfd_url, twodfd_idx_url = _source_urls(ymd, hh)
+    urls = [prslev_url, prslev_idx_url, twodfd_url, twodfd_idx_url]
+    try:
+        responses = await asyncio.gather(
+            *[client.head(url, timeout=10.0) for url in urls]
+        )
+        for r, url in zip(responses, urls):
+            if r.status_code != 200:
+                log.info(f'[rrfs] HEAD {r.status_code}: {url}')
+                return False
+        return True
+    except Exception as e:
+        log.warning(f'[rrfs] HEAD check failed: {e}')
+        return False
+
+
 # ── Public entry point ────────────────────────────────────────────────────────
 
 async def fetch_rrfs(cycle_dt: datetime) -> dict | None:
     """
     Fetch RRFS upper-air fields for cycle_dt using HTTP Range requests.
 
-    Uses f000 products (valid_time == run_time).  Tries up to 3 hourly
+    Uses f000 products (valid_time == run_time).  Tries up to 5 hourly
     runs back starting from cycle_dt rounded to the hour.
 
     Returns a dict with keys matching the fetch_rap output convention:
@@ -247,22 +273,30 @@ async def fetch_rrfs(cycle_dt: datetime) -> dict | None:
       t700, t925, pwat, lats_rap, lons_rap
 
     Non-critical fields are set to None rather than aborting the cycle.
-    Returns None if no RRFS cycle is available within 12 hours back.
+    Returns None if no RRFS cycle is available within 5 hours back.
     """
     # Round cycle_dt to the hour (drop sub-hour resolution)
     run_base = cycle_dt.replace(minute=0, second=0, microsecond=0)
 
     async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-        for offset in range(12):
+        for offset in range(5):
             run_dt    = run_base - timedelta(hours=offset)
             ymd       = run_dt.strftime('%Y%m%d')
             hh        = run_dt.strftime('%H')
             run_stamp = run_dt.strftime('%Y%m%d_%H')
 
+            log.info(f'[rrfs] checking run {run_stamp} (offset -{offset}h)')
+
+            # ── HEAD-check all 4 required files before committing to downloads ──
+            if not await _run_is_complete(client, ymd, hh):
+                log.info(f'[rrfs] {run_stamp}: incomplete — skipping')
+                continue
+
+            log.info(f'[rrfs] {run_stamp}: all 4 files present — fetching idx')
+
             prslev_url, prslev_idx_url, twodfd_url, twodfd_idx_url = (
                 _source_urls(ymd, hh)
             )
-            log.info(f'[rrfs] trying run {run_stamp} → {prslev_idx_url}')
 
             # ── Fetch both idx files concurrently ─────────────────────────────
             try:
@@ -274,14 +308,6 @@ async def fetch_rrfs(cycle_dt: datetime) -> dict | None:
                 log.warning(f'[rrfs] {run_stamp}: idx fetch failed: {e}')
                 continue
 
-            if prslev_r.status_code == 404:
-                log.info(f'[rrfs] {run_stamp}: prslev idx 404 '
-                         f'({prslev_idx_url}) — run not posted')
-                continue
-            if twodfd_r.status_code == 404:
-                log.info(f'[rrfs] {run_stamp}: 2dfld idx 404 '
-                         f'({twodfd_idx_url}) — run not posted')
-                continue
             try:
                 prslev_r.raise_for_status()
                 twodfd_r.raise_for_status()
@@ -349,8 +375,9 @@ async def fetch_rrfs(cycle_dt: datetime) -> dict | None:
             n_loaded = sum(1 for k, v in data.items()
                            if k not in ('lats_rap', 'lons_rap') and v is not None)
             log.info(f'[rrfs] {run_stamp}: OK — '
-                     f'{n_loaded}/{len(ALL_FIELDS)} fields loaded')
+                     f'{n_loaded}/{len(ALL_FIELDS)} fields loaded; '
+                     f'using offset -{offset}h from {run_base.strftime("%Hz")}')
             return data
 
-    log.warning('[rrfs] no RRFS cycle available within 12 hours back')
+    log.warning('[rrfs] no RRFS cycle available within 5 hours back')
     return None
