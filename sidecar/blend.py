@@ -408,7 +408,7 @@ def compute_cape_cin_lifted(
     def _upscale(coarse: np.ndarray) -> np.ndarray:
         f = RegularGridInterpolator(
             (rows.astype(np.float64), cols.astype(np.float64)), coarse,
-            method='linear', bounds_error=False, fill_value=None,   # extrapolate tail
+            method='linear', bounds_error=False, fill_value=0.0,   # clamp edge to 0 (no extrapolation)
         )
         RR, CC = np.meshgrid(np.arange(ny, dtype=np.float64),
                              np.arange(nx, dtype=np.float64), indexing='ij')
