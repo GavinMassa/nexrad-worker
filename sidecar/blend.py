@@ -486,7 +486,7 @@ def compute_cape_cin_lifted(
             buoy_r  = (Tv_p_cur  - Tv_e_cur)  / np.maximum(Tv_e_cur,  150.0)
             p_prev_safe = np.maximum(p_prev, 1.0) if isinstance(p_prev, np.ndarray) else max(p_prev, 1.0)
             p_cur_safe  = float(p_cur) if not isinstance(p_cur, np.ndarray) else np.maximum(p_cur, 1.0)
-            dA      = -Rd * (buoy_l + buoy_r) / 2.0 * np.log(p_prev_safe / p_cur_safe)
+            dA      = Rd * (buoy_l + buoy_r) / 2.0 * np.log(p_prev_safe / p_cur_safe)
             # Note: dp < 0 for ascending; ln(p_prev/p_cur) > 0 so dA sign is correct.
             # LFC: transition from negative to positive buoyancy.
             # Track per-gridpoint whether we've found the LFC yet.
