@@ -479,8 +479,8 @@ def compute_cape_cin_lifted(
             # CAPE/CIN = ∫ g (Tv_p - Tv_e)/Tv_e dz
             #          = ∫ -Rd (Tv_p - Tv_e)/1 d(ln p)   [via hypsometric]
             dp_     = p_cur - p_prev           # negative (ascending)
-            buoy_l  = (Tv_p_prev - Tv_e_prev) / Tv_e_prev
-            buoy_r  = (Tv_p_cur  - Tv_e_cur)  / Tv_e_cur
+            buoy_l  = (Tv_p_prev - Tv_e_prev) / np.maximum(Tv_e_prev, 150.0)
+            buoy_r  = (Tv_p_cur  - Tv_e_cur)  / np.maximum(Tv_e_cur,  150.0)
             dA      = -Rd * (buoy_l + buoy_r) / 2.0 * np.log(p_prev / p_cur)
             # Note: dp < 0 for ascending; ln(p_prev/p_cur) > 0 so dA sign is correct.
             cape = cape + np.where(dA > 0, dA,  0.0)
@@ -657,7 +657,8 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
         (500.0, t500_i, td500_i),
     ]
     lift_levels = [(p, T, Td) for p, T, Td in lift_levels
-                   if T is not None and Td is not None]
+                   if T is not None and Td is not None
+                   and float(np.nanmax(T)) > 150.0]   # exclude zero-filled out-of-domain grids
 
     SBCAPE_MIN = 150.0   # J/kg — display gate
 
