@@ -355,12 +355,20 @@ def compute_cape_cin_lifted(
     Td_stack = np.stack([td2m_c] + [np.clip(lv[2], 150.0, 325.0).astype(np.float32)
                                     for lv in valid_levels], axis=0)
 
+    # Raw (unclipped) upper-air T at coarse positions — used to detect fill
+    # values at the RRFS domain edge.  The clip above promotes 0 K fill to
+    # exactly 150 K, so we must check raw values (fill = 0.0 from
+    # RegularGridInterpolator) before they are clamped.
+    T_raw_upper = np.stack([lv[1].astype(np.float32) for lv in valid_levels], axis=0)
+
     # ── Coarse sampling positions ─────────────────────────────────────────────
     rows = np.arange(0, ny, COARSE_STEP)
     cols = np.arange(0, nx, COARSE_STEP)
     cny, cnx = rows.size, cols.size
     Tc  = T_stack[:, rows][:, :, cols].reshape(n_lev, -1)    # (n_lev, cny*cnx)
     Tdc = Td_stack[:, rows][:, :, cols].reshape(n_lev, -1)
+    # Raw upper-air sample (unclipped) — shape (n_lev-1, cny*cnx)
+    Tc_raw = T_raw_upper[:, rows][:, :, cols].reshape(len(valid_levels), -1)
 
     ml_p_top = P_SFC - ml_depth_mb
     ml_mask  = p_levels >= ml_p_top
@@ -377,10 +385,12 @@ def compute_cape_cin_lifted(
             T_col  = Tc[:, idx]
             Td_col = Tdc[:, idx]
             # Skip out-of-domain points: surface T invalid OR any upper-air
-            # level is zero-filled (RRFS domain edge — RTMA extends further).
+            # level is fill-valued at the RRFS domain edge (RTMA extends further).
+            # Must check raw (unclipped) values — np.clip(0→150) made the
+            # clipped stack useless for fill detection.
             if T_col[0] < 220.0 or T_col[0] > 330.0:
                 continue
-            if np.any(T_col[1:] < 150.0):   # upper levels zero-filled
+            if np.any(Tc_raw[:, idx] < 100.0):   # 0 K fill, pre-clip
                 continue
             try:
                 T_u  = T_col  * mpunits.kelvin
