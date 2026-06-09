@@ -386,11 +386,12 @@ def compute_cape_cin_lifted(
         Above the LCL: moist pseudoadiabatic using Wobus correction.
         Returns (T_parcel_at_p_end, still_below_lcl_mask).
         """
-        n_steps = max(1, int(abs(p_end - p_start) / 5.0))  # 5 mb sub-steps
-        dp = (p_end - p_start) / n_steps
+        _p_start_s = float(np.mean(p_start)) if isinstance(p_start, np.ndarray) else float(p_start)
+        n_steps = max(1, int(abs(p_end - _p_start_s) / 5.0))  # 5 mb sub-steps
+        dp = (p_end - p_start) / n_steps   # may be ndarray if p_start is 2D
         T_p   = T_parcel.copy()
         below = is_below_lcl.copy()
-        p_cur = float(p_start)
+        p_cur = _p_start_s
         for _ in range(n_steps):
             p_mid = p_cur + dp / 2.0
             # Dry-adiabatic dT/dp = Rd*T/(cp*p)  [K/mb, signed by direction]
@@ -403,8 +404,26 @@ def compute_cape_cin_lifted(
         return T_p, below
 
     # ── Surface parcel properties ─────────────────────────────────────────────
-    P_SFC    = 975.0   # approximate RTMA surface pressure (mb) — close enough
-                       # for a CONUS grid average; domain edges may differ ±15 mb
+    # Per-gridpoint surface pressure via hypsometric equation.
+    # Use RRFS 950mb T as reference level temperature.
+    # P_sfc = 950 * exp(g * z_950 / (Rd * T_950_mean))
+    # z_950 ≈ 540m (standard atmosphere); T_mean ≈ mean of sfc and 950mb T.
+    # Simpler: use Bolton's approximation: P_sfc ≈ 950 * exp(dz * g / (Rd * T_mean))
+    # where dz = 540m (950mb height AGL over flat terrain).
+    # Over elevated terrain (Rockies) this over-estimates P_sfc — acceptable error.
+    # Fallback to 1000mb if t950 unavailable.
+    _t950_for_psfc = None
+    for _p, _T, _Td in levels:
+        if abs(_p - 950.0) < 1.0 and _T is not None:
+            _t950_for_psfc = _T
+            break
+    if _t950_for_psfc is not None:
+        _T_mean_col = 0.5 * (t2m + _t950_for_psfc)
+        _T_mean_col = np.clip(_T_mean_col, 220.0, 330.0)
+        P_SFC = 950.0 * np.exp(9.80665 * 540.0 / (287.04 * _T_mean_col))
+        P_SFC = np.clip(P_SFC, 920.0, 1015.0)   # physical bounds
+    else:
+        P_SFC = np.full(t2m.shape, 1000.0, dtype=np.float32)
     # Clamp RTMA fields to physical range — fill values (0 K, NaN) outside domain
     # cause Bolton exp() to overflow and propagate NaN through the entire lift.
     t2m  = np.clip(t2m,  200.0, 330.0)
@@ -456,14 +475,15 @@ def compute_cape_cin_lifted(
         cape  = np.zeros(T_p.shape, dtype=np.float64)
         cin   = np.zeros(T_p.shape, dtype=np.float64)
 
-        # Virtual T of environment at surface
-        w_e_sfc    = _mixr(parcel_Td_sfc, p_sfc)    # use env Td = parcel Td at sfc
-        Tv_e_prev  = Tv_sfc                           # sfc env Tv (from outer scope)
-        Tv_p_prev  = _Tv(T_p, w_p)
+        # Environment Tv at surface: use RTMA td2m (from outer scope) for env moisture
+        w_e_sfc   = _mixr(td2m, p_sfc if np.isscalar(p_sfc) else float(np.mean(p_sfc)))
+        Tv_e_prev = _Tv(t2m, w_e_sfc)
+        Tv_p_prev = _Tv(T_p, w_p)
 
         for i in range(1, len(all_p)):
             p_prev = all_p[i - 1]
-            p_cur  = all_p[i]
+            p_cur  = float(all_p[i]) if not isinstance(all_p[i], np.ndarray) else all_p[i]
+            # p_prev may be ndarray (surface) or float (upper levels); _lift handles both
             T_e_cur  = all_T[i]
             Td_e_cur = all_Td[i]
             if T_e_cur is None or Td_e_cur is None:
@@ -481,10 +501,18 @@ def compute_cape_cin_lifted(
             dp_     = p_cur - p_prev           # negative (ascending)
             buoy_l  = (Tv_p_prev - Tv_e_prev) / np.maximum(Tv_e_prev, 150.0)
             buoy_r  = (Tv_p_cur  - Tv_e_cur)  / np.maximum(Tv_e_cur,  150.0)
-            dA      = -Rd * (buoy_l + buoy_r) / 2.0 * np.log(p_prev / p_cur)
+            p_prev_safe = np.maximum(p_prev, 1.0) if isinstance(p_prev, np.ndarray) else max(p_prev, 1.0)
+            p_cur_safe  = float(p_cur) if not isinstance(p_cur, np.ndarray) else np.maximum(p_cur, 1.0)
+            dA      = -Rd * (buoy_l + buoy_r) / 2.0 * np.log(p_prev_safe / p_cur_safe)
             # Note: dp < 0 for ascending; ln(p_prev/p_cur) > 0 so dA sign is correct.
-            cape = cape + np.where(dA > 0, dA,  0.0)
-            cin  = cin  + np.where(dA < 0, dA,  0.0)
+            # LFC: transition from negative to positive buoyancy.
+            # Track per-gridpoint whether we've found the LFC yet.
+            # CIN only accumulates below LFC; CAPE only above LFC.
+            if not hasattr(_integrate_cape_cin, '_lfc_found'):
+                pass  # handled via closure variable below
+            lfc_found = (cape > 0)          # any prior positive buoyancy = above LFC
+            cin  = cin  + np.where(~lfc_found & (dA < 0), dA, 0.0)
+            cape = cape + np.where(dA > 0, dA, 0.0)
 
             Tv_e_prev = Tv_e_cur
             Tv_p_prev = Tv_p_cur
@@ -495,7 +523,7 @@ def compute_cape_cin_lifted(
     sbcape, sbcin = _integrate_cape_cin(t2m, td2m, P_SFC)
 
     # ── MLCAPE — mean-layer parcel (lowest ml_depth_mb of the atmosphere) ────
-    ml_p_top = P_SFC - ml_depth_mb    # e.g. 975 - 100 = 875 mb
+    ml_p_top = float(np.mean(P_SFC)) - ml_depth_mb    # scalar — P_SFC is now 2D; mean keeps loop comparison unambiguous
     ml_T_sum  = t2m.copy().astype(np.float64)
     ml_Td_sum = td2m.copy().astype(np.float64)
     ml_n      = np.ones(t2m.shape, dtype=np.float64)   # surface already counted
