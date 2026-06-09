@@ -376,8 +376,11 @@ def compute_cape_cin_lifted(
         for idx in range(cny * cnx):
             T_col  = Tc[:, idx]
             Td_col = Tdc[:, idx]
-            # Skip clearly bad columns (fill values, out-of-domain).
+            # Skip out-of-domain points: surface T invalid OR any upper-air
+            # level is zero-filled (RRFS domain edge — RTMA extends further).
             if T_col[0] < 220.0 or T_col[0] > 330.0:
+                continue
+            if np.any(T_col[1:] < 150.0):   # upper levels zero-filled
                 continue
             try:
                 T_u  = T_col  * mpunits.kelvin
