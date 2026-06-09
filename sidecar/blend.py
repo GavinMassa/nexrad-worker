@@ -404,32 +404,15 @@ def compute_cape_cin_lifted(
         return T_p, below
 
     # ── Surface parcel properties ─────────────────────────────────────────────
-    # Per-gridpoint surface pressure via hypsometric equation.
-    # Use RRFS 950mb T as reference level temperature.
-    # P_sfc = 950 * exp(g * z_950 / (Rd * T_950_mean))
-    # z_950 ≈ 540m (standard atmosphere); T_mean ≈ mean of sfc and 950mb T.
-    # Simpler: use Bolton's approximation: P_sfc ≈ 950 * exp(dz * g / (Rd * T_mean))
-    # where dz = 540m (950mb height AGL over flat terrain).
-    # Over elevated terrain (Rockies) this over-estimates P_sfc — acceptable error.
-    # Fallback to 1000mb if t950 unavailable.
-    _t950_for_psfc = None
-    for _p, _T, _Td in levels:
-        if abs(_p - 950.0) < 1.0 and _T is not None:
-            _t950_for_psfc = _T
-            break
-    if _t950_for_psfc is not None:
-        _T_mean_col = 0.5 * (t2m + _t950_for_psfc)
-        _T_mean_col = np.clip(_T_mean_col, 220.0, 330.0)
-        P_SFC = 950.0 * np.exp(9.80665 * 540.0 / (287.04 * _T_mean_col))
-        P_SFC = np.clip(P_SFC, 920.0, 1015.0)   # physical bounds
-    else:
-        P_SFC = np.full(t2m.shape, 1000.0, dtype=np.float32)
-    # Clamp RTMA fields to physical range — fill values (0 K, NaN) outside domain
-    # cause Bolton exp() to overflow and propagate NaN through the entire lift.
+    # Surface pressure: use 1000mb as CONUS mean sea-level equivalent.
+    # 975mb was too low — it placed the parcel origin 25mb above the actual
+    # surface on the central plains (~300m MSL), causing the dry-adiabatic
+    # cooling to overshoot the cap and never find the LFC.
+    P_SFC    = 1000.0
     t2m  = np.clip(t2m,  200.0, 330.0)
     td2m = np.clip(td2m, 180.0, 320.0)
-    w_sfc    = _mixr(td2m, P_SFC)          # surface mixing ratio
-    Tv_sfc   = _Tv(t2m, w_sfc)            # surface virtual temperature
+    w_sfc    = _mixr(td2m, P_SFC)
+    Tv_sfc   = _Tv(t2m, w_sfc)
 
     # Bolton (1980) LCL temperature and pressure
     # T_lcl = 1 / (1/(Td-56) + ln(T/Td)/800) + 56   (all in K)
@@ -707,6 +690,9 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
         log.info(f'[sbcin] lifted-parcel: min={float(out["sbcin"].min()):.0f} J/kg')
         log.info(f'[mlcape] lifted-parcel: max={float(out["mlcape_lifted"].max()):.0f} '
                  f'active={int((out["mlcape_lifted"] > 0).sum())} cells')
+        log.info(f'[cape_diag] t2m_sample={float(t2m.flat[t2m.size//2]):.1f}K '
+                 f'td2m_sample={float(td2m.flat[td2m.size//2]):.1f}K '
+                 f'mucape_ref={float(mucape_i.max()) if mucape_i is not None else "N/A":.0f}')
     else:
         # Fallback: fewer than 2 upper-air levels — use old linear correction
         log.warning('[sbcape] fewer than 2 RRFS pressure levels — falling back to '
