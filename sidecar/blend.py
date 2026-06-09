@@ -478,21 +478,21 @@ def compute_cape_cin_lifted(
             Tv_e_cur = _Tv(T_e_cur, w_e_cur)
             Tv_p_cur = _Tv(T_p, w_p)
 
-            # Trapezoidal buoyancy integral: dZ ≈ -Rd·Tv_e/g · dp/p
-            # CAPE/CIN = ∫ g (Tv_p - Tv_e)/Tv_e dz
-            #          = ∫ -Rd (Tv_p - Tv_e)/1 d(ln p)   [via hypsometric]
-            dp_     = p_cur - p_prev           # negative (ascending)
-            buoy_l  = (Tv_p_prev - Tv_e_prev) / np.maximum(Tv_e_prev, 150.0)
-            buoy_r  = (Tv_p_cur  - Tv_e_cur)  / np.maximum(Tv_e_cur,  150.0)
+            # Trapezoidal buoyancy integral via hypsometric equation:
+            #   CAPE/CIN = ∫ g·(Tv_p - Tv_e)/Tv_e · dz
+            #   dz = -(Rd/g)·Tv_e · d(ln p)              [hypsometric]
+            # Substituting:
+            #   CAPE/CIN = ∫ g·(Tv_p - Tv_e)/Tv_e · (-(Rd/g)·Tv_e) · d(ln p)
+            #            = ∫ -Rd·(Tv_p - Tv_e) · d(ln p)
+            #            = Rd·(Tv_p - Tv_e) · ln(p_prev/p_cur)   [trapezoidal, ascending]
+            # The Tv_e denominators cancel — use raw ΔTv (K), not the dimensionless ratio.
+            # Using the ratio (Tv_p-Tv_e)/Tv_e would produce values ~270× too small.
+            dT_l    = Tv_p_prev - Tv_e_prev   # virtual-temperature difference (K)
+            dT_r    = Tv_p_cur  - Tv_e_cur
             p_prev_safe = np.maximum(p_prev, 1.0) if isinstance(p_prev, np.ndarray) else max(p_prev, 1.0)
             p_cur_safe  = float(p_cur) if not isinstance(p_cur, np.ndarray) else np.maximum(p_cur, 1.0)
-            dA      = Rd * (buoy_l + buoy_r) / 2.0 * np.log(p_prev_safe / p_cur_safe)
-            # Note: dp < 0 for ascending; ln(p_prev/p_cur) > 0 so dA sign is correct.
-            # LFC: transition from negative to positive buoyancy.
-            # Track per-gridpoint whether we've found the LFC yet.
-            # CIN only accumulates below LFC; CAPE only above LFC.
-            if not hasattr(_integrate_cape_cin, '_lfc_found'):
-                pass  # handled via closure variable below
+            dA      = Rd * (dT_l + dT_r) / 2.0 * np.log(p_prev_safe / p_cur_safe)
+            # ln(p_prev/p_cur) > 0 (ascending); dA > 0 when parcel warmer than env.
             lfc_found = (cape > 0)          # any prior positive buoyancy = above LFC
             cin  = cin  + np.where(~lfc_found & (dA < 0), dA, 0.0)
             cape = cape + np.where(dA > 0, dA, 0.0)
@@ -685,11 +685,13 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
         out['mlcape_lifted'] = np.where(
             mlcape_lifted >= SBCAPE_MIN, mlcape_lifted, 0.0
         ).astype(np.float32)
-        log.info(f'[sbcape] lifted-parcel: max={float(out["sbcape"].max()):.0f} '
-                 f'active={int((out["sbcape"] > 0).sum())} cells')
+        log.info(f'[sbcape] lifted-parcel: raw_max={float(raw_sbcape.max()):.0f} '
+                 f'gated_max={float(out["sbcape"].max()):.0f} '
+                 f'active={int((out["sbcape"] > 0).sum())} cells '
+                 f'(gate={SBCAPE_MIN:.0f} J/kg)')
         log.info(f'[sbcin] lifted-parcel: min={float(out["sbcin"].min()):.0f} J/kg')
-        log.info(f'[mlcape] lifted-parcel: max={float(out["mlcape_lifted"].max()):.0f} '
-                 f'active={int((out["mlcape_lifted"] > 0).sum())} cells')
+        log.info(f'[mlcape] lifted-parcel: raw_max={float(np.maximum(0.0, mlcape_lifted).max()):.0f} '
+                 f'gated_max={float(out["mlcape_lifted"].max()):.0f}')
         log.info(f'[cape_diag] t2m_sample={float(t2m.flat[t2m.size//2]):.1f}K '
                  f'td2m_sample={float(td2m.flat[td2m.size//2]):.1f}K '
                  f'mucape_ref={float(mucape_i.max()) if mucape_i is not None else "N/A":.0f}')
