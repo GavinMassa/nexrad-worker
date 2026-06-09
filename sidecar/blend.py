@@ -319,15 +319,14 @@ def compute_cape_cin_lifted(
 
     # ── Scalar helpers (operate element-wise on arrays) ───────────────────────
     def _es(T_K: np.ndarray) -> np.ndarray:
-        """Saturation vapour pressure (Pa) via Bolton (1980)."""
+        """Saturation vapour pressure (hPa) via Bolton (1980)."""
         tc = T_K - 273.15
-        return 611.2 * np.exp(17.67 * tc / (tc + 243.5))
+        return 6.112 * np.exp(17.67 * tc / (tc + 243.5))
 
     def _mixr(Td_K: np.ndarray, p_mb: float) -> np.ndarray:
-        """Mixing ratio (kg/kg) from dewpoint (K) and pressure (mb)."""
-        e = _es(Td_K)
-        p_pa = p_mb * 100.0
-        return eps * e / np.maximum(p_pa - e, 1.0)
+        """Mixing ratio (kg/kg) from dewpoint (K) and pressure (mb/hPa)."""
+        e = _es(Td_K)          # hPa
+        return eps * e / np.maximum(p_mb - e, 1.0)
 
     def _Tv(T_K: np.ndarray, w: np.ndarray) -> np.ndarray:
         """Virtual temperature (K)."""
@@ -367,11 +366,11 @@ def compute_cape_cin_lifted(
         dT/dp for a saturated (moist) adiabat (K/mb).
         Positive => temperature increases with pressure (downward).
         """
-        es_val = _es(T_K)
-        w_s    = eps * es_val / np.maximum(p_mb * 100.0 - es_val, 1.0)
-        numer  = (Rd * T_K / (p_mb * 100.0)) * (1.0 + Lv * w_s / (Rd * T_K))
+        es_val = _es(T_K)                                           # hPa
+        w_s    = eps * es_val / np.maximum(p_mb - es_val, 1.0)    # p in hPa, matches es
+        numer  = (Rd * T_K / (p_mb * 100.0)) * (1.0 + Lv * w_s / (Rd * T_K))  # p in Pa
         denom  = cp + Lv**2 * w_s / (Rv * T_K**2)
-        return numer / denom * 100.0   # convert Pa→mb denominator
+        return numer / denom * 100.0   # K/Pa → K/mb
 
     def _lift_parcel_to_level(
         T_parcel:    np.ndarray,
