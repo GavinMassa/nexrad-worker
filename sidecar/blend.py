@@ -2,6 +2,15 @@ import logging
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
 
+import warnings as _warnings
+# MetPy is used for parcel lift / CAPE / CIN — matches SPC NSHARP methodology.
+# Suppress the pint UnitStrippedWarning that fires on every array operation
+# when we detach units for numpy interop.
+with _warnings.catch_warnings():
+    _warnings.simplefilter('ignore')
+    import metpy.calc as mpcalc
+    from metpy.units import units as mpunits
+
 log = logging.getLogger(__name__)
 
 # Approximate grid spacing for RTMA 2.5km — used for gradient fields (m)
@@ -290,236 +299,132 @@ def _rtma_scale_factor(lats_deg: np.ndarray) -> np.ndarray:
 
 def compute_cape_cin_lifted(
     t2m:    np.ndarray,   # RTMA 2m temperature (K), shape (ny, nx)
-    td2m:   np.ndarray,   # RTMA 2m dewpoint (K), TPW-corrected, shape (ny, nx)
-    levels: list,         # list of (p_mb: float, T: np.ndarray|None, Td: np.ndarray|None)
-                          #   sorted descending by pressure (lowest altitude last)
-                          #   e.g. [(950, t950_i, td950_i), (925, ...), ...]
+    td2m:   np.ndarray,   # RTMA 2m dewpoint (K), TPW+Mesonet corrected, shape (ny, nx)
+    levels: list,         # [(p_mb, T_K_grid, Td_K_grid), ...] descending pressure
     ml_depth_mb: float = 100.0,   # mixed-layer averaging depth (mb) for MLCAPE
 ) -> tuple:
     """
-    Compute SBCAPE, SBCIN, and MLCAPE via pseudoadiabatic parcel lift.
+    Compute SBCAPE, SBCIN, and MLCAPE using MetPy's parcel lift.
 
-    Surface parcel: RTMA t2m / td2m (obs-anchored).
-    Upper profile:  RRFS pressure-level T and Td fields (already interpolated
-                    to the RTMA 2.5km grid).
-    Integration:    trapezoidal rule on virtual-temperature buoyancy.
+    Methodology matches SPC NSHARP / SFCOA:
+      - Surface parcel: RTMA T2m / corrected Td2m (obs-anchored)
+      - Upper profile:  RRFS pressure-level T and Td
+      - Parcel lift:    MetPy pseudoadiabatic with virtual-temperature correction
+      - SBCAPE/SBCIN:   surface-based parcel
+      - MLCAPE:         mean-layer parcel (lowest ml_depth_mb)
 
-    Returns (sbcape, sbcin, mlcape) — each shape (ny, nx), dtype float32,
-    non-negative for CAPE, non-positive for CIN (clipped to -300 J/kg).
+    Performance: MetPy's parcel_profile/cape_cin are 1D-sounding APIs costing
+    ~10 ms per gridpoint (SB+ML). The full RTMA grid (3.74M pts) would take
+    ~10 h/cycle, so we run MetPy on a coarsened grid (stride COARSE_STEP) and
+    bilinearly interpolate the result back to full resolution. CAPE is a smooth
+    field and the output is later downsampled+blurred, so the ~25 km effective
+    resolution is visually indistinguishable (SPC mesoanalysis itself is 40 km).
+
+    Returns (sbcape, sbcin, mlcape) — each float32 (ny, nx), CAPE >= 0, CIN <= 0.
     """
-    from scipy.ndimage import gaussian_filter  # noqa: F401 (imported for consistency)
+    import warnings as _w
 
-    # ── Physical constants ────────────────────────────────────────────────────
-    Rd   = 287.04    # J/(kg·K)  dry air gas constant
-    Rv   = 461.5     # J/(kg·K)  water vapour gas constant
-    g    = 9.80665   # m/s²
-    Lv   = 2.501e6   # J/kg      latent heat of vaporisation (0°C)
-    cp   = 1005.7    # J/(kg·K)  specific heat of dry air at const pressure
-    eps  = Rd / Rv   # ≈ 0.622
+    ny, nx = t2m.shape
 
-    # ── Scalar helpers (operate element-wise on arrays) ───────────────────────
-    def _es(T_K: np.ndarray) -> np.ndarray:
-        """Saturation vapour pressure (hPa) via Bolton (1980)."""
-        tc = np.clip(T_K - 273.15, -80.0, 60.0)   # clamp: -80°C avoids exp overflow, 60°C physical max
-        return 6.112 * np.exp(17.67 * tc / (tc + 243.5))
+    # ── Coarsening factor ─────────────────────────────────────────────────────
+    # step=10 → ~160×235 ≈ 37k soundings ≈ 6 min upper bound (high-CAPE points
+    # are the slow case; ocean / no-CAPE points return faster). Effective grid
+    # spacing 2.5 km × 10 = 25 km.
+    COARSE_STEP = 10
 
-    def _mixr(Td_K: np.ndarray, p_mb: float) -> np.ndarray:
-        """Mixing ratio (kg/kg) from dewpoint (K) and pressure (mb/hPa)."""
-        e = _es(Td_K)          # hPa
-        return eps * e / np.maximum(p_mb - e, 1.0)
+    P_SFC = 1000.0
 
-    def _Tv(T_K: np.ndarray, w: np.ndarray) -> np.ndarray:
-        """Virtual temperature (K)."""
-        return T_K * (1.0 + w / eps) / (1.0 + w)
+    # Keep only usable levels (drop None / zero-filled out-of-domain grids).
+    valid_levels = [(p, T, Td) for p, T, Td in levels
+                    if T is not None and Td is not None
+                    and float(np.nanmax(np.abs(T))) > 10.0]
+    if len(valid_levels) < 2:
+        log.warning('[cape] fewer than 2 valid upper-air levels — returning zeros')
+        zero = np.zeros((ny, nx), dtype=np.float32)
+        return zero, zero, zero
 
-    def _wobus(T_K: np.ndarray) -> np.ndarray:
-        """
-        Wobus polynomial: moist-adiabatic lapse rate correction (K).
-        Based on Wobus (1966) as implemented in NSHARP/SHARPpy.
-        Input: temperature (K).
-        """
-        tc = T_K - 273.15
-        x  = tc - 20.0
-        # Two polynomial segments joined at x = 0 (tc = 20 °C)
-        pol1 = (((((((( 2.0103e-9  * x) +
-                        (-1.6665e-7) ) * x +
-                        5.8464e-6  ) * x +
-                       -7.3765e-5  ) * x +
-                       4.8534e-4   ) * x +
-                      -2.9407e-3   ) * x +
-                       1.8060e-2   ) * x +
-                      -7.6617e-2   ) * x + \
-                      -7.8581e-3
-        pol2 = ((((((((-1.5966e-9  * x) +
-                        1.5422e-7   ) * x +
-                       -2.2530e-6  ) * x +
-                       -1.2978e-5  ) * x +
-                       1.5542e-4   ) * x +
-                      -6.3523e-4   ) * x +
-                       1.8927e-2   ) * x +
-                       1.5705e-1   ) * x + \
-                      -7.8581e-3
-        return np.where(x >= 0, pol1, pol2)
+    # Pressure profile (mb): surface first, then upper levels (descending p).
+    p_levels = np.array([P_SFC] + [lv[0] for lv in valid_levels], dtype=np.float32)
+    n_lev    = len(p_levels)
 
-    def _moist_adiabat_dT(T_K: np.ndarray, p_mb: float) -> np.ndarray:
-        """
-        dT/dp for a saturated (moist) adiabat (K/mb).
-        Positive => temperature increases with pressure (downward).
-        """
-        es_val = _es(T_K)                                           # hPa
-        w_s    = eps * es_val / np.maximum(p_mb - es_val, 1.0)    # p in hPa, matches es
-        numer  = (Rd * T_K / (p_mb * 100.0)) * (1.0 + Lv * w_s / (Rd * T_K))  # p in Pa
-        denom  = cp + Lv**2 * w_s / (Rv * T_K**2)
-        return numer / denom * 100.0   # K/Pa → K/mb
+    # Full-resolution clamped stacks (n_lev, ny, nx).
+    t2m_c  = np.clip(t2m,  200.0, 340.0).astype(np.float32)
+    td2m_c = np.clip(td2m, 180.0, 325.0).astype(np.float32)
+    T_stack  = np.stack([t2m_c]  + [np.clip(lv[1], 150.0, 340.0).astype(np.float32)
+                                    for lv in valid_levels], axis=0)
+    Td_stack = np.stack([td2m_c] + [np.clip(lv[2], 150.0, 325.0).astype(np.float32)
+                                    for lv in valid_levels], axis=0)
 
-    def _lift_parcel_to_level(
-        T_parcel:    np.ndarray,
-        w_parcel:    np.ndarray,   # mixing ratio at LCL (kg/kg), constant above
-        p_start:     float,
-        p_end:       float,
-        is_below_lcl: np.ndarray,  # bool mask: still dry adiabatic lift?
-        lcl_p:       np.ndarray,   # LCL pressure (mb), per gridpoint
-    ) -> tuple:
-        """
-        Lift a parcel from p_start to p_end using small finite steps.
-        Below the LCL: dry adiabatic (Γd = g/cp = 9.77 K/km).
-        Above the LCL: moist pseudoadiabatic using Wobus correction.
-        Returns (T_parcel_at_p_end, still_below_lcl_mask).
-        """
-        _p_start_s = float(np.mean(p_start)) if isinstance(p_start, np.ndarray) else float(p_start)
-        n_steps = max(1, int(abs(p_end - _p_start_s) / 5.0))  # 5 mb sub-steps
-        dp = (p_end - p_start) / n_steps   # may be ndarray if p_start is 2D
-        T_p   = T_parcel.copy()
-        below = is_below_lcl.copy()
-        p_cur = _p_start_s
-        for _ in range(n_steps):
-            p_mid = p_cur + dp / 2.0
-            # Dry-adiabatic dT/dp = Rd*T/(cp*p)  [K/mb, signed by direction]
-            dT_dry  = (Rd / cp) * T_p / p_mid * dp
-            # Moist-adiabatic step
-            dT_moist = _moist_adiabat_dT(T_p, p_mid) * dp
-            T_p   = np.where(below, T_p + dT_dry, T_p + dT_moist)
-            p_cur = p_cur + dp
-            below = below & (p_cur > lcl_p)  # cross LCL during this step?
-        return T_p, below
+    # ── Coarse sampling positions ─────────────────────────────────────────────
+    rows = np.arange(0, ny, COARSE_STEP)
+    cols = np.arange(0, nx, COARSE_STEP)
+    cny, cnx = rows.size, cols.size
+    Tc  = T_stack[:, rows][:, :, cols].reshape(n_lev, -1)    # (n_lev, cny*cnx)
+    Tdc = Td_stack[:, rows][:, :, cols].reshape(n_lev, -1)
 
-    # ── Surface parcel properties ─────────────────────────────────────────────
-    # Surface pressure: use 1000mb as CONUS mean sea-level equivalent.
-    # 975mb was too low — it placed the parcel origin 25mb above the actual
-    # surface on the central plains (~300m MSL), causing the dry-adiabatic
-    # cooling to overshoot the cap and never find the LFC.
-    P_SFC    = 1000.0
-    t2m  = np.clip(t2m,  200.0, 330.0)
-    td2m = np.clip(td2m, 180.0, 320.0)
-    w_sfc    = _mixr(td2m, P_SFC)
-    Tv_sfc   = _Tv(t2m, w_sfc)
+    ml_p_top = P_SFC - ml_depth_mb
+    ml_mask  = p_levels >= ml_p_top
 
-    # Bolton (1980) LCL temperature and pressure
-    # T_lcl = 1 / (1/(Td-56) + ln(T/Td)/800) + 56   (all in K)
-    lcl_T = 1.0 / (1.0 / np.maximum(td2m - 56.0, 0.5) +
-                   np.log(np.maximum(t2m / np.maximum(td2m, 200.0), 1.0)) / 800.0
-                   ) + 56.0
-    lcl_p = P_SFC * (lcl_T / t2m) ** (cp / Rd)  # Poisson: p_lcl / p_sfc
+    cap_c = np.zeros(cny * cnx, dtype=np.float32)
+    cin_c = np.zeros(cny * cnx, dtype=np.float32)
+    mlc_c = np.zeros(cny * cnx, dtype=np.float32)
 
-    # ── Build combined level arrays (surface + upper-air) ────────────────────
-    # levels is sorted descending in pressure (highest p first),
-    # e.g. [(950, t950_i, td950_i), (925,...), (850,...), (700,...), (500,...)]
-    # Prepend surface so integration starts from there.
-    all_p  = [P_SFC] + [lv[0] for lv in levels]
-    all_T  = [t2m]   + [lv[1] for lv in levels]
-    all_Td = [td2m]  + [lv[2] for lv in levels]
+    n_fail = 0
+    with _w.catch_warnings():
+        _w.simplefilter('ignore')   # suppress pint UnitStrippedWarning
+        p_u = p_levels * mpunits.hPa
+        for idx in range(cny * cnx):
+            T_col  = Tc[:, idx]
+            Td_col = Tdc[:, idx]
+            # Skip clearly bad columns (fill values, out-of-domain).
+            if T_col[0] < 220.0 or T_col[0] > 330.0:
+                continue
+            try:
+                T_u  = T_col  * mpunits.kelvin
+                Td_u = Td_col * mpunits.kelvin
 
-    # ── Inner integration function ────────────────────────────────────────────
-    def _integrate_cape_cin(
-        parcel_T_sfc:  np.ndarray,   # parcel T at surface (K)
-        parcel_Td_sfc: np.ndarray,   # parcel Td at surface (K)
-        p_sfc:         float,
-    ) -> tuple:
-        """
-        Lift the parcel defined by (parcel_T_sfc, parcel_Td_sfc) from p_sfc
-        through all_p/all_T/all_Td and integrate CAPE / CIN.
-        Returns (cape_arr, cin_arr) — shape (ny, nx), float32.
-        """
-        w_p    = _mixr(parcel_Td_sfc, p_sfc)
-        lcl_p_ = p_sfc * (_lift_parcel_to_level.__defaults__[0] if False
-                           else (1.0 / np.maximum(parcel_Td_sfc - 56.0, 0.5) +
-                                 np.log(np.maximum(parcel_T_sfc /
-                                                   np.maximum(parcel_Td_sfc, 200.0), 1.0)
-                                        ) / 800.0) ** -1 + 56.0)
-        # Cleaner: just recompute LCL pressure for this parcel
-        lcl_T_ = 1.0 / (1.0 / np.maximum(parcel_Td_sfc - 56.0, 0.5) +
-                         np.log(np.maximum(parcel_T_sfc /
-                                           np.maximum(parcel_Td_sfc, 200.0), 1.0)
-                                ) / 800.0) + 56.0
-        lcl_p_ = p_sfc * (lcl_T_ / parcel_T_sfc) ** (cp / Rd)
+                # Surface-based parcel
+                sb_prof = mpcalc.parcel_profile(p_u, T_u[0], Td_u[0])
+                sb_cape, sb_cin = mpcalc.cape_cin(p_u, T_u, Td_u, sb_prof)
+                cap_c[idx] = float(sb_cape.magnitude)
+                cin_c[idx] = float(sb_cin.magnitude)
 
-        T_p   = parcel_T_sfc.copy()
-        below = np.ones(T_p.shape, dtype=bool)      # all below LCL initially
-        cape  = np.zeros(T_p.shape, dtype=np.float64)
-        cin   = np.zeros(T_p.shape, dtype=np.float64)
+                # Mean-layer parcel (lowest ml_depth_mb)
+                ml_T  = float(np.mean(T_col[ml_mask]))  * mpunits.kelvin
+                ml_Td = float(np.mean(Td_col[ml_mask])) * mpunits.kelvin
+                ml_prof = mpcalc.parcel_profile(p_u, ml_T, ml_Td)
+                ml_cape, _ = mpcalc.cape_cin(p_u, T_u, Td_u, ml_prof)
+                mlc_c[idx] = float(ml_cape.magnitude)
+            except Exception:
+                # MetPy's lfc/el can raise on degenerate soundings — leave 0.
+                n_fail += 1
 
-        # Environment Tv at surface: use RTMA td2m (from outer scope) for env moisture
-        w_e_sfc   = _mixr(td2m, p_sfc if np.isscalar(p_sfc) else float(np.mean(p_sfc)))
-        Tv_e_prev = _Tv(t2m, w_e_sfc)
-        Tv_p_prev = _Tv(T_p, w_p)
+    # MetPy can emit NaN/inf CAPE; scrub before interpolation.
+    cap_c = np.nan_to_num(cap_c, nan=0.0, posinf=0.0, neginf=0.0).reshape(cny, cnx)
+    cin_c = np.nan_to_num(cin_c, nan=0.0, posinf=0.0, neginf=0.0).reshape(cny, cnx)
+    mlc_c = np.nan_to_num(mlc_c, nan=0.0, posinf=0.0, neginf=0.0).reshape(cny, cnx)
 
-        for i in range(1, len(all_p)):
-            p_prev = all_p[i - 1]
-            p_cur  = float(all_p[i]) if not isinstance(all_p[i], np.ndarray) else all_p[i]
-            # p_prev may be ndarray (surface) or float (upper levels); _lift handles both
-            T_e_cur  = all_T[i]
-            Td_e_cur = all_Td[i]
-            if T_e_cur is None or Td_e_cur is None:
-                continue                              # skip missing levels
-            # Lift parcel from previous level to current
-            T_p, below = _lift_parcel_to_level(T_p, w_p, p_prev, p_cur,
-                                                below, lcl_p_)
-            w_e_cur  = _mixr(Td_e_cur, p_cur)
-            Tv_e_cur = _Tv(T_e_cur, w_e_cur)
-            Tv_p_cur = _Tv(T_p, w_p)
+    # ── Interpolate coarse result back to full RTMA resolution ────────────────
+    def _upscale(coarse: np.ndarray) -> np.ndarray:
+        f = RegularGridInterpolator(
+            (rows.astype(np.float64), cols.astype(np.float64)), coarse,
+            method='linear', bounds_error=False, fill_value=None,   # extrapolate tail
+        )
+        RR, CC = np.meshgrid(np.arange(ny, dtype=np.float64),
+                             np.arange(nx, dtype=np.float64), indexing='ij')
+        return f((RR, CC)).astype(np.float32)
 
-            # Trapezoidal buoyancy integral via hypsometric equation:
-            #   CAPE/CIN = ∫ g·(Tv_p - Tv_e)/Tv_e · dz
-            #   dz = -(Rd/g)·Tv_e · d(ln p)              [hypsometric]
-            # Substituting:
-            #   CAPE/CIN = ∫ g·(Tv_p - Tv_e)/Tv_e · (-(Rd/g)·Tv_e) · d(ln p)
-            #            = ∫ -Rd·(Tv_p - Tv_e) · d(ln p)
-            #            = Rd·(Tv_p - Tv_e) · ln(p_prev/p_cur)   [trapezoidal, ascending]
-            # The Tv_e denominators cancel — use raw ΔTv (K), not the dimensionless ratio.
-            # Using the ratio (Tv_p-Tv_e)/Tv_e would produce values ~270× too small.
-            dT_l    = Tv_p_prev - Tv_e_prev   # virtual-temperature difference (K)
-            dT_r    = Tv_p_cur  - Tv_e_cur
-            p_prev_safe = np.maximum(p_prev, 1.0) if isinstance(p_prev, np.ndarray) else max(p_prev, 1.0)
-            p_cur_safe  = float(p_cur) if not isinstance(p_cur, np.ndarray) else np.maximum(p_cur, 1.0)
-            dA      = Rd * (dT_l + dT_r) / 2.0 * np.log(p_prev_safe / p_cur_safe)
-            # ln(p_prev/p_cur) > 0 (ascending); dA > 0 when parcel warmer than env.
-            lfc_found = (cape > 0)          # any prior positive buoyancy = above LFC
-            cin  = cin  + np.where(~lfc_found & (dA < 0), dA, 0.0)
-            cape = cape + np.where(dA > 0, dA, 0.0)
+    sbcape = np.maximum(0.0, _upscale(cap_c)).astype(np.float32)
+    sbcin  = np.clip(_upscale(cin_c), -300.0, 0.0).astype(np.float32)
+    mlcape = np.maximum(0.0, _upscale(mlc_c)).astype(np.float32)
 
-            Tv_e_prev = Tv_e_cur
-            Tv_p_prev = Tv_p_cur
-
-        return cape.astype(np.float32), np.maximum(cin, -300.0).astype(np.float32)
-
-    # ── SBCAPE / SBCIN — surface parcel ──────────────────────────────────────
-    sbcape, sbcin = _integrate_cape_cin(t2m, td2m, P_SFC)
-
-    # ── MLCAPE — mean-layer parcel (lowest ml_depth_mb of the atmosphere) ────
-    ml_p_top = float(np.mean(P_SFC)) - ml_depth_mb    # scalar — P_SFC is now 2D; mean keeps loop comparison unambiguous
-    ml_T_sum  = t2m.copy().astype(np.float64)
-    ml_Td_sum = td2m.copy().astype(np.float64)
-    ml_n      = np.ones(t2m.shape, dtype=np.float64)   # surface already counted
-
-    for p_mb, T_lev, Td_lev in levels:
-        if T_lev is not None and Td_lev is not None and p_mb >= ml_p_top:
-            ml_T_sum  = ml_T_sum  + T_lev.astype(np.float64)
-            ml_Td_sum = ml_Td_sum + Td_lev.astype(np.float64)
-            ml_n      = ml_n + 1.0
-
-    ml_T_mean  = (ml_T_sum  / ml_n).astype(np.float32)
-    ml_Td_mean = (ml_Td_sum / ml_n).astype(np.float32)
-    mlcape, _  = _integrate_cape_cin(ml_T_mean, ml_Td_mean, P_SFC)
+    log.info(f'[cape] MetPy coarse {cny}×{cnx} (step={COARSE_STEP}) → {ny}×{nx}; '
+             f'{n_fail} sounding failures')
+    log.info(f'[sbcape] MetPy: max={float(sbcape.max()):.0f} J/kg '
+             f'active={int((sbcape > 0).sum())} cells')
+    log.info(f'[sbcin]  MetPy: min={float(sbcin.min()):.0f} J/kg')
+    log.info(f'[mlcape] MetPy: max={float(mlcape.max()):.0f} J/kg '
+             f'active={int((mlcape > 0).sum())} cells')
 
     return sbcape, sbcin, mlcape
 

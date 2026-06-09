@@ -9,3 +9,4 @@ psutil
 netCDF4
 rasterio
 Pillow
+metpy
