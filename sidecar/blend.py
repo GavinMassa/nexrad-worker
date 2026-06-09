@@ -598,6 +598,15 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
     rh850_i  = interp(upper_air.get('rh850'),    'rh850')
     rh925_i  = interp(upper_air.get('rh925'),    'rh925')
     rh950_i  = interp(upper_air.get('rh950'),    'rh950')
+    # Upper-troposphere levels — extend integration to the EL (~200 mb).
+    t600_i   = interp(upper_air.get('t600'),     't600')
+    rh600_i  = interp(upper_air.get('rh600'),    'rh600')
+    t400_i   = interp(upper_air.get('t400'),     't400')
+    rh400_i  = interp(upper_air.get('rh400'),    'rh400')
+    t300_i   = interp(upper_air.get('t300'),     't300')
+    rh300_i  = interp(upper_air.get('rh300'),    'rh300')
+    t200_i   = interp(upper_air.get('t200'),     't200')
+    rh200_i  = interp(upper_air.get('rh200'),    'rh200')
 
     def _rh_to_td(T_K: np.ndarray, rh: np.ndarray):
         """Convert RH (0–100) + T (K) to Td (K) via Bolton inverse."""
@@ -659,13 +668,24 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
     td850_i = _rh_to_td(t850_i, rh850_i)
     td700_i = _rh_to_td(t700_i, rh700_i)
     td500_i = _rh_to_td(t500_i, rh500_i)
+    td600_i = _rh_to_td(t600_i, rh600_i)
+    td400_i = _rh_to_td(t400_i, rh400_i)
+    td300_i = _rh_to_td(t300_i, rh300_i)
+    td200_i = _rh_to_td(t200_i, rh200_i)
 
+    # Levels in descending pressure order (surface → tropopause).
+    # Upper levels (600→200 mb) are essential: the EL for strong convection
+    # is at 200–250 mb, and the 500→200 mb layer contributes 1500–3000 J/kg.
     lift_levels = [
         (950.0, t950_i, td950_i),
         (925.0, t925_i, td925_i),
         (850.0, t850_i, td850_i),
         (700.0, t700_i, td700_i),
+        (600.0, t600_i, td600_i),
         (500.0, t500_i, td500_i),
+        (400.0, t400_i, td400_i),
+        (300.0, t300_i, td300_i),
+        (200.0, t200_i, td200_i),
     ]
     lift_levels = [(p, T, Td) for p, T, Td in lift_levels
                    if T is not None and Td is not None
