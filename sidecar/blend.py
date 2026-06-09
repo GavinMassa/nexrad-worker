@@ -302,6 +302,7 @@ def compute_cape_cin_lifted(
     td2m:   np.ndarray,   # RTMA 2m dewpoint (K), TPW+Mesonet corrected, shape (ny, nx)
     levels: list,         # [(p_mb, T_K_grid, Td_K_grid), ...] descending pressure
     ml_depth_mb: float = 100.0,   # mixed-layer averaging depth (mb) for MLCAPE
+    psfc: "np.ndarray | None" = None,   # per-gridpoint surface pressure (mb), (ny,nx)
 ) -> tuple:
     """
     Compute SBCAPE, SBCIN, and MLCAPE using MetPy's parcel lift.
@@ -332,7 +333,15 @@ def compute_cape_cin_lifted(
     # spacing 2.5 km × 10 = 25 km.
     COARSE_STEP = 10
 
-    P_SFC = 1000.0
+    # P_SFC: per-gridpoint surface pressure from the Barnes pressure analysis
+    # (mb), passed in via rtma['psfc']. Falls back to a 1000 mb scalar. When a
+    # grid is supplied it is clamped to a physical range so a bad cell can't
+    # corrupt the lift.
+    if psfc is not None:
+        P_SFC = np.clip(psfc.astype(np.float32), 850.0, 1050.0)   # (ny, nx)
+    else:
+        P_SFC = 1000.0   # scalar fallback
+    psfc_is_grid = isinstance(P_SFC, np.ndarray)
 
     # Keep only usable levels (drop None / zero-filled out-of-domain grids).
     valid_levels = [(p, T, Td) for p, T, Td in levels
@@ -343,9 +352,11 @@ def compute_cape_cin_lifted(
         zero = np.zeros((ny, nx), dtype=np.float32)
         return zero, zero, zero
 
-    # Pressure profile (mb): surface first, then upper levels (descending p).
-    p_levels = np.array([P_SFC] + [lv[0] for lv in valid_levels], dtype=np.float32)
-    n_lev    = len(p_levels)
+    # Upper-air pressure levels (mb), descending — fixed for all gridpoints.
+    # The surface pressure is per-point (P_SFC) and prepended inside the loop,
+    # so the full column is built per gridpoint there.
+    p_levels_upper = np.array([lv[0] for lv in valid_levels], dtype=np.float32)
+    n_lev          = 1 + len(valid_levels)   # surface + upper levels (T/Td stack depth)
 
     # Full-resolution clamped stacks (n_lev, ny, nx).
     t2m_c  = np.clip(t2m,  200.0, 340.0).astype(np.float32)
@@ -370,9 +381,6 @@ def compute_cape_cin_lifted(
     # Raw upper-air sample (unclipped) — shape (n_lev-1, cny*cnx)
     Tc_raw = T_raw_upper[:, rows][:, :, cols].reshape(len(valid_levels), -1)
 
-    ml_p_top = P_SFC - ml_depth_mb
-    ml_mask  = p_levels >= ml_p_top
-
     cap_c = np.zeros(cny * cnx, dtype=np.float32)
     cin_c = np.zeros(cny * cnx, dtype=np.float32)
     mlc_c = np.zeros(cny * cnx, dtype=np.float32)
@@ -380,7 +388,6 @@ def compute_cape_cin_lifted(
     n_fail = 0
     with _w.catch_warnings():
         _w.simplefilter('ignore')   # suppress pint UnitStrippedWarning
-        p_u = p_levels * mpunits.hPa
         for idx in range(cny * cnx):
             T_col  = Tc[:, idx]
             Td_col = Tdc[:, idx]
@@ -392,9 +399,29 @@ def compute_cape_cin_lifted(
                 continue
             if np.any(Tc_raw[:, idx] < 100.0):   # 0 K fill, pre-clip
                 continue
+
+            # Per-point surface pressure (mb) from the Barnes analysis.
+            if psfc_is_grid:
+                ci_row, ci_col = divmod(idx, cnx)
+                p_sfc_pt = float(P_SFC[rows[ci_row], cols[ci_col]])
+            else:
+                p_sfc_pt = float(P_SFC)
+
+            # Drop any upper levels at/below ground (pressure >= surface) so the
+            # column is physical and strictly decreasing. p_levels_upper is
+            # already descending, so the filtered column stays descending and
+            # we DON'T sort (sorting would misalign T/Td against pressure).
+            above   = p_levels_upper < p_sfc_pt
+            p_col   = np.concatenate(([p_sfc_pt], p_levels_upper[above]))
+            T_arr   = np.concatenate(([T_col[0]],  T_col[1:][above]))
+            Td_arr  = np.concatenate(([Td_col[0]], Td_col[1:][above]))
+            if p_col.size < 3:        # too few levels above ground for a useful lift
+                continue
+
             try:
-                T_u  = T_col  * mpunits.kelvin
-                Td_u = Td_col * mpunits.kelvin
+                p_u  = p_col  * mpunits.hPa
+                T_u  = T_arr  * mpunits.kelvin
+                Td_u = Td_arr * mpunits.kelvin
 
                 # Surface-based parcel
                 sb_prof = mpcalc.parcel_profile(p_u, T_u[0], Td_u[0])
@@ -402,9 +429,11 @@ def compute_cape_cin_lifted(
                 cap_c[idx] = float(sb_cape.magnitude)
                 cin_c[idx] = float(sb_cin.magnitude)
 
-                # Mean-layer parcel (lowest ml_depth_mb)
-                ml_T  = float(np.mean(T_col[ml_mask]))  * mpunits.kelvin
-                ml_Td = float(np.mean(Td_col[ml_mask])) * mpunits.kelvin
+                # Mean-layer parcel: average over the lowest ml_depth_mb of THIS
+                # column (selection is per-point because surface pressure varies).
+                ml_sel = p_col >= (p_sfc_pt - ml_depth_mb)
+                ml_T   = float(np.mean(T_arr [ml_sel])) * mpunits.kelvin
+                ml_Td  = float(np.mean(Td_arr[ml_sel])) * mpunits.kelvin
                 ml_prof = mpcalc.parcel_profile(p_u, ml_T, ml_Td)
                 ml_cape, _ = mpcalc.cape_cin(p_u, T_u, Td_u, ml_prof)
                 mlc_c[idx] = float(ml_cape.magnitude)
@@ -612,8 +641,9 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
     SBCAPE_MIN = 150.0   # J/kg — display gate
 
     if len(lift_levels) >= 2:
+        _psfc_grid = rtma.get('psfc', None)
         sbcape_lifted, sbcin_lifted, mlcape_lifted = compute_cape_cin_lifted(
-            t2m, td2m, lift_levels
+            t2m, td2m, lift_levels, psfc=_psfc_grid
         )
         raw_sbcape = np.maximum(0.0, sbcape_lifted)
         out['sbcape'] = np.where(

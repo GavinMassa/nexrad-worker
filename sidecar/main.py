@@ -25,10 +25,11 @@ _cycle_lock  = asyncio.Lock()
 
 # Mesonet correction files written by mesonet_worker(), read by run_cycle().
 # Stored in the same OUT_DIR (/app/sidecar-out) so they persist across restarts.
-MESONET_DT_PATH   = OUT_DIR / 'mesonet_delta_t.bin'
-MESONET_DTD_PATH  = OUT_DIR / 'mesonet_delta_td.bin'
-MESONET_META_PATH = OUT_DIR / 'mesonet_meta.json'
-MESONET_MAX_AGE_S = 90 * 60   # discard corrections older than 90 minutes
+MESONET_DT_PATH    = OUT_DIR / 'mesonet_delta_t.bin'
+MESONET_DTD_PATH   = OUT_DIR / 'mesonet_delta_td.bin'
+MESONET_DPSFC_PATH = OUT_DIR / 'mesonet_delta_psfc.bin'
+MESONET_META_PATH  = OUT_DIR / 'mesonet_meta.json'
+MESONET_MAX_AGE_S  = 90 * 60   # discard corrections older than 90 minutes
 
 
 def log_memory(label: str = '') -> None:
@@ -139,15 +140,33 @@ async def mesonet_worker():
             grid_td2m = np.frombuffer(td2m_path.read_bytes(),
                                       dtype=np.float32).reshape(ny_small, nx_small)
 
-            # IDW is CPU-bound but fast with the thinned network (~600 stations)
+            # Barnes OA is CPU-bound but fast with the thinned network (~600 stations)
             loop = asyncio.get_running_loop()
-            delta_t, delta_td = await loop.run_in_executor(
+
+            # Build background psfc grid: start with 1013.25mb everywhere,
+            # then refine using any previously written psfc analysis.
+            # This bootstraps correctly: first cycle uses 1013.25, subsequent
+            # cycles refine from the previous Barnes analysis.
+            _psfc_bg = np.full_like(grid_t2m, 1013.25, dtype=np.float32)
+            if MESONET_DPSFC_PATH.exists():
+                try:
+                    _dp = np.frombuffer(MESONET_DPSFC_PATH.read_bytes(),
+                                        dtype=np.float32).reshape(ny_small, nx_small)
+                    _psfc_bg = np.clip(1013.25 + _dp, 850.0, 1050.0).astype(np.float32)
+                except Exception:
+                    pass
+
+            delta_t, delta_td, delta_psfc = await loop.run_in_executor(
                 _thread_pool, compute_correction,
-                thinned, grid_lats, grid_lons, grid_t2m, grid_td2m,
+                thinned, grid_lats, grid_lons, grid_t2m, grid_td2m, _psfc_bg,
             )
 
             # Write correction files atomically — run_cycle() may read at any time
-            for fpath, arr in [(MESONET_DT_PATH, delta_t), (MESONET_DTD_PATH, delta_td)]:
+            for fpath, arr in [
+                (MESONET_DT_PATH,    delta_t),
+                (MESONET_DTD_PATH,   delta_td),
+                (MESONET_DPSFC_PATH, delta_psfc),
+            ]:
                 tmp = fpath.parent / (fpath.name + '.tmp')
                 arr.tofile(str(tmp))
                 tmp.replace(fpath)
@@ -168,7 +187,7 @@ async def mesonet_worker():
             # can hold hundreds of MB if the GC doesn't collect promptly.
             del stations, stations_domain, thinned
             del grid_lats, grid_lons, grid_t2m, grid_td2m
-            del delta_t, delta_td
+            del delta_t, delta_td, delta_psfc
             gc.collect()
             log_memory('[mesonet] after GC')
 
@@ -295,6 +314,25 @@ async def run_cycle():
                         rtma['td2m'] = np.clip(
                             rtma['td2m'] + dtd_full, 200.0, 320.0
                         ).astype(np.float32)
+
+                        # Apply surface pressure analysis if available.
+                        # Build absolute psfc = 1013.25mb background + Barnes ΔP.
+                        if MESONET_DPSFC_PATH.exists():
+                            try:
+                                dp_raw = np.frombuffer(
+                                    MESONET_DPSFC_PATH.read_bytes(),
+                                    dtype=np.float32).reshape(ny_c, nx_c)
+                                dp_full = ndimage_zoom(dp_raw, UP, order=1)[:ny_full, :nx_full]
+                                rtma['psfc'] = np.clip(
+                                    1013.25 + dp_full, 850.0, 1050.0
+                                ).astype(np.float32)
+                            except Exception as _e:
+                                log.warning(f'[mesonet] psfc correction failed: {_e}')
+                                rtma['psfc'] = np.full_like(rtma['t2m'], 1000.0)
+                        else:
+                            # No psfc analysis yet — use 1000mb (same as before)
+                            rtma['psfc'] = np.full_like(rtma['t2m'], 1000.0)
+
                         log.info(f'[mesonet] applied correction '
                                  f'(age={age_s/60:.0f} min, '
                                  f'stations={corr_meta["n_stations"]})')
@@ -304,6 +342,9 @@ async def run_cycle():
                 except Exception as e:
                     log.warning(f'[mesonet] correction read failed: {e} '
                                 f'— using raw RTMA')
+            # Ensure psfc is always present in rtma dict (stale/missing/failed correction)
+            if 'psfc' not in rtma:
+                rtma['psfc'] = np.full_like(rtma['t2m'], 1000.0)
 
             # Blend derivation is CPU-heavy; off-loaded to thread pool.
             # tpw_data is passed as third positional arg; blend() defaults to
