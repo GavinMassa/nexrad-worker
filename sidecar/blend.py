@@ -288,6 +288,228 @@ def _rtma_scale_factor(lats_deg: np.ndarray) -> np.ndarray:
     return scale.astype(np.float32)
 
 
+def compute_cape_cin_lifted(
+    t2m:    np.ndarray,   # RTMA 2m temperature (K), shape (ny, nx)
+    td2m:   np.ndarray,   # RTMA 2m dewpoint (K), TPW-corrected, shape (ny, nx)
+    levels: list,         # list of (p_mb: float, T: np.ndarray|None, Td: np.ndarray|None)
+                          #   sorted descending by pressure (lowest altitude last)
+                          #   e.g. [(950, t950_i, td950_i), (925, ...), ...]
+    ml_depth_mb: float = 100.0,   # mixed-layer averaging depth (mb) for MLCAPE
+) -> tuple:
+    """
+    Compute SBCAPE, SBCIN, and MLCAPE via pseudoadiabatic parcel lift.
+
+    Surface parcel: RTMA t2m / td2m (obs-anchored).
+    Upper profile:  RRFS pressure-level T and Td fields (already interpolated
+                    to the RTMA 2.5km grid).
+    Integration:    trapezoidal rule on virtual-temperature buoyancy.
+
+    Returns (sbcape, sbcin, mlcape) — each shape (ny, nx), dtype float32,
+    non-negative for CAPE, non-positive for CIN (clipped to -300 J/kg).
+    """
+    from scipy.ndimage import gaussian_filter  # noqa: F401 (imported for consistency)
+
+    # ── Physical constants ────────────────────────────────────────────────────
+    Rd   = 287.04    # J/(kg·K)  dry air gas constant
+    Rv   = 461.5     # J/(kg·K)  water vapour gas constant
+    g    = 9.80665   # m/s²
+    Lv   = 2.501e6   # J/kg      latent heat of vaporisation (0°C)
+    cp   = 1005.7    # J/(kg·K)  specific heat of dry air at const pressure
+    eps  = Rd / Rv   # ≈ 0.622
+
+    # ── Scalar helpers (operate element-wise on arrays) ───────────────────────
+    def _es(T_K: np.ndarray) -> np.ndarray:
+        """Saturation vapour pressure (Pa) via Bolton (1980)."""
+        tc = T_K - 273.15
+        return 611.2 * np.exp(17.67 * tc / (tc + 243.5))
+
+    def _mixr(Td_K: np.ndarray, p_mb: float) -> np.ndarray:
+        """Mixing ratio (kg/kg) from dewpoint (K) and pressure (mb)."""
+        e = _es(Td_K)
+        p_pa = p_mb * 100.0
+        return eps * e / np.maximum(p_pa - e, 1.0)
+
+    def _Tv(T_K: np.ndarray, w: np.ndarray) -> np.ndarray:
+        """Virtual temperature (K)."""
+        return T_K * (1.0 + w / eps) / (1.0 + w)
+
+    def _wobus(T_K: np.ndarray) -> np.ndarray:
+        """
+        Wobus polynomial: moist-adiabatic lapse rate correction (K).
+        Based on Wobus (1966) as implemented in NSHARP/SHARPpy.
+        Input: temperature (K).
+        """
+        tc = T_K - 273.15
+        x  = tc - 20.0
+        # Two polynomial segments joined at x = 0 (tc = 20 °C)
+        pol1 = (((((((( 2.0103e-9  * x) +
+                        (-1.6665e-7) ) * x +
+                        5.8464e-6  ) * x +
+                       -7.3765e-5  ) * x +
+                       4.8534e-4   ) * x +
+                      -2.9407e-3   ) * x +
+                       1.8060e-2   ) * x +
+                      -7.6617e-2   ) * x + \
+                      -7.8581e-3
+        pol2 = ((((((((-1.5966e-9  * x) +
+                        1.5422e-7   ) * x +
+                       -2.2530e-6  ) * x +
+                       -1.2978e-5  ) * x +
+                       1.5542e-4   ) * x +
+                      -6.3523e-4   ) * x +
+                       1.8927e-2   ) * x +
+                       1.5705e-1   ) * x + \
+                      -7.8581e-3
+        return np.where(x >= 0, pol1, pol2)
+
+    def _moist_adiabat_dT(T_K: np.ndarray, p_mb: float) -> np.ndarray:
+        """
+        dT/dp for a saturated (moist) adiabat (K/mb).
+        Positive => temperature increases with pressure (downward).
+        """
+        es_val = _es(T_K)
+        w_s    = eps * es_val / np.maximum(p_mb * 100.0 - es_val, 1.0)
+        numer  = (Rd * T_K / (p_mb * 100.0)) * (1.0 + Lv * w_s / (Rd * T_K))
+        denom  = cp + Lv**2 * w_s / (Rv * T_K**2)
+        return numer / denom * 100.0   # convert Pa→mb denominator
+
+    def _lift_parcel_to_level(
+        T_parcel:    np.ndarray,
+        w_parcel:    np.ndarray,   # mixing ratio at LCL (kg/kg), constant above
+        p_start:     float,
+        p_end:       float,
+        is_below_lcl: np.ndarray,  # bool mask: still dry adiabatic lift?
+        lcl_p:       np.ndarray,   # LCL pressure (mb), per gridpoint
+    ) -> tuple:
+        """
+        Lift a parcel from p_start to p_end using small finite steps.
+        Below the LCL: dry adiabatic (Γd = g/cp = 9.77 K/km).
+        Above the LCL: moist pseudoadiabatic using Wobus correction.
+        Returns (T_parcel_at_p_end, still_below_lcl_mask).
+        """
+        n_steps = max(1, int(abs(p_end - p_start) / 5.0))  # 5 mb sub-steps
+        dp = (p_end - p_start) / n_steps
+        T_p   = T_parcel.copy()
+        below = is_below_lcl.copy()
+        p_cur = float(p_start)
+        for _ in range(n_steps):
+            p_mid = p_cur + dp / 2.0
+            # Dry-adiabatic dT/dp = Rd*T/(cp*p)  [K/mb, signed by direction]
+            dT_dry  = (Rd / cp) * T_p / p_mid * dp
+            # Moist-adiabatic step
+            dT_moist = _moist_adiabat_dT(T_p, p_mid) * dp
+            T_p   = np.where(below, T_p + dT_dry, T_p + dT_moist)
+            p_cur = p_cur + dp
+            below = below & (p_cur > lcl_p)  # cross LCL during this step?
+        return T_p, below
+
+    # ── Surface parcel properties ─────────────────────────────────────────────
+    P_SFC    = 975.0   # approximate RTMA surface pressure (mb) — close enough
+                       # for a CONUS grid average; domain edges may differ ±15 mb
+    w_sfc    = _mixr(td2m, P_SFC)          # surface mixing ratio
+    Tv_sfc   = _Tv(t2m, w_sfc)            # surface virtual temperature
+
+    # Bolton (1980) LCL temperature and pressure
+    # T_lcl = 1 / (1/(Td-56) + ln(T/Td)/800) + 56   (all in K)
+    lcl_T = 1.0 / (1.0 / np.maximum(td2m - 56.0, 0.5) +
+                   np.log(np.maximum(t2m / np.maximum(td2m, 200.0), 1.0)) / 800.0
+                   ) + 56.0
+    lcl_p = P_SFC * (lcl_T / t2m) ** (cp / Rd)  # Poisson: p_lcl / p_sfc
+
+    # ── Build combined level arrays (surface + upper-air) ────────────────────
+    # levels is sorted descending in pressure (highest p first),
+    # e.g. [(950, t950_i, td950_i), (925,...), (850,...), (700,...), (500,...)]
+    # Prepend surface so integration starts from there.
+    all_p  = [P_SFC] + [lv[0] for lv in levels]
+    all_T  = [t2m]   + [lv[1] for lv in levels]
+    all_Td = [td2m]  + [lv[2] for lv in levels]
+
+    # ── Inner integration function ────────────────────────────────────────────
+    def _integrate_cape_cin(
+        parcel_T_sfc:  np.ndarray,   # parcel T at surface (K)
+        parcel_Td_sfc: np.ndarray,   # parcel Td at surface (K)
+        p_sfc:         float,
+    ) -> tuple:
+        """
+        Lift the parcel defined by (parcel_T_sfc, parcel_Td_sfc) from p_sfc
+        through all_p/all_T/all_Td and integrate CAPE / CIN.
+        Returns (cape_arr, cin_arr) — shape (ny, nx), float32.
+        """
+        w_p    = _mixr(parcel_Td_sfc, p_sfc)
+        lcl_p_ = p_sfc * (_lift_parcel_to_level.__defaults__[0] if False
+                           else (1.0 / np.maximum(parcel_Td_sfc - 56.0, 0.5) +
+                                 np.log(np.maximum(parcel_T_sfc /
+                                                   np.maximum(parcel_Td_sfc, 200.0), 1.0)
+                                        ) / 800.0) ** -1 + 56.0)
+        # Cleaner: just recompute LCL pressure for this parcel
+        lcl_T_ = 1.0 / (1.0 / np.maximum(parcel_Td_sfc - 56.0, 0.5) +
+                         np.log(np.maximum(parcel_T_sfc /
+                                           np.maximum(parcel_Td_sfc, 200.0), 1.0)
+                                ) / 800.0) + 56.0
+        lcl_p_ = p_sfc * (lcl_T_ / parcel_T_sfc) ** (cp / Rd)
+
+        T_p   = parcel_T_sfc.copy()
+        below = np.ones(T_p.shape, dtype=bool)      # all below LCL initially
+        cape  = np.zeros(T_p.shape, dtype=np.float64)
+        cin   = np.zeros(T_p.shape, dtype=np.float64)
+
+        # Virtual T of environment at surface
+        w_e_sfc    = _mixr(parcel_Td_sfc, p_sfc)    # use env Td = parcel Td at sfc
+        Tv_e_prev  = Tv_sfc                           # sfc env Tv (from outer scope)
+        Tv_p_prev  = _Tv(T_p, w_p)
+
+        for i in range(1, len(all_p)):
+            p_prev = all_p[i - 1]
+            p_cur  = all_p[i]
+            T_e_cur  = all_T[i]
+            Td_e_cur = all_Td[i]
+            if T_e_cur is None or Td_e_cur is None:
+                continue                              # skip missing levels
+            # Lift parcel from previous level to current
+            T_p, below = _lift_parcel_to_level(T_p, w_p, p_prev, p_cur,
+                                                below, lcl_p_)
+            w_e_cur  = _mixr(Td_e_cur, p_cur)
+            Tv_e_cur = _Tv(T_e_cur, w_e_cur)
+            Tv_p_cur = _Tv(T_p, w_p)
+
+            # Trapezoidal buoyancy integral: dZ ≈ -Rd·Tv_e/g · dp/p
+            # CAPE/CIN = ∫ g (Tv_p - Tv_e)/Tv_e dz
+            #          = ∫ -Rd (Tv_p - Tv_e)/1 d(ln p)   [via hypsometric]
+            dp_     = p_cur - p_prev           # negative (ascending)
+            buoy_l  = (Tv_p_prev - Tv_e_prev) / Tv_e_prev
+            buoy_r  = (Tv_p_cur  - Tv_e_cur)  / Tv_e_cur
+            dA      = -Rd * (buoy_l + buoy_r) / 2.0 * np.log(p_prev / p_cur)
+            # Note: dp < 0 for ascending; ln(p_prev/p_cur) > 0 so dA sign is correct.
+            cape = cape + np.where(dA > 0, dA,  0.0)
+            cin  = cin  + np.where(dA < 0, dA,  0.0)
+
+            Tv_e_prev = Tv_e_cur
+            Tv_p_prev = Tv_p_cur
+
+        return cape.astype(np.float32), np.maximum(cin, -300.0).astype(np.float32)
+
+    # ── SBCAPE / SBCIN — surface parcel ──────────────────────────────────────
+    sbcape, sbcin = _integrate_cape_cin(t2m, td2m, P_SFC)
+
+    # ── MLCAPE — mean-layer parcel (lowest ml_depth_mb of the atmosphere) ────
+    ml_p_top = P_SFC - ml_depth_mb    # e.g. 975 - 100 = 875 mb
+    ml_T_sum  = t2m.copy().astype(np.float64)
+    ml_Td_sum = td2m.copy().astype(np.float64)
+    ml_n      = np.ones(t2m.shape, dtype=np.float64)   # surface already counted
+
+    for p_mb, T_lev, Td_lev in levels:
+        if T_lev is not None and Td_lev is not None and p_mb >= ml_p_top:
+            ml_T_sum  = ml_T_sum  + T_lev.astype(np.float64)
+            ml_Td_sum = ml_Td_sum + Td_lev.astype(np.float64)
+            ml_n      = ml_n + 1.0
+
+    ml_T_mean  = (ml_T_sum  / ml_n).astype(np.float32)
+    ml_Td_mean = (ml_Td_sum / ml_n).astype(np.float32)
+    mlcape, _  = _integrate_cape_cin(ml_T_mean, ml_Td_mean, P_SFC)
+
+    return sbcape, sbcin, mlcape
+
+
 def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
           hrrr_hlcy: dict | None = None) -> dict:
     """
@@ -353,6 +575,26 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
     cape3k_i = interp(upper_air.get('cape3k'),   'cape3k')
     mucape_i = interp(upper_air.get('mucape'),   'mucape')
     t700_i   = interp(upper_air.get('t700'),     't700')
+    t850_i   = interp(upper_air.get('t850'),     't850')
+    t500_i   = interp(upper_air.get('t500'),     't500')
+    t950_i   = interp(upper_air.get('t950'),     't950')
+    t925_i   = interp(upper_air.get('t925'),     't925')
+    rh500_i  = interp(upper_air.get('rh500'),    'rh500')
+    rh700_i  = interp(upper_air.get('rh700'),    'rh700')
+    rh850_i  = interp(upper_air.get('rh850'),    'rh850')
+    rh925_i  = interp(upper_air.get('rh925'),    'rh925')
+    rh950_i  = interp(upper_air.get('rh950'),    'rh950')
+
+    def _rh_to_td(T_K: np.ndarray, rh: np.ndarray):
+        """Convert RH (0–100) + T (K) to Td (K) via Bolton inverse."""
+        if T_K is None or rh is None:
+            return None
+        rh_frac = np.clip(rh, 1.0, 100.0) / 100.0
+        tc = T_K - 273.15
+        ln_rh = np.log(rh_frac)
+        ln_es  = 17.67 * tc / (tc + 243.5)
+        td_c   = 243.5 * (ln_rh + ln_es) / (17.67 - ln_rh - ln_es)
+        return (td_c + 273.15).astype(np.float32)
 
     # Interpolate HRRR 0-1km HLCY to RTMA grid (optional — 3km → 2.5km).
     # HRRR uses Lambert Conformal like RAP but at 3km resolution; the same
@@ -395,70 +637,70 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
 
     out: dict = {}
 
-    # Shared surface-T delta — used by both SBCAPE and SBCIN corrections.
-    # Computed here so both blocks can reference it without duplication.
-    if t2m_rap is not None:
-        delta_t_clamped = np.clip(t2m - t2m_rap, -2.0, 2.0)
-    else:
-        delta_t_clamped = np.zeros_like(t2m)
+    # ── Obs-anchored SBCAPE / SBCIN / MLCAPE via lifted parcel ───────────────
+    # Build pressure-level profile from RRFS fields (descending pressure order
+    # so the shallowest levels are first). Derive Td from RH using Bolton inverse.
+    td950_i = _rh_to_td(t950_i, rh950_i)
+    td925_i = _rh_to_td(t925_i, rh925_i)
+    td850_i = _rh_to_td(t850_i, rh850_i)
+    td700_i = _rh_to_td(t700_i, rh700_i)
+    td500_i = _rh_to_td(t500_i, rh500_i)
 
-    # --- SBCAPE: RAP CAPE corrected by RTMA vs RAP surface-T delta -------
+    lift_levels = [
+        (950.0, t950_i, td950_i),
+        (925.0, t925_i, td925_i),
+        (850.0, t850_i, td850_i),
+        (700.0, t700_i, td700_i),
+        (500.0, t500_i, td500_i),
+    ]
+    lift_levels = [(p, T, Td) for p, T, Td in lift_levels
+                   if T is not None and Td is not None]
+
     SBCAPE_MIN = 150.0   # J/kg — display gate
-    if cape_i is not None and t2m_rap is not None:
-        sbcape_corrected = np.maximum(0, cape_i + delta_t_clamped * 180.0)
-        cape_mask        = cape_i < 50.0
-        raw_sbcape       = np.where(cape_mask, np.maximum(0, cape_i), sbcape_corrected).astype(np.float32)
-        out['sbcape']    = np.where(raw_sbcape >= SBCAPE_MIN, raw_sbcape, 0.0).astype(np.float32)
-    elif cape_i is not None:
-        raw_sbcape    = np.maximum(0, cape_i).astype(np.float32)
-        out['sbcape'] = np.where(raw_sbcape >= SBCAPE_MIN, raw_sbcape, 0.0).astype(np.float32)
-        log.warning('blend: sbcape has no surface-T correction (t2m_rap missing)')
-    else:
-        log.warning('blend: sbcape skipped (cape missing)')
 
-    # --- SBCIN: RAP CIN with RTMA linear thermal correction -------------
-    # Linear additive correction: 1K surface warming reduces cap by 40 J/kg,
-    # 1K cooling amplifies it. 40 J/kg/K is the empirical mixed-layer sensitivity.
-    # Uses additive (not multiplicative) approach because CIN is a negative
-    # energy quantity — exponential multipliers on negative numbers produce
-    # unbounded amplification when delta_t is negative (cold air advection).
-    # Clamp to [-300, 0] — operationally, CIN below −300 J/kg is "fully capped"
-    # regardless of exact value (no surface parcel breaks it). Clamping at −300
-    # prevents stable non-convective regimes (Rockies, polar air) from producing
-    # extreme negative values that drag the CIN gate down to zero everywhere.
-    if cin_i is not None:
+    if len(lift_levels) >= 2:
+        sbcape_lifted, sbcin_lifted, mlcape_lifted = compute_cape_cin_lifted(
+            t2m, td2m, lift_levels
+        )
+        raw_sbcape = np.maximum(0.0, sbcape_lifted)
+        out['sbcape'] = np.where(
+            raw_sbcape >= SBCAPE_MIN, raw_sbcape, 0.0
+        ).astype(np.float32)
+        out['sbcin'] = sbcin_lifted   # already clipped to [-300, 0]
+        out['mlcape_lifted'] = np.where(
+            mlcape_lifted >= SBCAPE_MIN, mlcape_lifted, 0.0
+        ).astype(np.float32)
+        log.info(f'[sbcape] lifted-parcel: max={float(out["sbcape"].max()):.0f} '
+                 f'active={int((out["sbcape"] > 0).sum())} cells')
+        log.info(f'[sbcin] lifted-parcel: min={float(out["sbcin"].min()):.0f} J/kg')
+        log.info(f'[mlcape] lifted-parcel: max={float(out["mlcape_lifted"].max()):.0f} '
+                 f'active={int((out["mlcape_lifted"] > 0).sum())} cells')
+    else:
+        # Fallback: fewer than 2 upper-air levels — use old linear correction
+        log.warning('[sbcape] fewer than 2 RRFS pressure levels — falling back to '
+                    'linear delta-T correction')
         if t2m_rap is not None:
-            cin_correction = delta_t_clamped * 40.0
-            out['sbcin'] = np.clip(
-                cin_i + cin_correction, -300.0, 0.0
-            ).astype(np.float32)
-            log.info(f'[sbcin] linear thermal correction: '
-                     f'min={float(out["sbcin"].min()):.0f} '
-                     f'correction range=[{float(cin_correction.min()):.0f}, '
-                     f'{float(cin_correction.max()):.0f}] J/kg')
+            delta_t_clamped = np.clip(t2m - t2m_rap, -2.0, 2.0)
         else:
-            out['sbcin'] = np.clip(cin_i, -300.0, 0.0).astype(np.float32)
-            log.warning('blend: sbcin has no thermal correction (t2m_rap missing)')
-    else:
-        log.warning('blend: sbcin skipped (cin missing)')
+            delta_t_clamped = np.zeros_like(t2m)
 
-    # Physical consistency: a parcel cannot carry significant CAPE through
-    # an unbreakable cap. If SBCIN is pegged at the -300 J/kg clamp AND
-    # corrected SBCAPE is positive, the linear correction has produced an
-    # inconsistent state — zero out SBCAPE for those gridpoints.
-    if 'sbcin' in out and 'sbcape' in out:
-        hard_capped = (out['sbcin'] <= -299.0)
-        inconsistent = hard_capped & (out['sbcape'] > 0.0)
-        if inconsistent.any():
-            n_zeroed = int(inconsistent.sum())
-            out['sbcape'] = np.where(inconsistent, 0.0, out['sbcape']).astype(np.float32)
-            log.info(f'[sbcape] capped {n_zeroed} cells where CIN=-300 clamp '
-                     f'produced CAPE/CIN inconsistency')
+        cape_i_raw = interp(upper_air.get('cape'), 'cape')
+        cin_i_raw  = interp(upper_air.get('cin'),  'cin')
 
-    # --- 0-3km CAPE: low-level buoyancy from RAP lev_0-3000_m layer ------
-    # No RTMA correction applied — the layer-mean CAPE is not sensitive to the
-    # surface-skin T anomaly the way surface-based CAPE is. Pass through with
-    # floor clamp and display gate only.
+        if cape_i_raw is not None:
+            sbcape_corrected = np.maximum(0, cape_i_raw + delta_t_clamped * 180.0)
+            cape_mask        = cape_i_raw < 50.0
+            raw_sbcape       = np.where(cape_mask, np.maximum(0, cape_i_raw),
+                                        sbcape_corrected).astype(np.float32)
+            out['sbcape']    = np.where(raw_sbcape >= SBCAPE_MIN,
+                                        raw_sbcape, 0.0).astype(np.float32)
+        if cin_i_raw is not None:
+            cin_correction = delta_t_clamped * 40.0
+            out['sbcin']   = np.clip(cin_i_raw + cin_correction,
+                                     -300.0, 0.0).astype(np.float32)
+
+    # --- 0-3km CAPE: low-level buoyancy from RRFS lev_0-3000_m layer --------
+    # (unchanged — this is a model layer field, not surface-based)
     CAPE3K_MIN = 50.0   # J/kg — display gate (remove noise)
     if cape3k_i is not None:
         out['cape3k'] = np.where(
@@ -470,9 +712,10 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
     else:
         log.warning('blend: cape3k skipped (RAP 0-3km CAPE not available)')
 
-    # --- MUCAPE: most unstable parcel CAPE (180-0mb search layer) -----------
-    # No RTMA surface correction — MU parcel is elevated, not surface-based.
-    # Same display gate as SBCAPE (150 J/kg) to suppress noise.
+    # --- MUCAPE: RRFS model most-unstable CAPE (180-0mb search layer) --------
+    # Note: SBCAPE and MLCAPE now use the obs-anchored lifted parcel above.
+    # MUCAPE retains the model value as it requires an elevated parcel search
+    # that would need many more pressure levels to implement from scratch.
     MUCAPE_MIN = 150.0
     if mucape_i is not None:
         out['mucape'] = np.where(

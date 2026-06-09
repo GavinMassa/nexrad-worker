@@ -54,6 +54,14 @@ FIELDS_PRSLEV: list[tuple[str, str]] = [
     ('v950', ':VGRD:950 mb:'),
     ('t700', ':TMP:700 mb:'),
     ('t925', ':TMP:925 mb:'),
+    ('t850',  ':TMP:850 mb:'),
+    ('t500',  ':TMP:500 mb:'),
+    ('rh500', ':RH:500 mb:'),
+    ('rh700', ':RH:700 mb:'),
+    ('rh850', ':RH:850 mb:'),
+    ('rh925', ':RH:925 mb:'),
+    ('rh950', ':RH:950 mb:'),
+    ('t950',  ':TMP:950 mb:'),
 ]
 
 # Surface / derived fields — 2dfld file
