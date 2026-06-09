@@ -320,7 +320,7 @@ def compute_cape_cin_lifted(
     # ── Scalar helpers (operate element-wise on arrays) ───────────────────────
     def _es(T_K: np.ndarray) -> np.ndarray:
         """Saturation vapour pressure (hPa) via Bolton (1980)."""
-        tc = T_K - 273.15
+        tc = np.clip(T_K - 273.15, -80.0, 60.0)   # clamp: -80°C avoids exp overflow, 60°C physical max
         return 6.112 * np.exp(17.67 * tc / (tc + 243.5))
 
     def _mixr(Td_K: np.ndarray, p_mb: float) -> np.ndarray:
@@ -405,6 +405,10 @@ def compute_cape_cin_lifted(
     # ── Surface parcel properties ─────────────────────────────────────────────
     P_SFC    = 975.0   # approximate RTMA surface pressure (mb) — close enough
                        # for a CONUS grid average; domain edges may differ ±15 mb
+    # Clamp RTMA fields to physical range — fill values (0 K, NaN) outside domain
+    # cause Bolton exp() to overflow and propagate NaN through the entire lift.
+    t2m  = np.clip(t2m,  200.0, 330.0)
+    td2m = np.clip(td2m, 180.0, 320.0)
     w_sfc    = _mixr(td2m, P_SFC)          # surface mixing ratio
     Tv_sfc   = _Tv(t2m, w_sfc)            # surface virtual temperature
 
@@ -589,7 +593,7 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
         if T_K is None or rh is None:
             return None
         rh_frac = np.clip(rh, 1.0, 100.0) / 100.0
-        tc = T_K - 273.15
+        tc = np.clip(T_K - 273.15, -80.0, 60.0)
         ln_rh = np.log(rh_frac)
         ln_es  = 17.67 * tc / (tc + 243.5)
         td_c   = 243.5 * (ln_rh + ln_es) / (17.67 - ln_rh - ln_es)
