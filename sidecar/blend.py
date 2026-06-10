@@ -472,7 +472,7 @@ def compute_cape_cin_lifted(
 
 
 def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
-          hrrr_hlcy: dict | None = None) -> dict:
+          hrrr_hlcy: dict | None = None, vad_data: dict | None = None) -> dict:
     """
     Blend RTMA 2.5km surface fields with upper-air model fields.
 
@@ -859,6 +859,35 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
         log.warning('[srh1] RRFS-only (ustm/vstm missing, HRRR unavailable)')
     else:
         log.warning('blend: srh1 skipped (all SRH sources missing)')
+
+    # ── VAD observed-hodograph overlay (hybrid) ──────────────────────────────
+    # Where NEXRAD VAD coverage exists, refine srh1 with an observation-anchored
+    # 0-1km SRH built from: RTMA surface wind (observed) + VAD winds at 500m and
+    # 1000m AGL (observed) + model USTM/VSTM storm motion (full-depth Bunkers,
+    # which the shallow VAD profiles cannot provide reliably). The model SRH in
+    # out['srh1'] is retained everywhere; VAD is blended in only where covered.
+    if (vad_data is not None and 'srh1' in out
+            and ustm_i is not None and vstm_i is not None):
+        try:
+            cov   = vad_data['cov']
+            u500  = vad_data['u500'];  v500  = vad_data['v500']
+            u1000 = vad_data['u1000']; v1000 = vad_data['v1000']
+
+            # Storm-relative helicity over sfc(10m) → 500m → 1000m AGL:
+            #   SRH = Σ (u_k − C_u)(v_{k+1} − v_k) − (v_k − C_v)(u_{k+1} − u_k)
+            l1 = ((u10  - ustm_i) * (v500  - v10 ) - (v10  - vstm_i) * (u500  - u10 ))
+            l2 = ((u500 - ustm_i) * (v1000 - v500) - (v500 - vstm_i) * (u1000 - u500))
+            srh_vad = np.clip(np.abs(l1 + l2), 0.0, 1200.0).astype(np.float32)
+
+            covm = (cov > 0)
+            blended_srh = (0.65 * srh_vad + 0.35 * out['srh1']).astype(np.float32)
+            out['srh1'] = np.where(covm, blended_srh, out['srh1']).astype(np.float32)
+            vad_max = float(srh_vad[covm].max()) if bool(covm.any()) else 0.0
+            log.info(f'[srh1] VAD overlay (obs hodograph + model motion): '
+                     f'coverage={float(covm.mean())*100:.0f}% '
+                     f'vad_max={vad_max:.0f} blended_max={float(out["srh1"].max()):.0f}')
+        except Exception as _e:
+            log.warning(f'[srh1] VAD overlay skipped: {_e}')
 
     # --- 0-6km BWD: pure bulk vector difference (V500mb − V10m_RTMA) ---------
     # Breaking into sub-layers and summing magnitudes computes total hodograph

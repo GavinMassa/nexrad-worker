@@ -9,6 +9,7 @@ from fetch_rap import fetch_rap, fetch_hrrr_hlcy
 from fetch_rrfs import fetch_rrfs
 from fetch_tpw import fetch_latest_tpw
 from mesonet import fetch_mesonet_obs, compute_correction
+from fetch_vad import fetch_vad_profiles, compute_site_layer_winds
 from blend import blend as do_blend
 from writer import write_output, OUT_DIR
 from terrain_setup import build_terrain, terrain_already_exists
@@ -30,6 +31,17 @@ MESONET_DTD_PATH   = OUT_DIR / 'mesonet_delta_td.bin'
 MESONET_DPSFC_PATH = OUT_DIR / 'mesonet_delta_psfc.bin'
 MESONET_META_PATH  = OUT_DIR / 'mesonet_meta.json'
 MESONET_MAX_AGE_S  = 90 * 60   # discard corrections older than 90 minutes
+
+# VAD observed-hodograph grids — written by vad_worker(), read by run_cycle().
+# u/v interpolated to 500m and 1000m AGL + a coverage mask. blend.py combines
+# these with the RTMA surface wind and model storm motion to form observed SRH.
+VAD_U500_PATH  = OUT_DIR / 'vad_u500.bin'
+VAD_V500_PATH  = OUT_DIR / 'vad_v500.bin'
+VAD_U1000_PATH = OUT_DIR / 'vad_u1000.bin'
+VAD_V1000_PATH = OUT_DIR / 'vad_v1000.bin'
+VAD_COV_PATH   = OUT_DIR / 'vad_cov.bin'      # float32 (ny,nx): 1.0 where covered
+VAD_META_PATH  = OUT_DIR / 'vad_meta.json'
+VAD_MAX_AGE_S  = 45 * 60   # discard VAD grids older than 45 min
 
 
 def log_memory(label: str = '') -> None:
@@ -198,6 +210,138 @@ async def mesonet_worker():
         await asyncio.sleep(600)   # 10-minute interval
 
 
+# ── VAD wind profile background worker ────────────────────────────────────────
+
+async def vad_worker():
+    """
+    Fetch NEXRAD VAD wind profiles every 15 minutes, interpolate the observed
+    low-level hodograph to 500m and 1000m AGL, grid those winds onto the blend
+    output grid via Barnes OA, and write binary files for run_cycle().
+
+    Storm motion is NOT computed here — VAD profiles are usually too shallow for
+    a reliable 0-6km Bunkers estimate, so blend.py pairs these observed winds
+    with the model's full-depth USTM/VSTM. Runs independently of run_cycle().
+    """
+    from scipy.spatial import KDTree
+
+    KAPPA = 1.0    # deg² Barnes Gaussian width (~100 km influence)
+    R     = 3.0    # deg hard cutoff radius
+
+    def _barnes(st_lats, st_lons, st_val, gp_lats, gp_lons, gp_pts, tree):
+        """Barnes-grid one scalar field; returns (values, count) flat arrays."""
+        n_gp = len(gp_lats)
+        out  = np.zeros(n_gp, dtype=np.float32)
+        cnt  = np.zeros(n_gp, dtype=np.int32)
+        CHUNK = 10_000
+        for start in range(0, n_gp, CHUNK):
+            end  = min(start + CHUNK, n_gp)
+            nbrs = tree.query_ball_point(gp_pts[start:end], r=R)
+            for local_i, nn_idx in enumerate(nbrs):
+                gi = start + local_i
+                if not nn_idx:
+                    continue
+                nn = np.array(nn_idx, dtype=np.int32)
+                d2 = (gp_lats[gi] - st_lats[nn])**2 + (gp_lons[gi] - st_lons[nn])**2
+                w  = np.exp(-d2 / KAPPA)
+                ws = w.sum()
+                if ws < 1e-10:
+                    continue
+                out[gi] = float((w * st_val[nn]).sum() / ws)
+                cnt[gi] = len(nn)
+        return out, cnt
+
+    while True:
+        try:
+            meta_path = OUT_DIR / 'meta.json'
+            if not meta_path.exists():
+                await asyncio.sleep(60)
+                continue
+            meta     = json.loads(meta_path.read_text())
+            ny_small = meta['ny']; nx_small = meta['nx']
+
+            lats_path = OUT_DIR / 'rtma_lats_small.bin'
+            lons_path = OUT_DIR / 'rtma_lons_small.bin'
+            if not (lats_path.exists() and lons_path.exists()):
+                await asyncio.sleep(60)
+                continue
+            grid_lats = np.frombuffer(lats_path.read_bytes(),
+                                      dtype=np.float32).reshape(ny_small, nx_small)
+            grid_lons = np.frombuffer(lons_path.read_bytes(),
+                                      dtype=np.float32).reshape(ny_small, nx_small)
+
+            profiles = await fetch_vad_profiles()
+            if len(profiles) < 10:
+                log.warning(f'[vad] only {len(profiles)} profiles — skipping cycle')
+                await asyncio.sleep(900)
+                continue
+            profiles = compute_site_layer_winds(profiles)
+
+            # Sites valid at each height (profile reached that level)
+            s5  = [p for p in profiles if p['u500']  is not None]
+            s10 = [p for p in profiles if p['u1000'] is not None]
+            if len(s10) < 5:
+                log.warning(f'[vad] only {len(s10)} sites reach 1000m — skipping')
+                await asyncio.sleep(900)
+                continue
+            log.info(f'[vad] {len(s5)} sites @500m, {len(s10)} sites @1000m')
+
+            gp_lats = grid_lats.ravel().astype(np.float64)
+            gp_lons = grid_lons.ravel().astype(np.float64)
+            gp_pts  = np.column_stack([gp_lats, gp_lons])
+
+            def grid_pair(sites, ukey, vkey):
+                st_lats = np.array([p['lat']  for p in sites], dtype=np.float64)
+                st_lons = np.array([p['lon']  for p in sites], dtype=np.float64)
+                st_u    = np.array([p[ukey]   for p in sites], dtype=np.float32)
+                st_v    = np.array([p[vkey]   for p in sites], dtype=np.float32)
+                tree    = KDTree(np.column_stack([st_lats, st_lons]))
+                u, cu = _barnes(st_lats, st_lons, st_u, gp_lats, gp_lons, gp_pts, tree)
+                v, _  = _barnes(st_lats, st_lons, st_v, gp_lats, gp_lons, gp_pts, tree)
+                return u, v, cu
+
+            loop = asyncio.get_running_loop()
+            (u500, v500, _c5), (u1000, v1000, c10) = await loop.run_in_executor(
+                _thread_pool,
+                lambda: (grid_pair(s5, 'u500', 'v500'),
+                         grid_pair(s10, 'u1000', 'v1000')),
+            )
+
+            # Coverage: ≥2 contributing sites at the 1000m (binding) level.
+            cov = (c10 >= 2).astype(np.float32)
+            shp = (ny_small, nx_small)
+            outs = {
+                VAD_U500_PATH:  np.where(cov > 0, u500,  0.0).reshape(shp).astype(np.float32),
+                VAD_V500_PATH:  np.where(cov > 0, v500,  0.0).reshape(shp).astype(np.float32),
+                VAD_U1000_PATH: np.where(cov > 0, u1000, 0.0).reshape(shp).astype(np.float32),
+                VAD_V1000_PATH: np.where(cov > 0, v1000, 0.0).reshape(shp).astype(np.float32),
+                VAD_COV_PATH:   cov.reshape(shp),
+            }
+            for fpath, arr in outs.items():
+                tmp = fpath.parent / (fpath.name + '.tmp')
+                arr.tofile(str(tmp))
+                tmp.replace(fpath)
+
+            vad_meta = {
+                'nx': nx_small, 'ny': ny_small,
+                'n_sites_500': len(s5), 'n_sites_1000': len(s10),
+                'updated': datetime.now(timezone.utc).isoformat(),
+            }
+            tmp_m = VAD_META_PATH.parent / (VAD_META_PATH.name + '.tmp')
+            tmp_m.write_text(json.dumps(vad_meta))
+            tmp_m.replace(VAD_META_PATH)
+            log.info(f'[vad] grid written: coverage={int((cov>0).sum())}/{ny_small*nx_small} pts '
+                     f'({len(s10)} sites @1000m)')
+
+            del profiles, grid_lats, grid_lons, gp_lats, gp_lons, gp_pts
+            gc.collect()
+
+        except Exception as e:
+            log.error(f'[vad_worker] error: {e}', exc_info=True)
+            gc.collect()
+
+        await asyncio.sleep(900)   # 15-minute interval
+
+
 # ── Hourly blend cycle ────────────────────────────────────────────────────────
 
 async def run_cycle():
@@ -346,11 +490,46 @@ async def run_cycle():
             if 'psfc' not in rtma:
                 rtma['psfc'] = np.full_like(rtma['t2m'], 1000.0)
 
+            # Load VAD observed-hodograph grids if fresh; upsample to full RTMA.
+            # blend() uses these (where coverage>0) with model storm motion to
+            # form an observation-anchored 0-1km SRH. Absent/stale → vad_data
+            # stays None and blend() falls back to the model SRH blend.
+            vad_data = None
+            _vad_files = [VAD_U500_PATH, VAD_V500_PATH, VAD_U1000_PATH,
+                          VAD_V1000_PATH, VAD_COV_PATH, VAD_META_PATH]
+            if all(p.exists() for p in _vad_files):
+                try:
+                    vad_meta_j  = json.loads(VAD_META_PATH.read_text())
+                    vad_updated = datetime.fromisoformat(vad_meta_j['updated'])
+                    vad_age_s   = (datetime.now(timezone.utc) - vad_updated).total_seconds()
+                    if vad_age_s < VAD_MAX_AGE_S:
+                        ny_v = vad_meta_j['ny']; nx_v = vad_meta_j['nx']
+                        UP = 1.0 / FACTOR
+                        ny_full, nx_full = rtma['t2m'].shape
+                        def _load_up(path, order):
+                            a = np.frombuffer(path.read_bytes(),
+                                              dtype=np.float32).reshape(ny_v, nx_v)
+                            return ndimage_zoom(a, UP, order=order)[:ny_full, :nx_full].astype(np.float32)
+                        vad_data = {
+                            'u500':  _load_up(VAD_U500_PATH,  1),
+                            'v500':  _load_up(VAD_V500_PATH,  1),
+                            'u1000': _load_up(VAD_U1000_PATH, 1),
+                            'v1000': _load_up(VAD_V1000_PATH, 1),
+                            # nearest-neighbour for the coverage mask (keep it crisp 0/1)
+                            'cov':   _load_up(VAD_COV_PATH,   0),
+                        }
+                        log.info(f'[vad] loaded: coverage={float((vad_data["cov"]>0).mean())*100:.0f}% '
+                                 f'age={vad_age_s/60:.0f}min sites={vad_meta_j.get("n_sites_1000","?")}')
+                    else:
+                        log.warning(f'[vad] grids stale ({vad_age_s/60:.0f} min) — skipping')
+                except Exception as _e:
+                    log.warning(f'[vad] load failed: {_e}')
+
             # Blend derivation is CPU-heavy; off-loaded to thread pool.
             # tpw_data is passed as third positional arg; blend() defaults to
             # None if not available so this is safe when TPW fetch failed.
             blended = await loop.run_in_executor(
-                _thread_pool, do_blend, rtma, upper_air, tpw_data, hrrr_hlcy
+                _thread_pool, do_blend, rtma, upper_air, tpw_data, hrrr_hlcy, vad_data
             )
             write_output(blended, now)
 
@@ -403,6 +582,7 @@ async def main():
         await asyncio.gather(
             scheduler(),
             mesonet_worker(),
+            vad_worker(),
             satellite_worker(),
         )
     finally:
