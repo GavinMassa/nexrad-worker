@@ -24,6 +24,16 @@ log = logging.getLogger(__name__)
 _thread_pool = ThreadPoolExecutor(max_workers=2)
 _cycle_lock  = asyncio.Lock()
 
+# Cache of the most recent successful fetch — used by mesonet_triggered_blend()
+# to re-run blend() with fresh surface corrections without re-fetching model data.
+# Protected by _cycle_lock so run_cycle() and mesonet_triggered_blend() never
+# run concurrently.
+_cached_rtma_base: dict | None = None     # raw RTMA before mesonet correction
+_cached_upper_air: dict | None = None
+_cached_tpw_data = None
+_cached_hrrr_hlcy = None
+_cached_cycle_dt: datetime | None = None  # UTC hour this cache was built for
+
 # Mesonet correction files written by mesonet_worker(), read by run_cycle().
 # Stored in the same OUT_DIR (/app/sidecar-out) so they persist across restarts.
 MESONET_DT_PATH    = OUT_DIR / 'mesonet_delta_t.bin'
@@ -94,14 +104,15 @@ async def mesonet_worker():
             log.info(f'[mesonet] {len(stations_domain)}/{len(stations)} in domain')
 
             # Spatially adaptive thinning:
-            # East of -100° (dense ASOS/AWOS network): 0.75° spacing → ~2x station density
-            # West of -100° (sparse network): 1.5° spacing → same as before
-            # This sharpens moisture/temp gradients near boundaries in the Plains/East
-            # without the memory cost of global densification.
+            # East of -100° (dense ASOS/AWOS network): 0.5° spacing — tighter than
+            #   before to capture more Plains/Southeast boundary-layer obs
+            # West of -100° (sparse network): 1.5° spacing
+            # Barnes OA uses KDTree radius queries (no full distance matrix) so
+            # memory is O(n_gp × avg_neighbors) — safe at higher station counts.
             occupied = {}
             thinned = []
             for st in stations_domain:
-                spacing = 0.75 if st['lon'] > -100.0 else 1.5
+                spacing = 0.5 if st['lon'] > -100.0 else 1.5
                 key = (int(st['lat'] / spacing), int(st['lon'] / spacing), spacing)
                 if key not in occupied:
                     occupied[key] = True
@@ -110,16 +121,15 @@ async def mesonet_worker():
             east_count = sum(1 for st in thinned if st['lon'] > -100.0)
             west_count = len(thinned) - east_count
             log.info(f'[mesonet] thinned {len(stations_domain)} → {len(thinned)} stations '
-                     f'(east={east_count}@0.75°, west={west_count}@1.5°)')
+                     f'(east={east_count}@0.5°, west={west_count}@1.5°)')
 
-            # Hard cap: IDW intermediate arrays scale as N_stations × N_gridpoints.
-            # At 1350 stations on a 1597×2345 grid that's ~20GB — OOM on Railway Hobby.
-            # Slice the front of the list; stations are already spatially distributed
-            # by the thinning loop so the cap preserves geographic spread.
-            MAX_STATIONS = 700
+            # Cap raised from 700 → 1500: Barnes OA is memory-safe at this count
+            # because it never builds a full distance matrix (KDTree radius queries
+            # only materialise ~5-20 station weights per gridpoint).
+            MAX_STATIONS = 1500
             if len(thinned) > MAX_STATIONS:
                 thinned = thinned[:MAX_STATIONS]
-                log.info(f'[mesonet] capped to {MAX_STATIONS} stations (memory limit)')
+                log.info(f'[mesonet] capped to {MAX_STATIONS} stations')
 
             if len(thinned) < 10:
                 log.warning('[mesonet] too few stations after thinning — skipping')
@@ -194,6 +204,10 @@ async def mesonet_worker():
             tmp_m.replace(MESONET_META_PATH)
             log.info(f'[mesonet] correction written: {len(thinned)} stations, '
                      f'{ny_small}×{nx_small} grid')
+
+            # Trigger a re-blend with the fresh correction.
+            # Fire-and-forget: don't await so mesonet_worker() resumes immediately.
+            asyncio.create_task(mesonet_triggered_blend())
 
             # Release large arrays immediately — KDTree + distance matrix
             # can hold hundreds of MB if the GC doesn't collect promptly.
@@ -451,6 +465,7 @@ async def run_cycle():
                         # Upsample correction to full RTMA resolution, crop ±1px
                         dt_full  = ndimage_zoom(dt,  UP, order=1)[:ny_full, :nx_full]
                         dtd_full = ndimage_zoom(dtd, UP, order=1)[:ny_full, :nx_full]
+                        _rtma_before_correction = rtma   # save base for re-blend cache
                         rtma = dict(rtma)
                         rtma['t2m']  = np.clip(
                             rtma['t2m']  + dt_full,  200.0, 340.0
@@ -486,6 +501,10 @@ async def run_cycle():
                 except Exception as e:
                     log.warning(f'[mesonet] correction read failed: {e} '
                                 f'— using raw RTMA')
+            # Always capture base RTMA for the re-blend cache even if correction
+            # was stale/missing/failed (the fresh-correction branch may not have run).
+            if '_rtma_before_correction' not in dir():
+                _rtma_before_correction = rtma
             # Ensure psfc is always present in rtma dict (stale/missing/failed correction)
             if 'psfc' not in rtma:
                 rtma['psfc'] = np.full_like(rtma['t2m'], 1000.0)
@@ -525,6 +544,18 @@ async def run_cycle():
                 except Exception as _e:
                     log.warning(f'[vad] load failed: {_e}')
 
+            # Cache raw (pre-correction) RTMA + upper-air for mesonet re-blend.
+            # The `del` of these locals below only unbinds the names; the cache
+            # keeps the arrays alive so a fresh-correction re-blend can reuse the
+            # same model data without re-fetching RRFS/RTMA.
+            global _cached_rtma_base, _cached_upper_air, _cached_tpw_data
+            global _cached_hrrr_hlcy, _cached_cycle_dt
+            _cached_rtma_base  = _rtma_before_correction
+            _cached_upper_air  = upper_air
+            _cached_tpw_data   = tpw_data
+            _cached_hrrr_hlcy  = hrrr_hlcy
+            _cached_cycle_dt   = now
+
             # Blend derivation is CPU-heavy; off-loaded to thread pool.
             # tpw_data is passed as third positional arg; blend() defaults to
             # None if not available so this is safe when TPW fetch failed.
@@ -547,6 +578,136 @@ async def run_cycle():
             log_memory('cycle end')
         except Exception as e:
             log.error(f'Cycle failed: {e}', exc_info=True)
+
+
+# ── Mesonet-triggered lightweight re-blend ────────────────────────────────────
+
+async def mesonet_triggered_blend():
+    """
+    Re-run blend() with fresh mesonet correction whenever new obs are written,
+    without re-fetching RRFS/RTMA (model data hasn't changed between cycles).
+
+    This gives ~10-minute output refresh for surface-derived fields (SBCAPE,
+    SBCIN, STP, LCL, Td depression) while keeping cycle time short (~30s vs
+    ~3min for a full cycle). Upper-air fields (SRH, BWD6, MUCAPE) are unchanged
+    between full RRFS cycles but still benefit from fresh VAD data.
+
+    Skips if: no cached data, cache older than 90min (next full cycle imminent),
+    or a full cycle is already running.
+    """
+    global _cached_rtma_base, _cached_upper_air, _cached_tpw_data
+    global _cached_hrrr_hlcy, _cached_cycle_dt
+
+    if _cached_rtma_base is None or _cached_upper_air is None:
+        return   # no successful full cycle yet
+
+    cache_age = (datetime.now(timezone.utc) - _cached_cycle_dt).total_seconds()
+    if cache_age > 90 * 60:
+        return   # cache too stale — full cycle will run soon anyway
+
+    if _cycle_lock.locked():
+        return   # full cycle running — don't overlap
+
+    async with _cycle_lock:
+        try:
+            log.info(f'[re-blend] mesonet-triggered re-blend '
+                     f'(cache age={cache_age/60:.0f}min)')
+            log_memory('re-blend start')
+
+            FACTOR = 0.5
+            loop   = asyncio.get_running_loop()
+            now    = _cached_cycle_dt
+
+            # Start with the base (uncorrected) RTMA
+            rtma = _cached_rtma_base
+
+            # Apply the freshest mesonet correction
+            if (MESONET_META_PATH.exists() and
+                    MESONET_DT_PATH.exists() and MESONET_DTD_PATH.exists()):
+                try:
+                    corr_meta = json.loads(MESONET_META_PATH.read_text())
+                    updated   = datetime.fromisoformat(corr_meta['updated'])
+                    age_s     = (datetime.now(timezone.utc) - updated).total_seconds()
+                    if age_s < MESONET_MAX_AGE_S:
+                        ny_c = corr_meta['ny']; nx_c = corr_meta['nx']
+                        dt   = np.frombuffer(MESONET_DT_PATH.read_bytes(),
+                                             dtype=np.float32).reshape(ny_c, nx_c)
+                        dtd  = np.frombuffer(MESONET_DTD_PATH.read_bytes(),
+                                             dtype=np.float32).reshape(ny_c, nx_c)
+                        UP = 1.0 / FACTOR
+                        ny_full, nx_full = rtma['t2m'].shape
+                        dt_full  = ndimage_zoom(dt,  UP, order=1)[:ny_full, :nx_full]
+                        dtd_full = ndimage_zoom(dtd, UP, order=1)[:ny_full, :nx_full]
+                        rtma = dict(rtma)
+                        rtma['t2m']  = np.clip(rtma['t2m']  + dt_full,
+                                               200.0, 340.0).astype(np.float32)
+                        rtma['td2m'] = np.clip(rtma['td2m'] + dtd_full,
+                                               200.0, 320.0).astype(np.float32)
+                        if MESONET_DPSFC_PATH.exists():
+                            dp_raw = np.frombuffer(MESONET_DPSFC_PATH.read_bytes(),
+                                                   dtype=np.float32).reshape(ny_c, nx_c)
+                            dp_full = ndimage_zoom(dp_raw, UP, order=1)[:ny_full, :nx_full]
+                            rtma['psfc'] = np.clip(1013.25 + dp_full,
+                                                   850.0, 1050.0).astype(np.float32)
+                        else:
+                            rtma['psfc'] = np.full_like(rtma['t2m'], 1000.0)
+                        log.info(f'[re-blend] mesonet correction applied '
+                                 f'(age={age_s/60:.0f}min, '
+                                 f'stations={corr_meta["n_stations"]})')
+                    else:
+                        log.info(f'[re-blend] correction stale ({age_s/60:.0f}min) '
+                                 f'— re-blend skipped')
+                        return
+                except Exception as e:
+                    log.warning(f'[re-blend] correction load failed: {e} — skipping')
+                    return
+            else:
+                return   # no correction available yet
+
+            if 'psfc' not in rtma:
+                rtma['psfc'] = np.full_like(rtma['t2m'], 1000.0)
+
+            # Load fresh VAD data
+            vad_data = None
+            _vad_files = [VAD_U500_PATH, VAD_V500_PATH, VAD_U1000_PATH,
+                          VAD_V1000_PATH, VAD_COV_PATH, VAD_META_PATH]
+            if all(p.exists() for p in _vad_files):
+                try:
+                    vad_meta_j  = json.loads(VAD_META_PATH.read_text())
+                    vad_updated = datetime.fromisoformat(vad_meta_j['updated'])
+                    vad_age_s   = (datetime.now(timezone.utc) - vad_updated).total_seconds()
+                    if vad_age_s < VAD_MAX_AGE_S:
+                        ny_v = vad_meta_j['ny']; nx_v = vad_meta_j['nx']
+                        UP = 1.0 / FACTOR
+                        ny_full, nx_full = rtma['t2m'].shape
+                        def _load_up(path, order):
+                            a = np.frombuffer(path.read_bytes(),
+                                              dtype=np.float32).reshape(ny_v, nx_v)
+                            return ndimage_zoom(a, UP, order=order)[:ny_full, :nx_full].astype(np.float32)
+                        vad_data = {
+                            'u500':  _load_up(VAD_U500_PATH,  1),
+                            'v500':  _load_up(VAD_V500_PATH,  1),
+                            'u1000': _load_up(VAD_U1000_PATH, 1),
+                            'v1000': _load_up(VAD_V1000_PATH, 1),
+                            'cov':   _load_up(VAD_COV_PATH,   0),
+                        }
+                except Exception:
+                    pass
+
+            blended = await loop.run_in_executor(
+                _thread_pool, do_blend,
+                rtma, _cached_upper_air, _cached_tpw_data, _cached_hrrr_hlcy, vad_data
+            )
+            write_output(blended, now)
+
+            del rtma, blended
+            gc.collect()
+            log.info('[re-blend] complete')
+            log_memory('re-blend end')
+
+        except Exception as e:
+            log.error(f'[re-blend] failed: {e}', exc_info=True)
+            gc.collect()
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
