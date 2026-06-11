@@ -68,8 +68,14 @@ const SIDECAR_URL = process.env.SIDECAR_URL || null;
 // instantly from memory instead of fetching 14 MB from the sidecar.
 // Cache stores compressed bytes — compression runs once per sidecar cycle,
 // every subsequent request within the TTL pays zero gzip cost.
-let blendCache = { raw: null, compressed: null, metaHeader: null, expires: 0 };
-const BLEND_CACHE_TTL = 45 * 60 * 1000;   // 45 min — refresh before next sidecar cycle
+let blendCache = { raw: null, compressed: null, metaHeader: null, cacheKey: null, fetchedAt: 0 };
+// No fixed TTL — the cache is invalidated by valid_time change (cheap meta
+// check), not a timer. The sidecar rewrites every ~10 min (mesonet re-blend)
+// or ~60 min (full cycle). MAX_STALE_MS is only a safety net: if the meta
+// endpoint is unreachable we serve the cached copy rather than refetch 14 MB on
+// every request, but never for longer than this so a stuck meta can't freeze
+// output indefinitely.
+const MAX_STALE_MS = 75 * 60 * 1000;   // 75 min — longer than a full cycle
 
 // Archived hour blend cache — immutable once fetched (past cycles never change).
 // Grows to at most ARCHIVE_HOURS (6) entries × ~13 MB compressed each ≈ 80 MB.
@@ -77,10 +83,42 @@ const BLEND_CACHE_TTL = 45 * 60 * 1000;   // 45 min — refresh before next side
 const hourBlendCache = new Map();
 
 async function getBlendAll() {
-    const now = Date.now();
-    if (blendCache.compressed && now < blendCache.expires) {
-        return blendCache;   // already compressed — instant, no sidecar round-trip
+    // ── Step 1: cheap check against sidecar meta.json ───────────────────────
+    // meta.json is a tiny JSON file (~200 bytes) written atomically every time
+    // the sidecar produces new output. We key on `generated_at` (wall-clock
+    // write time), which changes on EVERY write — including the ~10-min mesonet
+    // re-blends that keep `valid_time` fixed at the model cycle hour. Fall back
+    // to valid_time for older sidecars that don't emit generated_at yet.
+    // Checked first (< 5 ms) before deciding whether to fetch the 14 MB binary.
+    let latestKey = null;
+    try {
+        const metaResp = await fetch(`${SIDECAR_URL}/blend/meta`, {
+            signal: AbortSignal.timeout(5_000),
+        });
+        if (metaResp.ok) {
+            const metaJson = await metaResp.json();
+            latestKey = metaJson.generated_at || metaJson.valid_time || null;
+        }
+    } catch {
+        // meta fetch failed — handled below (serve cache if we have one)
     }
+
+    // ── Step 2: serve cache when safe ───────────────────────────────────────
+    // Only consider the cache fresh enough if it's younger than MAX_STALE_MS.
+    const cacheAge = blendCache.compressed ? (Date.now() - blendCache.fetchedAt) : Infinity;
+    if (blendCache.compressed && cacheAge < MAX_STALE_MS) {
+        if (latestKey && latestKey === blendCache.cacheKey) {
+            return blendCache;   // confirmed unchanged — instant, zero sidecar cost
+        }
+        if (!latestKey) {
+            // Meta unreachable (transient sidecar hiccup): serve the cached copy
+            // rather than refetch 14 MB on every request. Bounded by MAX_STALE_MS.
+            return blendCache;
+        }
+        // else: generated_at changed → fall through and fetch fresh data.
+    }
+
+    // ── Step 3: cache miss / changed / too stale — fetch full binary ────────
     const t0 = Date.now();
     const resp = await fetch(`${SIDECAR_URL}/blend/all`, {
         signal: AbortSignal.timeout(120_000),
@@ -93,7 +131,17 @@ async function getBlendAll() {
         zlib.gzip(raw, { level: 1 }, (err, r) => err ? reject(err) : resolve(r))
     );
     console.log(`[blend] compressed: ${(compressed.length / 1024 / 1024).toFixed(1)}MB  ratio=${(raw.length / compressed.length).toFixed(1)}x  took=${Date.now() - t0}ms`);
-    blendCache = { raw, compressed, metaHeader, expires: now + BLEND_CACHE_TTL };
+
+    // Prefer the key from the meta check; fall back to the X-Meso-Meta header.
+    let newKey = latestKey;
+    if (!newKey) {
+        try {
+            const h = JSON.parse(metaHeader);
+            newKey = h.generated_at || h.valid_time || null;
+        } catch {}
+    }
+
+    blendCache = { raw, compressed, metaHeader, cacheKey: newKey, fetchedAt: Date.now() };
     return blendCache;
 }
 
@@ -619,6 +667,32 @@ async function handle(req, res) {
             } : null,
         }));
         return true;
+    }
+
+    // ── GET /rap/blend/meta ──────────────────────────────────────────────────
+    // Tiny JSON passthrough — used by getBlendAll() for cheap revalidation.
+    // Returns the sidecar's meta.json: {valid_time, nx, ny, ...} (~200 bytes).
+    if (p === '/blend/meta') {
+        if (!SIDECAR_URL) {
+            res.writeHead(503, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'SIDECAR_URL not set' }));
+            return true;
+        }
+        try {
+            const r = await fetch(`${SIDECAR_URL}/blend/meta`, {
+                signal: AbortSignal.timeout(5_000),
+            });
+            const body = await r.text();
+            res.writeHead(r.status, {
+                'Content-Type':                'application/json',
+                'Cache-Control':               'no-cache',
+                'Access-Control-Allow-Origin': '*',
+            });
+            return res.end(body);
+        } catch (err) {
+            res.writeHead(503);
+            return res.end(JSON.stringify({ error: err.message }));
+        }
     }
 
     // ── GET /rap/blend/history ───────────────────────────────────────────────

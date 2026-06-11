@@ -56,6 +56,22 @@ async def handle_status(request):
     except Exception as e:
         return web.json_response({'ready': False, 'error': str(e)})
 
+async def handle_blend_meta(request: web.Request) -> web.Response:
+    """Lightweight metadata endpoint for Node revalidation.
+    Returns meta.json (~200 bytes) so rap.js can check valid_time
+    before deciding whether to fetch the full 14MB blend binary."""
+    path = OUT_DIR / 'meta.json'
+    if not path.exists():
+        raise web.HTTPServiceUnavailable(reason='meta.json not ready')
+    return web.Response(
+        text=path.read_text(),
+        content_type='application/json',
+        headers={
+            'Cache-Control':               'no-cache',
+            'Access-Control-Allow-Origin': '*',
+        },
+    )
+
 async def handle_blend_history(request: web.Request) -> web.Response:
     """Return history.json — list of available archived hour keys."""
     path = OUT_DIR / 'history.json'
@@ -133,6 +149,7 @@ async def start_server():
     # Literal routes before parameterised so aiohttp never ambiguates them.
     app.router.add_get('/blend/history',       handle_blend_history)
     app.router.add_get('/blend/all',           handle_all)
+    app.router.add_get('/blend/meta',          handle_blend_meta)
     app.router.add_get('/blend/status',        handle_status)
     # Parameterised route last — matches any /blend/<10-digit-hour>
     app.router.add_get('/blend/{hour}',        handle_blend_hour)

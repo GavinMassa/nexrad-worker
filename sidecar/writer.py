@@ -1,7 +1,7 @@
 import json, logging, shutil
 import numpy as np
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from scipy.ndimage import zoom
 
 log = logging.getLogger(__name__)
@@ -129,6 +129,11 @@ def write_output(grids: dict, cycle_dt: datetime) -> None:
         'lon_min':    lon_min,
         'lon_max':    lon_max,
         'valid_time': cycle_dt.isoformat(),
+        # Wall-clock write time — changes on EVERY write, including the ~10-min
+        # mesonet re-blends that keep valid_time fixed at the model cycle hour.
+        # rap.js revalidates its cache against this, not valid_time, so surface
+        # re-blends actually reach clients.
+        'generated_at': datetime.now(timezone.utc).isoformat(),
         'params':     params,
         'source':     f'RTMA+RAP blend, clipped+downsampled {DOWNSAMPLE_FACTOR}× '
                       f'from {src_ny}×{src_nx} → {src_ny_clip}×{src_nx_clip}',
