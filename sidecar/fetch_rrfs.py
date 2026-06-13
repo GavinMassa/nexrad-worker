@@ -88,6 +88,8 @@ FIELDS_2DFLD: list[tuple[str, str]] = [
     ('vstm',   ':VSTM:6000-0 m above ground:'),
     ('pwat',   ':PWAT:entire atmosphere (considered as a single layer):'),
     ('gh_sfc', ':HGT:surface:'),
+    ('t2m_rap',  ':TMP:2 m above ground:'),
+    ('td2m_rap', ':DPT:2 m above ground:'),
 ]
 
 # All fields combined (for result initialisation)
