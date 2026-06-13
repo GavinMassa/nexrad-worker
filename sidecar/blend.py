@@ -321,7 +321,8 @@ def compute_cape_cin_lifted(
     field and the output is later downsampled+blurred, so the ~25 km effective
     resolution is visually indistinguishable (SPC mesoanalysis itself is 40 km).
 
-    Returns (sbcape, sbcin, mlcape) — each float32 (ny, nx), CAPE >= 0, CIN <= 0.
+    Returns (sbcape, sbcin, mlcape, eff_base_p, eff_top_p) — all float32 (ny, nx).
+    CAPE >= 0, CIN <= 0. eff_base_p/eff_top_p in mb; 0 where no effective inflow.
     """
     import warnings as _w
 
@@ -350,7 +351,7 @@ def compute_cape_cin_lifted(
     if len(valid_levels) < 2:
         log.warning('[cape] fewer than 2 valid upper-air levels — returning zeros')
         zero = np.zeros((ny, nx), dtype=np.float32)
-        return zero, zero, zero
+        return zero, zero, zero, zero, zero
 
     # Upper-air pressure levels (mb), descending — fixed for all gridpoints.
     # The surface pressure is per-point (P_SFC) and prepended inside the loop,
@@ -384,6 +385,12 @@ def compute_cape_cin_lifted(
     cap_c = np.zeros(cny * cnx, dtype=np.float32)
     cin_c = np.zeros(cny * cnx, dtype=np.float32)
     mlc_c = np.zeros(cny * cnx, dtype=np.float32)
+    # Effective inflow layer bounds (pressure, mb).
+    # eff_base_c: surface pressure where SBCAPE≥100 & SBCIN≥-250 (viable inflow).
+    # eff_top_c:  EL pressure from the surface parcel lift.
+    # Both 0.0 where no effective inflow layer exists.
+    eff_base_c = np.zeros(cny * cnx, dtype=np.float32)
+    eff_top_c  = np.zeros(cny * cnx, dtype=np.float32)
 
     n_fail = 0
     with _w.catch_warnings():
@@ -437,6 +444,29 @@ def compute_cape_cin_lifted(
                 ml_prof = mpcalc.parcel_profile(p_u, ml_T, ml_Td)
                 ml_cape, _ = mpcalc.cape_cin(p_u, T_u, Td_u, ml_prof)
                 mlc_c[idx] = float(ml_cape.magnitude)
+
+                # ── Effective inflow layer detection ──────────────────────────
+                # Effective base = surface if SBCAPE≥100 AND SBCIN≥-250.
+                # Effective top  = EL pressure from the surface parcel lift.
+                # Where neither condition is met, both stay 0 (no inflow).
+                sb_cape_val = float(sb_cape.magnitude)
+                sb_cin_val  = float(sb_cin.magnitude)
+
+                if sb_cape_val >= 100.0 and sb_cin_val >= -250.0:
+                    # Surface parcel is viable — effective base is surface
+                    eff_base_c[idx] = p_sfc_pt
+
+                    # Effective top = EL pressure from surface parcel lift
+                    try:
+                        el_p, _ = mpcalc.el(p_u, T_u, Td_u, sb_prof)
+                        if el_p is not None and not np.isnan(el_p.magnitude):
+                            eff_top_c[idx] = float(el_p.magnitude)
+                        else:
+                            eff_top_c[idx] = float(p_col[-1])  # top of sounding
+                    except Exception:
+                        eff_top_c[idx] = float(p_col[-1])
+                # else: no effective inflow — eff_base_c and eff_top_c stay 0
+
             except Exception:
                 # MetPy's lfc/el can raise on degenerate soundings — leave 0.
                 n_fail += 1
@@ -445,6 +475,8 @@ def compute_cape_cin_lifted(
     cap_c = np.nan_to_num(cap_c, nan=0.0, posinf=0.0, neginf=0.0).reshape(cny, cnx)
     cin_c = np.nan_to_num(cin_c, nan=0.0, posinf=0.0, neginf=0.0).reshape(cny, cnx)
     mlc_c = np.nan_to_num(mlc_c, nan=0.0, posinf=0.0, neginf=0.0).reshape(cny, cnx)
+    eff_base_c = np.nan_to_num(eff_base_c, nan=0.0).reshape(cny, cnx)
+    eff_top_c  = np.nan_to_num(eff_top_c,  nan=0.0).reshape(cny, cnx)
 
     # ── Interpolate coarse result back to full RTMA resolution ────────────────
     def _upscale(coarse: np.ndarray) -> np.ndarray:
@@ -456,9 +488,11 @@ def compute_cape_cin_lifted(
                              np.arange(nx, dtype=np.float64), indexing='ij')
         return f((RR, CC)).astype(np.float32)
 
-    sbcape = np.maximum(0.0, _upscale(cap_c)).astype(np.float32)
-    sbcin  = np.clip(_upscale(cin_c), -300.0, 0.0).astype(np.float32)
-    mlcape = np.maximum(0.0, _upscale(mlc_c)).astype(np.float32)
+    sbcape     = np.maximum(0.0, _upscale(cap_c)).astype(np.float32)
+    sbcin      = np.clip(_upscale(cin_c), -300.0, 0.0).astype(np.float32)
+    mlcape     = np.maximum(0.0, _upscale(mlc_c)).astype(np.float32)
+    eff_base_p = _upscale(eff_base_c)   # mb; 0 = no effective inflow
+    eff_top_p  = _upscale(eff_top_c)    # mb
 
     log.info(f'[cape] MetPy coarse {cny}×{cnx} (step={COARSE_STEP}) → {ny}×{nx}; '
              f'{n_fail} sounding failures')
@@ -467,8 +501,16 @@ def compute_cape_cin_lifted(
     log.info(f'[sbcin]  MetPy: min={float(sbcin.min()):.0f} J/kg')
     log.info(f'[mlcape] MetPy: max={float(mlcape.max()):.0f} J/kg '
              f'active={int((mlcape > 0).sum())} cells')
+    n_eff = int((eff_base_p > 0).sum())
+    log.info(f'[estp] effective inflow: {n_eff} active gridpoints '
+             f'eff_base range='
+             f'{float(eff_base_p[eff_base_p>0].min()) if n_eff else 0:.0f}'
+             f'–{float(eff_base_p.max()):.0f} mb '
+             f'eff_top range='
+             f'{float(eff_top_p[eff_top_p>0].min()) if n_eff else 0:.0f}'
+             f'–{float(eff_top_p.max()):.0f} mb')
 
-    return sbcape, sbcin, mlcape
+    return sbcape, sbcin, mlcape, eff_base_p, eff_top_p
 
 
 def _apply_bl_thermal_correction(
@@ -760,9 +802,11 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
 
     if len(lift_levels) >= 2:
         _psfc_grid = rtma.get('psfc', None)
-        sbcape_lifted, sbcin_lifted, mlcape_lifted = compute_cape_cin_lifted(
-            t2m, td2m, lift_levels, psfc=_psfc_grid
+        sbcape_lifted, sbcin_lifted, mlcape_lifted, eff_base_p, eff_top_p = (
+            compute_cape_cin_lifted(t2m, td2m, lift_levels, psfc=_psfc_grid)
         )
+        out['eff_base_p'] = eff_base_p   # mb; used internally for ESTP
+        out['eff_top_p']  = eff_top_p    # mb; used internally for ESTP
         raw_sbcape = np.maximum(0.0, sbcape_lifted)
         out['sbcape'] = np.where(
             raw_sbcape >= SBCAPE_MIN, raw_sbcape, 0.0
@@ -1011,6 +1055,149 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
                      f'vad_max={vad_max:.0f} blended_max={float(out["srh1"].max()):.0f}')
         except Exception as _e:
             log.warning(f'[srh1] VAD overlay skipped: {_e}')
+
+    # --- Effective-layer SRH (ESTP prerequisite) ---------------------------
+    # Hodograph integral from the effective inflow base to the effective top.
+    # Wind levels used:
+    #   surface: RTMA 10m (observed)
+    #   950mb:   BL-corrected via exponential decay (same formula as srh1)
+    #   925mb:   BL-corrected
+    #   850mb:   BL-corrected
+    # The integral covers only the fraction of each layer that lies within
+    # [eff_base_p, eff_top_p].  For the typical surface-based effective layer
+    # (eff_base = psfc ≈ 1000mb, eff_top = 200–300mb) the full 0-1km
+    # hodograph is included, giving eff_SRH ≈ SRH1 for classic supercell
+    # environments — consistent with Thompson et al. (2004).
+    _u850c = _v850c = None   # set below if conditions met; fallback for eff_bwd
+    if ('eff_base_p' in out and 'eff_top_p' in out
+            and ustm_i is not None and vstm_i is not None
+            and u850_i is not None and v850_i is not None):
+        try:
+            eff_base = out['eff_base_p']   # mb, 0 = no inflow
+            eff_top  = out['eff_top_p']    # mb
+            active   = eff_base > 0        # boolean mask: effective inflow exists
+
+            # z0 is already in scope from the SRH block above (set at line
+            # "z0 = np.clip(lcl, 400.0, 1200.0)").
+            du_anom_eff = u10 - u10_rap if u10_rap is not None else np.zeros_like(u10)
+            dv_anom_eff = v10 - v10_rap if v10_rap is not None else np.zeros_like(v10)
+
+            # BL-corrected winds at each level
+            _u850c = u850_i + du_anom_eff * np.exp(-1500.0 / z0)
+            _v850c = v850_i + dv_anom_eff * np.exp(-1500.0 / z0)
+
+            _has950 = (u950_i is not None and v950_i is not None
+                       and u925_i is not None and v925_i is not None)
+            if _has950:
+                _u950c = u950_i + du_anom_eff * np.exp(-500.0 / z0)
+                _v950c = v950_i + dv_anom_eff * np.exp(-500.0 / z0)
+                _u925c = u925_i + du_anom_eff * np.exp(-750.0 / z0)
+                _v925c = v925_i + dv_anom_eff * np.exp(-750.0 / z0)
+
+            # Hodograph layers (pressure ranges, mb):
+            #   L1: sfc → 950mb  (~0–500m AGL)
+            #   L2: 950 → 925mb  (~500–750m AGL)
+            #   L3: 925 → 850mb  (~750–1500m AGL)
+            # For each layer the layer is counted only when eff_top is above
+            # the top of that layer (i.e., the EL is high enough to include it)
+            # AND the effective base is at or below the layer bottom.
+            # Layer pressure bounds (mb):
+            _p_l1_bot, _p_l1_top = 1000.0, 950.0   # nominal; sfc pressure varies
+            _p_l2_bot, _p_l2_top = 950.0,  925.0
+            _p_l3_bot, _p_l3_top = 925.0,  850.0
+
+            # Boolean: effective layer covers this layer?
+            # Condition: eff_top (lower mb = higher altitude) < layer_top_pressure
+            # i.e., EL is above the layer top.
+            in_l1 = active & (eff_top < _p_l1_top)
+            in_l2 = active & (eff_top < _p_l2_top) & _has950
+            in_l3 = active & (eff_top < _p_l3_top) & _has950
+
+            # Layer SRH contributions (same cross-product formula as srh1)
+            srh_eff = np.zeros_like(u10)
+            if _has950:
+                _l1 = ((u10    - ustm_i) * (_v950c - v10  ) -
+                       (v10    - vstm_i) * (_u950c - u10  ))
+                _l2 = ((_u950c - ustm_i) * (_v925c - _v950c) -
+                       (_v950c - vstm_i) * (_u925c - _u950c))
+                _l3 = ((_u925c - ustm_i) * (_v850c - _v925c) -
+                       (_v925c - vstm_i) * (_u850c - _u925c))
+                srh_eff = (np.where(in_l1, _l1, 0.0) +
+                           np.where(in_l2, _l2, 0.0) +
+                           np.where(in_l3, _l3, 0.0))
+            else:
+                # 1-layer fallback: sfc → 850mb
+                in_l_sfc_850 = active & (eff_top < 850.0)
+                _l_sfc = ((u10 - ustm_i) * (_v850c - v10) -
+                          (v10 - vstm_i) * (_u850c - u10))
+                srh_eff = np.where(in_l_sfc_850, _l_sfc, 0.0)
+
+            srh_eff = np.clip(np.abs(srh_eff), 0.0, 1200.0).astype(np.float32)
+
+            # Optional VAD overlay (same logic as srh1)
+            if (vad_data is not None and ustm_i is not None and vstm_i is not None):
+                try:
+                    cov    = vad_data['cov']
+                    u500v  = vad_data['u500'];   v500v  = vad_data['v500']
+                    u1000v = vad_data['u1000'];  v1000v = vad_data['v1000']
+                    l1v = ((u10    - ustm_i) * (v500v  - v10  ) - (v10   - vstm_i) * (u500v  - u10  ))
+                    l2v = ((u500v  - ustm_i) * (v1000v - v500v) - (v500v - vstm_i) * (u1000v - u500v))
+                    srh_eff_vad = np.clip(np.abs(l1v + l2v), 0.0, 1200.0).astype(np.float32)
+                    covm_eff = (cov > 0) & active
+                    blend_eff = (0.65 * srh_eff_vad + 0.35 * srh_eff).astype(np.float32)
+                    srh_eff = np.where(covm_eff, blend_eff, srh_eff).astype(np.float32)
+                except Exception as _ev:
+                    log.warning(f'[eff_srh] VAD overlay skipped: {_ev}')
+
+            out['eff_srh'] = srh_eff
+            log.info(f'[eff_srh] max={float(srh_eff.max()):.0f} '
+                     f'active={int((srh_eff > 0).sum())} cells')
+        except Exception as _e:
+            log.warning(f'[eff_srh] computation failed: {_e}')
+
+    # --- Effective-layer BWD (ESTP prerequisite) ---------------------------
+    # Bulk vector difference from the effective inflow base to the effective top.
+    # Top level wind: 850mb (corrected) when EL ≤ 850mb, else 500mb.
+    # Base level wind: RTMA 10m (same as STP surface wind).
+    if ('eff_top_p' in out and u850_i is not None and v850_i is not None
+            and u500_i is not None and v500_i is not None):
+        try:
+            eff_top  = out['eff_top_p']
+            _u850_top = _u850c if _u850c is not None else u850_i
+            _v850_top = _v850c if _v850c is not None else v850_i
+            top_u = np.where(eff_top > 850.0, _u850_top, u500_i)
+            top_v = np.where(eff_top > 850.0, _v850_top, v500_i)
+            eff_bwd = np.sqrt((top_u - u10)**2 + (top_v - v10)**2).astype(np.float32)
+            eff_bwd = np.where(out['eff_base_p'] > 0, eff_bwd, 0.0).astype(np.float32)
+            out['eff_bwd'] = eff_bwd
+            log.info(f'[eff_bwd] max={float(eff_bwd.max()):.1f} m/s '
+                     f'active={int((eff_bwd > 0).sum())} cells')
+        except Exception as _e:
+            log.warning(f'[eff_bwd] computation failed: {_e}')
+
+    # --- Effective-layer STP (ESTP, Thompson et al. 2004) ------------------
+    # ESTP = (MLCAPE/1500) × (eff_SRH/150) × clip(eff_BWD/12, 0, 1.5)
+    #      × clip((2000−LCL)/1000, 0, 1) × clip((200+SBCIN)/150, 0, 1)
+    # MLCAPE from the lifted-parcel section (obs-anchored mixed-layer).
+    # All terms clamped to ≥0; ESTP=0 where no effective inflow exists.
+    if ('mlcape_lifted' in out and 'eff_srh' in out and 'eff_bwd' in out
+            and 'sbcin' in out and 'eff_base_p' in out):
+        try:
+            mlcape_term = out['mlcape_lifted'] / 1500.0
+            srh_term_e  = out['eff_srh'] / 150.0
+            bwd_term_e  = np.clip(out['eff_bwd'] / 12.0, 0.0, 1.5)
+            lcl_term_e  = np.clip((2000.0 - lcl) / 1000.0, 0.0, 1.0).astype(np.float32)
+            cin_term_e  = np.clip((200.0 + out['sbcin']) / 150.0, 0.0, 1.0)
+            raw_estp    = mlcape_term * srh_term_e * bwd_term_e * lcl_term_e * cin_term_e
+            # Zero out where no effective inflow
+            raw_estp    = np.where(out['eff_base_p'] > 0, raw_estp, 0.0)
+            out['estp'] = np.nan_to_num(
+                np.maximum(0.0, raw_estp), nan=0.0, posinf=0.0, neginf=0.0,
+            ).astype(np.float32)
+            log.info(f'[estp] max={float(out["estp"].max()):.2f} '
+                     f'active={int((out["estp"] > 0).sum())} cells')
+        except Exception as _e:
+            log.warning(f'[estp] computation failed: {_e}')
 
     # --- 0-6km BWD: pure bulk vector difference (V500mb − V10m_RTMA) ---------
     # Breaking into sub-layers and summing magnitudes computes total hodograph
