@@ -172,9 +172,14 @@ async def mesonet_worker():
             _psfc_bg = np.full_like(grid_t2m, 1013.25, dtype=np.float32)
             if MESONET_DPSFC_PATH.exists():
                 try:
-                    _dp = np.frombuffer(MESONET_DPSFC_PATH.read_bytes(),
-                                        dtype=np.float32).reshape(ny_small, nx_small)
-                    _psfc_bg = np.clip(1013.25 + _dp, 850.0, 1050.0).astype(np.float32)
+                    _dp_bytes = MESONET_DPSFC_PATH.read_bytes()
+                    _dp_flat  = np.frombuffer(_dp_bytes, dtype=np.float32)
+                    # File may be full-size (post-fix) or small-size (pre-fix).
+                    # Only use it if it reshapes cleanly to the current small grid.
+                    if _dp_flat.size == ny_small * nx_small:
+                        _dp = _dp_flat.reshape(ny_small, nx_small)
+                        _psfc_bg = np.clip(1013.25 + _dp, 850.0, 1050.0).astype(np.float32)
+                    # else: wrong size (post-fix full-size file) — leave at 1013.25
                 except Exception:
                     pass
 
@@ -183,19 +188,59 @@ async def mesonet_worker():
                 thinned, grid_lats, grid_lons, grid_t2m, grid_td2m, _psfc_bg,
             )
 
-            # Write correction files atomically — run_cycle() may read at any time
+            # Upsample correction from downsampled-clipped back to clipped size,
+            # then embed into a full RTMA-sized zero array using the saved masks.
+            # This ensures corrections are spatially aligned with _cached_rtma_base
+            # so no zoom is needed at apply time in run_cycle / mesonet_triggered_blend.
+            UP = 1.0 / FACTOR   # = 2.0
+            dt_clip  = ndimage_zoom(delta_t,    UP, order=1).astype(np.float32)
+            dtd_clip = ndimage_zoom(delta_td,   UP, order=1).astype(np.float32)
+            dp_clip  = ndimage_zoom(delta_psfc, UP, order=1).astype(np.float32)
+
+            # Load clip masks + full RTMA shape saved by _save_rtma_ref().
+            # Skip the write entirely if they haven't been written yet
+            # (first startup before any full cycle completes).
+            try:
+                row_mask = np.frombuffer(
+                    (OUT_DIR / 'rtma_row_mask.bin').read_bytes(), dtype=np.uint8
+                ).astype(bool)   # shape (ny_full,)
+                col_mask = np.frombuffer(
+                    (OUT_DIR / 'rtma_col_mask.bin').read_bytes(), dtype=np.uint8
+                ).astype(bool)   # shape (nx_full,)
+                ref_meta_j = json.loads((OUT_DIR / 'rtma_ref_meta.json').read_text())
+                ny_full    = ref_meta_j['ny_full']
+                nx_full    = ref_meta_j['nx_full']
+            except FileNotFoundError:
+                log.warning('[mesonet] rtma ref masks not yet available — skipping correction write')
+                continue
+
+            # Build full-size correction arrays (zero outside clip domain)
+            ny_clip = int(row_mask.sum())
+            nx_clip = int(col_mask.sum())
+            dt_full  = np.zeros((ny_full, nx_full), dtype=np.float32)
+            dtd_full = np.zeros((ny_full, nx_full), dtype=np.float32)
+            dp_full  = np.zeros((ny_full, nx_full), dtype=np.float32)
+
+            # Trim to exactly match the mask region (handles zoom rounding)
+            dt_full [np.ix_(row_mask, col_mask)] = dt_clip [:ny_clip, :nx_clip]
+            dtd_full[np.ix_(row_mask, col_mask)] = dtd_clip[:ny_clip, :nx_clip]
+            dp_full [np.ix_(row_mask, col_mask)] = dp_clip [:ny_clip, :nx_clip]
+
+            ny_save, nx_save = ny_full, nx_full
+
+            # Write full-size corrections atomically — run_cycle() may read at any time
             for fpath, arr in [
-                (MESONET_DT_PATH,    delta_t),
-                (MESONET_DTD_PATH,   delta_td),
-                (MESONET_DPSFC_PATH, delta_psfc),
+                (MESONET_DT_PATH,    dt_full),
+                (MESONET_DTD_PATH,   dtd_full),
+                (MESONET_DPSFC_PATH, dp_full),
             ]:
                 tmp = fpath.parent / (fpath.name + '.tmp')
                 arr.tofile(str(tmp))
                 tmp.replace(fpath)
 
             meta_corr = {
-                'nx':         nx_small,
-                'ny':         ny_small,
+                'nx':         nx_save,
+                'ny':         ny_save,
                 'n_stations': len(thinned),
                 'updated':    datetime.now(timezone.utc).isoformat(),
             }
@@ -203,7 +248,7 @@ async def mesonet_worker():
             tmp_m.write_text(json.dumps(meta_corr))
             tmp_m.replace(MESONET_META_PATH)
             log.info(f'[mesonet] correction written: {len(thinned)} stations, '
-                     f'{ny_small}×{nx_small} grid')
+                     f'{ny_save}×{nx_save} grid (full RTMA size)')
 
             # Trigger a re-blend with the fresh correction.
             # Fire-and-forget: don't await so mesonet_worker() resumes immediately.
@@ -426,6 +471,16 @@ async def run_cycle():
                     arr.astype(np.float32).tofile(str(tmp))
                     tmp.replace(fpath)
                 log.info('[mesonet] saved clipped RTMA reference grids (t2m, td2m, lats, lons)')
+                # Save masks and full shape so mesonet_worker can embed corrections
+                # back into the full RTMA domain without needing the full lats/lons.
+                ny_f, nx_f = rtma_full['t2m'].shape
+                (OUT_DIR / 'rtma_row_mask.bin').write_bytes(row_mask.astype(np.uint8).tobytes())
+                (OUT_DIR / 'rtma_col_mask.bin').write_bytes(col_mask.astype(np.uint8).tobytes())
+                ref_meta = {'ny_full': ny_f, 'nx_full': nx_f,
+                            'ny_clip': int(row_mask.sum()), 'nx_clip': int(col_mask.sum())}
+                (OUT_DIR / 'rtma_ref_meta.json').write_text(json.dumps(ref_meta))
+                log.info(f'[mesonet] saved rtma_ref_meta: full={ny_f}×{nx_f} '
+                         f'clip={ref_meta["ny_clip"]}×{ref_meta["nx_clip"]}')
 
             await loop.run_in_executor(_thread_pool, _save_rtma_ref, rtma)
 
@@ -446,25 +501,18 @@ async def run_cycle():
                         dtd  = np.frombuffer(MESONET_DTD_PATH.read_bytes(),
                                              dtype=np.float32).reshape(ny_c, nx_c)
                         # Guard against stale correction from a previous RTMA domain
-                        # size (e.g. after a deploy that changes DOWNSAMPLE_FACTOR).
-                        # The correction is at FACTOR=0.5 resolution; upsampled back
-                        # to full RTMA must yield exactly ny_full×nx_full after crop.
-                        # If the correction's compressed dimensions don't match the
-                        # current RTMA shape when upsampled, discard and skip.
-                        UP = 1.0 / FACTOR
+                        # size (e.g. after a deploy or restart). Corrections are now
+                        # saved at full RTMA size — dimensions must match exactly.
                         ny_full, nx_full = rtma['t2m'].shape
-                        ny_corr_up = round(ny_c * UP)
-                        nx_corr_up = round(nx_c * UP)
-                        if abs(ny_corr_up - ny_full) > 4 or abs(nx_corr_up - nx_full) > 4:
+                        if ny_c != ny_full or nx_c != nx_full:
                             log.warning(
                                 f'[mesonet] correction shape mismatch: '
-                                f'correction={ny_c}×{nx_c} → upsampled={ny_corr_up}×{nx_corr_up} '
-                                f'vs RTMA={ny_full}×{nx_full} — discarding stale correction'
+                                f'{ny_c}×{nx_c} vs RTMA {ny_full}×{nx_full} — discarding'
                             )
                             raise ValueError('shape mismatch')
-                        # Upsample correction to full RTMA resolution, crop ±1px
-                        dt_full  = ndimage_zoom(dt,  UP, order=1)[:ny_full, :nx_full]
-                        dtd_full = ndimage_zoom(dtd, UP, order=1)[:ny_full, :nx_full]
+                        # Corrections are already at full RTMA size — no zoom needed
+                        dt_full  = dt
+                        dtd_full = dtd
                         _rtma_before_correction = rtma   # save base for re-blend cache
                         rtma = dict(rtma)
                         rtma['t2m']  = np.clip(
@@ -481,7 +529,7 @@ async def run_cycle():
                                 dp_raw = np.frombuffer(
                                     MESONET_DPSFC_PATH.read_bytes(),
                                     dtype=np.float32).reshape(ny_c, nx_c)
-                                dp_full = ndimage_zoom(dp_raw, UP, order=1)[:ny_full, :nx_full]
+                                dp_full = dp_raw   # already full size — no zoom needed
                                 rtma['psfc'] = np.clip(
                                     1013.25 + dp_full, 850.0, 1050.0
                                 ).astype(np.float32)
@@ -634,10 +682,16 @@ async def mesonet_triggered_blend():
                                              dtype=np.float32).reshape(ny_c, nx_c)
                         dtd  = np.frombuffer(MESONET_DTD_PATH.read_bytes(),
                                              dtype=np.float32).reshape(ny_c, nx_c)
-                        UP = 1.0 / FACTOR
                         ny_full, nx_full = rtma['t2m'].shape
-                        dt_full  = ndimage_zoom(dt,  UP, order=1)[:ny_full, :nx_full]
-                        dtd_full = ndimage_zoom(dtd, UP, order=1)[:ny_full, :nx_full]
+                        if ny_c != ny_full or nx_c != nx_full:
+                            log.warning(
+                                f'[mesonet] correction shape mismatch: '
+                                f'{ny_c}×{nx_c} vs RTMA {ny_full}×{nx_full} — discarding'
+                            )
+                            raise ValueError('shape mismatch')
+                        # Corrections are already at full RTMA size — no zoom needed
+                        dt_full  = dt
+                        dtd_full = dtd
                         rtma = dict(rtma)
                         rtma['t2m']  = np.clip(rtma['t2m']  + dt_full,
                                                200.0, 340.0).astype(np.float32)
@@ -646,7 +700,7 @@ async def mesonet_triggered_blend():
                         if MESONET_DPSFC_PATH.exists():
                             dp_raw = np.frombuffer(MESONET_DPSFC_PATH.read_bytes(),
                                                    dtype=np.float32).reshape(ny_c, nx_c)
-                            dp_full = ndimage_zoom(dp_raw, UP, order=1)[:ny_full, :nx_full]
+                            dp_full = dp_raw   # already full size — no zoom needed
                             rtma['psfc'] = np.clip(1013.25 + dp_full,
                                                    850.0, 1050.0).astype(np.float32)
                         else:
