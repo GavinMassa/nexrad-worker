@@ -471,6 +471,67 @@ def compute_cape_cin_lifted(
     return sbcape, sbcin, mlcape
 
 
+def _apply_bl_thermal_correction(
+    field_i:    np.ndarray,         # raw RRFS field at pressure level (K), (ny, nx)
+    sfc_field:  np.ndarray,         # RTMA or obs-corrected surface field (K), (ny, nx)
+    sfc_model:  np.ndarray | None,  # RRFS model surface field (K), (ny, nx) or None
+    z0:         np.ndarray,         # BL scale height (m), (ny, nx)
+    z_agl:      np.ndarray | None,  # geopotential height AGL of the level (m) or None
+    decay_z:    float,              # nominal height of this level AGL (m), e.g. 500 or 750
+    is_td:      bool = False,       # True when correcting Td (tighter ΔTd clamp)
+) -> np.ndarray:
+    """
+    Apply exponential-decay boundary layer correction to a pressure-level
+    field, with three physics guards:
+
+    Guard 1 — Terrain: if the level is at or below the surface
+        (z_agl <= 0), the correction weight is zeroed. Prevents
+        phantom corrections over the Rockies/High Plains where 950mb
+        is underground.
+
+    Guard 2 — Inversion: if the surface T anomaly would warm the BL
+        but a temperature inversion is present (field_i > sfc_field at
+        the same location), the correction is suppressed. This avoids
+        eroding nocturnal residual layers.
+
+    Guard 3 — Moisture discontinuity (Td only): clamp the surface
+        anomaly to ±2K before applying to Td, preventing dryline
+        gradients from being smeared vertically.
+
+    Returns corrected field (float32, same shape as field_i).
+    """
+    if sfc_model is None:
+        return field_i
+
+    # Surface anomaly (obs - model)
+    delta = (sfc_field - sfc_model).astype(np.float32)
+
+    # Guard 3: tighter clamp for moisture to avoid smearing dryline
+    max_delta = 2.0 if is_td else 5.0
+    delta = np.clip(delta, -max_delta, max_delta)
+
+    # Exponential decay weight
+    weight = np.exp(-decay_z / np.maximum(z0, 100.0)).astype(np.float32)
+
+    correction = delta * weight
+
+    # Guard 1: zero out where level is underground
+    if z_agl is not None:
+        correction = np.where(z_agl > 0.0, correction, 0.0)
+
+    # Guard 2: suppress inversion case
+    # If surface is COOLER than the level (inversion present), and we're
+    # trying to apply a negative (cooling) correction, let it through —
+    # that's physically consistent. But if surface is warmer and an
+    # inversion is present (surface decoupled from BL above), suppress.
+    inversion_mask = field_i > (sfc_field + 1.0)   # >1K warmer than surface
+    warming_correction = correction > 0.0
+    suppress = inversion_mask & warming_correction
+    correction = np.where(suppress, 0.0, correction)
+
+    return (field_i + correction).astype(np.float32)
+
+
 def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
           hrrr_hlcy: dict | None = None, vad_data: dict | None = None) -> dict:
     """
@@ -554,6 +615,9 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
     rh300_i  = interp(upper_air.get('rh300'),    'rh300')
     t200_i   = interp(upper_air.get('t200'),     't200')
     rh200_i  = interp(upper_air.get('rh200'),    'rh200')
+    gh925_i  = interp(upper_air.get('gh925'),    'gh925')
+    gh950_i  = interp(upper_air.get('gh950'),    'gh950')
+    gh_sfc_i = interp(upper_air.get('gh_sfc'),   'gh_sfc')
 
     def _rh_to_td(T_K: np.ndarray, rh: np.ndarray):
         """Convert RH (0–100) + T (K) to Td (K) via Bolton inverse."""
@@ -620,6 +684,60 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
     td300_i = _rh_to_td(t300_i, rh300_i)
     td200_i = _rh_to_td(t200_i, rh200_i)
 
+    # ── Stability-gated BL thermal correction for MLCAPE ─────────────────
+    # Propagates the RTMA surface obs anomaly into the lowest BL levels
+    # (950mb, 925mb) used in the mixed-layer parcel average.
+    # Three guards prevent non-physical artifacts: terrain, inversions,
+    # and moisture discontinuities. See _apply_bl_thermal_correction().
+    if t2m_rap is not None:
+        # z0: BL scale height from LCL approximation — mirrors the formula
+        # used later in the SRH section. Computed here so the correction
+        # can run before lift_levels is constructed (LCL block runs after
+        # the CAPE section in this file, so z0 must be derived inline).
+        _bl_t2m_c   = t2m  - 273.15
+        _bl_td2m_c  = td2m - 273.15
+        _bl_lcl_den = np.maximum(0.0012 + 0.00012 * _bl_t2m_c, 1e-4)
+        _bl_lcl     = (_bl_t2m_c - _bl_td2m_c) / _bl_lcl_den
+        z0 = np.clip(_bl_lcl, 400.0, 1200.0)
+
+        # Geopotential height AGL: level height minus surface height (m).
+        # gh fields are in metres; subtract surface geopotential.
+        # None if either field was unavailable.
+        z950_agl = (gh950_i - gh_sfc_i).astype(np.float32) \
+                   if gh950_i is not None and gh_sfc_i is not None else None
+        z925_agl = (gh925_i - gh_sfc_i).astype(np.float32) \
+                   if gh925_i is not None and gh_sfc_i is not None else None
+
+        if t950_i is not None:
+            t950_i = _apply_bl_thermal_correction(
+                t950_i, t2m, t2m_rap, z0, z950_agl,
+                decay_z=500.0, is_td=False,
+            )
+        if td950_i is not None:
+            td2m_rap_field = td2m_rap if td2m_rap is not None else None
+            if td2m_rap_field is not None:
+                td950_i = _apply_bl_thermal_correction(
+                    td950_i, td2m, td2m_rap_field, z0, z950_agl,
+                    decay_z=500.0, is_td=True,
+                )
+        if t925_i is not None:
+            t925_i = _apply_bl_thermal_correction(
+                t925_i, t2m, t2m_rap, z0, z925_agl,
+                decay_z=750.0, is_td=False,
+            )
+        if td925_i is not None:
+            td2m_rap_field = td2m_rap if td2m_rap is not None else None
+            if td2m_rap_field is not None:
+                td925_i = _apply_bl_thermal_correction(
+                    td925_i, td2m, td2m_rap_field, z0, z925_agl,
+                    decay_z=750.0, is_td=True,
+                )
+        log.info(f'[mlcape] BL thermal correction applied: '
+                 f'950mb_terrain_guard={z950_agl is not None}, '
+                 f'925mb_terrain_guard={z925_agl is not None}')
+    else:
+        log.info('[mlcape] BL thermal correction skipped: t2m_rap unavailable')
+
     # Levels in descending pressure order (surface → tropopause).
     # Upper levels (600→200 mb) are essential: the EL for strong convection
     # is at 200–250 mb, and the 500→200 mb layer contributes 1500–3000 J/kg.
@@ -663,6 +781,11 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
         log.info(f'[cape_diag] t2m_sample={float(t2m.flat[t2m.size//2]):.1f}K '
                  f'td2m_sample={float(td2m.flat[td2m.size//2]):.1f}K '
                  f'mucape_ref={float(mucape_i.max()) if mucape_i is not None else "N/A":.0f}')
+        log.info(f'[mlcape] BL-corrected 950mb sample: '
+                 f't={float(t950_i.flat[t950_i.size//2]):.1f}K '
+                 f'td={float(td950_i.flat[td950_i.size//2]):.1f}K'
+                 if t950_i is not None and td950_i is not None else
+                 '[mlcape] 950mb fields unavailable for BL correction check')
     else:
         # Fallback: fewer than 2 upper-air levels — use old linear correction
         log.warning('[sbcape] fewer than 2 RRFS pressure levels — falling back to '

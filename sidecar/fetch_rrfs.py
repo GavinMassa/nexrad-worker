@@ -62,6 +62,8 @@ FIELDS_PRSLEV: list[tuple[str, str]] = [
     ('rh925', ':RH:925 mb:'),
     ('rh950', ':RH:950 mb:'),
     ('t950',  ':TMP:950 mb:'),
+    ('gh925',  ':HGT:925 mb:'),
+    ('gh950',  ':HGT:950 mb:'),
     # Upper-troposphere levels — needed to reach the EL (typically 200–250 mb).
     # Without these, CAPE integration truncates at 500 mb and misses 1500–3000 J/kg
     # of positive buoyancy in the 500→200 mb layer where Tv_parcel >> Tv_env.
@@ -85,6 +87,7 @@ FIELDS_2DFLD: list[tuple[str, str]] = [
     ('ustm',   ':USTM:6000-0 m above ground:'),
     ('vstm',   ':VSTM:6000-0 m above ground:'),
     ('pwat',   ':PWAT:entire atmosphere (considered as a single layer):'),
+    ('gh_sfc', ':HGT:surface:'),
 ]
 
 # All fields combined (for result initialisation)
