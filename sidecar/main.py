@@ -221,10 +221,21 @@ async def mesonet_worker():
             dtd_full = np.zeros((ny_full, nx_full), dtype=np.float32)
             dp_full  = np.zeros((ny_full, nx_full), dtype=np.float32)
 
-            # Trim to exactly match the mask region (handles zoom rounding)
-            dt_full [np.ix_(row_mask, col_mask)] = dt_clip [:ny_clip, :nx_clip]
-            dtd_full[np.ix_(row_mask, col_mask)] = dtd_clip[:ny_clip, :nx_clip]
-            dp_full [np.ix_(row_mask, col_mask)] = dp_clip [:ny_clip, :nx_clip]
+            # Resize each clipped correction to exactly (ny_clip, nx_clip) before
+            # embedding. scipy.ndimage.zoom() rounds to the nearest integer shape,
+            # so a 702×1172 grid zoomed ×2.0 may land at 1404×2344 when the mask
+            # region is 1403×2345 (±1 px). A second zoom with exact target ratios
+            # corrects this without trimming or padding at the edges.
+            def _exact(arr, ny, nx):
+                if arr.shape == (ny, nx):
+                    return arr
+                zy = ny / arr.shape[0]
+                zx = nx / arr.shape[1]
+                return ndimage_zoom(arr, (zy, zx), order=1).astype(np.float32)
+
+            dt_full [np.ix_(row_mask, col_mask)] = _exact(dt_clip,  ny_clip, nx_clip)
+            dtd_full[np.ix_(row_mask, col_mask)] = _exact(dtd_clip, ny_clip, nx_clip)
+            dp_full [np.ix_(row_mask, col_mask)] = _exact(dp_clip,  ny_clip, nx_clip)
 
             ny_save, nx_save = ny_full, nx_full
 
