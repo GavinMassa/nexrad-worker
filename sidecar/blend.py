@@ -395,7 +395,17 @@ def compute_cape_cin_lifted(
     eff_base_c = np.zeros(cny * cnx, dtype=np.float32)
     eff_top_c  = np.zeros(cny * cnx, dtype=np.float32)
 
+    import time as _time
     n_fail = 0
+    _t_lcl_sb   = 0.0   # parcel_profile_with_lcl (surface-based)
+    _t_virt_sb  = 0.0   # virtual_temperature + saturation_mixing_ratio calls (SB)
+    _t_cape_sb  = 0.0   # cape_cin for SB CAPE (virtual)
+    _t_cin_sb   = 0.0   # cape_cin for SB CIN (non-virtual)
+    _t_el       = 0.0   # mpcalc.el()
+    _t_lcl_ml   = 0.0   # parcel_profile_with_lcl (mixed-layer)
+    _t_virt_ml  = 0.0   # virtual_temperature + saturation_mixing_ratio calls (ML)
+    _t_cape_ml  = 0.0   # cape_cin for ML CAPE
+    _n_timed    = 0     # successful points timed (excludes failures/skips)
     with _w.catch_warnings():
         _w.simplefilter('ignore')   # suppress pint UnitStrippedWarning
         for idx in range(cny * cnx):
@@ -437,29 +447,43 @@ def compute_cape_cin_lifted(
                 # parcel_profile_with_lcl takes full atmospheric T/Td arrays;
                 # uses T_u[0] / Td_u[0] as the parcel starting point.
                 # Returns a pressure grid with the LCL level inserted.
+                _t0 = _time.perf_counter()
                 sb_prof_p, sb_prof_T, sb_prof_Td, sb_prof_parcel_T = (
                     mpcalc.parcel_profile_with_lcl(p_u, T_u, Td_u)
                 )
+                _t_lcl_sb += _time.perf_counter() - _t0
+
                 # Environmental virtual T:
                 #   sat_mixing_ratio(p, Td) == actual mixing ratio at Td
                 #   (by definition: at the dewpoint the air is saturated)
-                env_w  = mpcalc.saturation_mixing_ratio(sb_prof_p, sb_prof_Td)
-                env_Tv = mpcalc.virtual_temperature(sb_prof_T, env_w)
-
                 # Parcel virtual T: assume saturated throughout (above LCL the
                 # parcel is saturated; below LCL this slightly overestimates Tv
                 # but CAPE is integrated above LFC where the parcel IS saturated,
                 # so the effect on CAPE is negligible).
-                parcel_w  = mpcalc.saturation_mixing_ratio(sb_prof_p, sb_prof_parcel_T)
-                parcel_Tv = mpcalc.virtual_temperature(sb_prof_parcel_T, parcel_w)
+                _t0 = _time.perf_counter()
+                env_Tv = mpcalc.virtual_temperature(
+                    sb_prof_T,
+                    mpcalc.saturation_mixing_ratio(sb_prof_p, sb_prof_Td),
+                )
+                parcel_Tv = mpcalc.virtual_temperature(
+                    sb_prof_parcel_T,
+                    mpcalc.saturation_mixing_ratio(sb_prof_p, sb_prof_parcel_T),
+                )
+                _t_virt_sb += _time.perf_counter() - _t0
 
                 # CAPE: virtual-temperature-corrected (matches SPC mesoanalysis)
+                _t0 = _time.perf_counter()
                 sb_cape, _ = mpcalc.cape_cin(sb_prof_p, env_Tv, sb_prof_Td, parcel_Tv)
+                _t_cape_sb += _time.perf_counter() - _t0
+
                 # CIN: non-virtual (SPC: "non-virtual CIN calculations tend to
                 # define areas of weak cap more accurately")
+                _t0 = _time.perf_counter()
                 _, sb_cin = mpcalc.cape_cin(
                     sb_prof_p, sb_prof_T, sb_prof_Td, sb_prof_parcel_T
                 )
+                _t_cin_sb += _time.perf_counter() - _t0
+
                 cap_c[idx] = float(sb_cape.magnitude)
                 cin_c[idx] = float(sb_cin.magnitude)
 
@@ -476,16 +500,30 @@ def compute_cape_cin_lifted(
                           * mpunits.kelvin)
                 _Td_ml = (np.concatenate([[ml_Td.magnitude], Td_u.magnitude[1:]])
                           * mpunits.kelvin)
+
+                _t0 = _time.perf_counter()
                 ml_prof_p, ml_prof_T, ml_prof_Td, ml_prof_parcel_T = (
                     mpcalc.parcel_profile_with_lcl(p_u, _T_ml, _Td_ml)
                 )
-                ml_env_w     = mpcalc.saturation_mixing_ratio(ml_prof_p, ml_prof_Td)
-                ml_env_Tv    = mpcalc.virtual_temperature(ml_prof_T, ml_env_w)
-                ml_parcel_w  = mpcalc.saturation_mixing_ratio(ml_prof_p, ml_prof_parcel_T)
-                ml_parcel_Tv = mpcalc.virtual_temperature(ml_prof_parcel_T, ml_parcel_w)
-                ml_cape, _   = mpcalc.cape_cin(
+                _t_lcl_ml += _time.perf_counter() - _t0
+
+                _t0 = _time.perf_counter()
+                ml_env_Tv = mpcalc.virtual_temperature(
+                    ml_prof_T,
+                    mpcalc.saturation_mixing_ratio(ml_prof_p, ml_prof_Td),
+                )
+                ml_parcel_Tv = mpcalc.virtual_temperature(
+                    ml_prof_parcel_T,
+                    mpcalc.saturation_mixing_ratio(ml_prof_p, ml_prof_parcel_T),
+                )
+                _t_virt_ml += _time.perf_counter() - _t0
+
+                _t0 = _time.perf_counter()
+                ml_cape, _ = mpcalc.cape_cin(
                     ml_prof_p, ml_env_Tv, ml_prof_Td, ml_parcel_Tv
                 )
+                _t_cape_ml += _time.perf_counter() - _t0
+
                 mlc_c[idx] = float(ml_cape.magnitude)
 
                 # ── Effective inflow layer detection ──────────────────────────
@@ -496,6 +534,7 @@ def compute_cape_cin_lifted(
                 sb_cape_val = float(sb_cape.magnitude)
                 sb_cin_val  = float(sb_cin.magnitude)
 
+                _t0 = _time.perf_counter()
                 if sb_cape_val >= 100.0 and sb_cin_val >= -250.0:
                     # Surface parcel is viable — effective base is surface
                     eff_base_c[idx] = p_sfc_pt
@@ -514,6 +553,9 @@ def compute_cape_cin_lifted(
                     except Exception:
                         eff_top_c[idx] = float(p_col[-1])
                 # else: no effective inflow — eff_base_c and eff_top_c stay 0
+                _t_el += _time.perf_counter() - _t0
+
+                _n_timed += 1
 
             except Exception:
                 # MetPy's lfc/el can raise on degenerate soundings — leave 0.
@@ -542,6 +584,15 @@ def compute_cape_cin_lifted(
     eff_base_p = _upscale(eff_base_c)   # mb; 0 = no effective inflow
     eff_top_p  = _upscale(eff_top_c)    # mb
 
+    log.info(
+        f'[cape] timing breakdown ({_n_timed} pts): '
+        f'lcl_sb={_t_lcl_sb:.1f}s  virt_sb={_t_virt_sb:.1f}s  '
+        f'cape_sb={_t_cape_sb:.1f}s  cin_sb={_t_cin_sb:.1f}s  '
+        f'el={_t_el:.1f}s  '
+        f'lcl_ml={_t_lcl_ml:.1f}s  virt_ml={_t_virt_ml:.1f}s  '
+        f'cape_ml={_t_cape_ml:.1f}s  '
+        f'total={_t_lcl_sb+_t_virt_sb+_t_cape_sb+_t_cin_sb+_t_el+_t_lcl_ml+_t_virt_ml+_t_cape_ml:.1f}s'
+    )
     log.info(f'[cape] MetPy coarse {cny}×{cnx} (step={COARSE_STEP}) → {ny}×{nx}; '
              f'{n_fail} sounding failures')
     log.info(f'[sbcape] MetPy: max={float(sbcape.max()):.0f} J/kg '
