@@ -310,7 +310,10 @@ def compute_cape_cin_lifted(
     Methodology matches SPC NSHARP / SFCOA:
       - Surface parcel: RTMA T2m / corrected Td2m (obs-anchored)
       - Upper profile:  RRFS pressure-level T and Td
-      - Parcel lift:    MetPy pseudoadiabatic with virtual-temperature correction
+      - Parcel lift:    MetPy pseudoadiabatic, virtual temperature correction
+                         applied to CAPE only (CIN remains non-virtual per
+                         SPC mesoanalysis methodology: see
+                         spc.noaa.gov/exper/mesoanalysis/help/help_sbcp.html)
       - SBCAPE/SBCIN:   surface-based parcel
       - MLCAPE:         mean-layer parcel (lowest ml_depth_mb)
 
@@ -430,25 +433,66 @@ def compute_cape_cin_lifted(
                 T_u  = T_arr  * mpunits.kelvin
                 Td_u = Td_arr * mpunits.kelvin
 
-                # Surface-based parcel
-                sb_prof = mpcalc.parcel_profile(p_u, T_u[0], Td_u[0])
-                sb_cape, sb_cin = mpcalc.cape_cin(p_u, T_u, Td_u, sb_prof)
+                # ── Surface-based parcel ──────────────────────────────────────
+                # parcel_profile_with_lcl takes full atmospheric T/Td arrays;
+                # uses T_u[0] / Td_u[0] as the parcel starting point.
+                # Returns a pressure grid with the LCL level inserted.
+                sb_prof_p, sb_prof_T, sb_prof_Td, sb_prof_parcel_T = (
+                    mpcalc.parcel_profile_with_lcl(p_u, T_u, Td_u)
+                )
+                # Environmental virtual T:
+                #   sat_mixing_ratio(p, Td) == actual mixing ratio at Td
+                #   (by definition: at the dewpoint the air is saturated)
+                env_w  = mpcalc.saturation_mixing_ratio(sb_prof_p, sb_prof_Td)
+                env_Tv = mpcalc.virtual_temperature(sb_prof_T, env_w)
+
+                # Parcel virtual T: assume saturated throughout (above LCL the
+                # parcel is saturated; below LCL this slightly overestimates Tv
+                # but CAPE is integrated above LFC where the parcel IS saturated,
+                # so the effect on CAPE is negligible).
+                parcel_w  = mpcalc.saturation_mixing_ratio(sb_prof_p, sb_prof_parcel_T)
+                parcel_Tv = mpcalc.virtual_temperature(sb_prof_parcel_T, parcel_w)
+
+                # CAPE: virtual-temperature-corrected (matches SPC mesoanalysis)
+                sb_cape, _ = mpcalc.cape_cin(sb_prof_p, env_Tv, sb_prof_Td, parcel_Tv)
+                # CIN: non-virtual (SPC: "non-virtual CIN calculations tend to
+                # define areas of weak cap more accurately")
+                _, sb_cin = mpcalc.cape_cin(
+                    sb_prof_p, sb_prof_T, sb_prof_Td, sb_prof_parcel_T
+                )
                 cap_c[idx] = float(sb_cape.magnitude)
                 cin_c[idx] = float(sb_cin.magnitude)
 
-                # Mean-layer parcel: average over the lowest ml_depth_mb of THIS
-                # column (selection is per-point because surface pressure varies).
+                # ── Mean-layer parcel: same virtual-T treatment ───────────────
+                # Average over the lowest ml_depth_mb of THIS column (per-point
+                # because surface pressure varies).
                 ml_sel = p_col >= (p_sfc_pt - ml_depth_mb)
                 ml_T   = float(np.mean(T_arr [ml_sel])) * mpunits.kelvin
                 ml_Td  = float(np.mean(Td_arr[ml_sel])) * mpunits.kelvin
-                ml_prof = mpcalc.parcel_profile(p_u, ml_T, ml_Td)
-                ml_cape, _ = mpcalc.cape_cin(p_u, T_u, Td_u, ml_prof)
+
+                # Substitute surface (index 0) with ML averages so the parcel
+                # starts from ml_T/ml_Td; upper-level environment is unchanged.
+                _T_ml  = (np.concatenate([[ml_T.magnitude],  T_u.magnitude[1:]])
+                          * mpunits.kelvin)
+                _Td_ml = (np.concatenate([[ml_Td.magnitude], Td_u.magnitude[1:]])
+                          * mpunits.kelvin)
+                ml_prof_p, ml_prof_T, ml_prof_Td, ml_prof_parcel_T = (
+                    mpcalc.parcel_profile_with_lcl(p_u, _T_ml, _Td_ml)
+                )
+                ml_env_w     = mpcalc.saturation_mixing_ratio(ml_prof_p, ml_prof_Td)
+                ml_env_Tv    = mpcalc.virtual_temperature(ml_prof_T, ml_env_w)
+                ml_parcel_w  = mpcalc.saturation_mixing_ratio(ml_prof_p, ml_prof_parcel_T)
+                ml_parcel_Tv = mpcalc.virtual_temperature(ml_prof_parcel_T, ml_parcel_w)
+                ml_cape, _   = mpcalc.cape_cin(
+                    ml_prof_p, ml_env_Tv, ml_prof_Td, ml_parcel_Tv
+                )
                 mlc_c[idx] = float(ml_cape.magnitude)
 
                 # ── Effective inflow layer detection ──────────────────────────
                 # Effective base = surface if SBCAPE≥100 AND SBCIN≥-250.
                 # Effective top  = EL pressure from the surface parcel lift.
                 # Where neither condition is met, both stay 0 (no inflow).
+                # Uses the virtual-T corrected CAPE/CIN values from above.
                 sb_cape_val = float(sb_cape.magnitude)
                 sb_cin_val  = float(sb_cin.magnitude)
 
@@ -456,9 +500,13 @@ def compute_cape_cin_lifted(
                     # Surface parcel is viable — effective base is surface
                     eff_base_c[idx] = p_sfc_pt
 
-                    # Effective top = EL pressure from surface parcel lift
+                    # Effective top = EL pressure from surface parcel lift.
+                    # Use the LCL-adjusted grid from parcel_profile_with_lcl
+                    # so the EL search is consistent with the CAPE computation.
                     try:
-                        el_p, _ = mpcalc.el(p_u, T_u, Td_u, sb_prof)
+                        el_p, _ = mpcalc.el(
+                            sb_prof_p, sb_prof_T, sb_prof_Td, sb_prof_parcel_T
+                        )
                         if el_p is not None and not np.isnan(el_p.magnitude):
                             eff_top_c[idx] = float(el_p.magnitude)
                         else:
