@@ -6,7 +6,11 @@ from scipy.ndimage import zoom
 
 log = logging.getLogger(__name__)
 OUT_DIR       = Path('/app/sidecar-out')
-ARCHIVE_HOURS = 6          # retain the last N hourly blend cycles
+ARCHIVE_HOURS = 6          # retain the last N blend cycles
+# NOTE: with 8-min cycles, 6 "hours" of retention now means ~45
+# archived cycles (6*60/8), not 6. Pruning logic (count-based) is
+# unaffected — it still prunes anything beyond ARCHIVE_HOURS
+# entries, just with more entries per wall-clock hour now.
 OUT_DIR.mkdir(exist_ok=True)
 
 # Downsample factor applied to all param grids before writing.
@@ -152,7 +156,7 @@ def write_output(grids: dict, cycle_dt: datetime) -> None:
     # Node.js server can serve historical cycles at GET /rap/blend/YYYYMMDDHH.
     # The flat files in OUT_DIR remain untouched — existing /rap/blend/all
     # endpoint continues to serve the latest cycle with zero disruption.
-    hour_key  = cycle_dt.strftime('%Y%m%d%H')
+    hour_key  = cycle_dt.strftime('%Y%m%d%H%M')
     cycle_dir = OUT_DIR / hour_key
     cycle_dir.mkdir(exist_ok=True)
 
@@ -171,10 +175,10 @@ def write_output(grids: dict, cycle_dt: datetime) -> None:
     log.info(f'Archived cycle {hour_key} → {cycle_dir} ({len(params)} params × {ny_new}×{nx_new})')
 
     # ── Prune cycles beyond ARCHIVE_HOURS ────────────────────────────────────
-    # Dirs are named YYYYMMDDHH (10 digits); lexicographic sort = time order.
+    # Dirs are named YYYYMMDDHHMM (12 digits); lexicographic sort = time order.
     existing_dirs = sorted(
         [d for d in OUT_DIR.iterdir()
-         if d.is_dir() and len(d.name) == 10 and d.name.isdigit()],
+         if d.is_dir() and len(d.name) == 12 and d.name.isdigit()],
         key=lambda d: d.name,
     )
     while len(existing_dirs) > ARCHIVE_HOURS:
@@ -187,7 +191,7 @@ def write_output(grids: dict, cycle_dt: datetime) -> None:
     # the filesystem on every request.
     available = sorted(
         d.name for d in OUT_DIR.iterdir()
-        if d.is_dir() and len(d.name) == 10 and d.name.isdigit()
+        if d.is_dir() and len(d.name) == 12 and d.name.isdigit()
     )
     history = {
         'hours':      available,

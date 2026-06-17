@@ -415,8 +415,8 @@ async def vad_worker():
 # ── Hourly blend cycle ────────────────────────────────────────────────────────
 
 async def run_cycle():
-    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-    log.info(f'Starting cycle for {now.strftime("%Y-%m-%d %H:00Z")}')
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    log.info(f'Starting cycle for {now.strftime("%Y-%m-%d %H:%MZ")}')
     log_memory('cycle start')
     if _cycle_lock.locked():
         log.warning('Previous cycle still running — skipping')
@@ -777,19 +777,16 @@ async def mesonet_triggered_blend():
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 
+CYCLE_INTERVAL_S = 8 * 60   # 8 min — measured CAPE step ~5.8-6min + margin
+
 async def scheduler():
     await run_cycle()   # run immediately on startup
     while True:
-        now      = datetime.now(timezone.utc)
-        next_run = now.replace(minute=28, second=0, microsecond=0)
-        if now >= next_run:
-            # timedelta addition handles hour=23 → next day correctly.
-            next_run = (next_run + timedelta(hours=1)).replace(
-                minute=28, second=0, microsecond=0
-            )
-        wait = (next_run - now).total_seconds()
-        log.info(f'Next cycle in {wait:.0f}s at {next_run.strftime("%H:%M")}Z')
-        await asyncio.sleep(wait)
+        cycle_start = datetime.now(timezone.utc)
+        await asyncio.sleep(CYCLE_INTERVAL_S)
+        elapsed_since_start = (datetime.now(timezone.utc) - cycle_start).total_seconds()
+        log.info(f'[scheduler] {elapsed_since_start:.0f}s since last cycle trigger — '
+                 f'starting next cycle')
         await run_cycle()
 
 
