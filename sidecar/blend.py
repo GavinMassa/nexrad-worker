@@ -583,20 +583,27 @@ def compute_cape_cin_lifted(
     eff_top_c  = np.nan_to_num(eff_top_c,  nan=0.0).reshape(cny, cnx)
 
     # ── Interpolate coarse result back to full RTMA resolution ────────────────
+    # RR/CC built ONCE outside _upscale — identical target grid for every
+    # field, no reason to rebuild it per call.
+    _RR, _CC = np.meshgrid(np.arange(ny, dtype=np.float64),
+                            np.arange(nx, dtype=np.float64), indexing='ij')
+    _target_pts = (_RR, _CC)
+
     def _upscale(coarse: np.ndarray) -> np.ndarray:
         f = RegularGridInterpolator(
             (rows.astype(np.float64), cols.astype(np.float64)), coarse,
-            method='linear', bounds_error=False, fill_value=0.0,   # clamp edge to 0 (no extrapolation)
+            method='linear', bounds_error=False, fill_value=0.0,
         )
-        RR, CC = np.meshgrid(np.arange(ny, dtype=np.float64),
-                             np.arange(nx, dtype=np.float64), indexing='ij')
-        return f((RR, CC)).astype(np.float32)
+        return f(_target_pts).astype(np.float32)
 
+    _t_upscale0 = _time.perf_counter()
     sbcape     = np.maximum(0.0, _upscale(cap_c)).astype(np.float32)
     sbcin      = np.clip(_upscale(cin_c), -300.0, 0.0).astype(np.float32)
     mlcape     = np.maximum(0.0, _upscale(mlc_c)).astype(np.float32)
-    eff_base_p = _upscale(eff_base_c)   # mb; 0 = no effective inflow
-    eff_top_p  = _upscale(eff_top_c)    # mb
+    eff_base_p = _upscale(eff_base_c)
+    eff_top_p  = _upscale(eff_top_c)
+    _t_upscale = _time.perf_counter() - _t_upscale0
+    log.info(f'[cape] upscale timing: {_t_upscale:.1f}s for 5 fields')
 
     _named_total = (_t_lcl_sb + _t_virt_sb + _t_cape_sb + _t_cin_sb +
                     _t_el + _t_lcl_ml + _t_virt_ml + _t_cape_ml +
