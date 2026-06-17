@@ -397,18 +397,23 @@ def compute_cape_cin_lifted(
 
     import time as _time
     n_fail = 0
-    _t_lcl_sb   = 0.0   # parcel_profile_with_lcl (surface-based)
-    _t_virt_sb  = 0.0   # virtual_temperature + saturation_mixing_ratio calls (SB)
-    _t_cape_sb  = 0.0   # cape_cin for SB CAPE (virtual)
-    _t_cin_sb   = 0.0   # cape_cin for SB CIN (non-virtual)
-    _t_el       = 0.0   # mpcalc.el()
-    _t_lcl_ml   = 0.0   # parcel_profile_with_lcl (mixed-layer)
-    _t_virt_ml  = 0.0   # virtual_temperature + saturation_mixing_ratio calls (ML)
-    _t_cape_ml  = 0.0   # cape_cin for ML CAPE
-    _n_timed    = 0     # successful points timed (excludes failures/skips)
+    _t_lcl_sb    = 0.0   # parcel_profile_with_lcl (surface-based)
+    _t_virt_sb   = 0.0   # virtual_temperature + saturation_mixing_ratio calls (SB)
+    _t_cape_sb   = 0.0   # cape_cin for SB CAPE (virtual)
+    _t_cin_sb    = 0.0   # cape_cin for SB CIN (non-virtual)
+    _t_el        = 0.0   # mpcalc.el()
+    _t_lcl_ml    = 0.0   # parcel_profile_with_lcl (mixed-layer)
+    _t_virt_ml   = 0.0   # virtual_temperature + saturation_mixing_ratio calls (ML)
+    _t_cape_ml   = 0.0   # cape_cin for ML CAPE
+    _t_prep      = 0.0   # per-point array slicing before try block
+    _t_units     = 0.0   # pint unit-wrapping (p_u/T_u/Td_u)
+    _t_loop_total = 0.0  # wall-clock for the entire per-point iteration body
+    _n_timed     = 0     # successful points timed (excludes failures/skips)
     with _w.catch_warnings():
         _w.simplefilter('ignore')   # suppress pint UnitStrippedWarning
         for idx in range(cny * cnx):
+            _t_iter_start = _time.perf_counter()
+
             T_col  = Tc[:, idx]
             Td_col = Tdc[:, idx]
             # Skip out-of-domain points: surface T invalid OR any upper-air
@@ -416,8 +421,10 @@ def compute_cape_cin_lifted(
             # Must check raw (unclipped) values — np.clip(0→150) made the
             # clipped stack useless for fill detection.
             if T_col[0] < 220.0 or T_col[0] > 330.0:
+                _t_loop_total += _time.perf_counter() - _t_iter_start
                 continue
             if np.any(Tc_raw[:, idx] < 100.0):   # 0 K fill, pre-clip
+                _t_loop_total += _time.perf_counter() - _t_iter_start
                 continue
 
             # Per-point surface pressure (mb) from the Barnes analysis.
@@ -431,17 +438,22 @@ def compute_cape_cin_lifted(
             # column is physical and strictly decreasing. p_levels_upper is
             # already descending, so the filtered column stays descending and
             # we DON'T sort (sorting would misalign T/Td against pressure).
+            _t_prep0 = _time.perf_counter()
             above   = p_levels_upper < p_sfc_pt
             p_col   = np.concatenate(([p_sfc_pt], p_levels_upper[above]))
             T_arr   = np.concatenate(([T_col[0]],  T_col[1:][above]))
             Td_arr  = np.concatenate(([Td_col[0]], Td_col[1:][above]))
+            _t_prep += _time.perf_counter() - _t_prep0
             if p_col.size < 3:        # too few levels above ground for a useful lift
+                _t_loop_total += _time.perf_counter() - _t_iter_start
                 continue
 
             try:
+                _t_units0 = _time.perf_counter()
                 p_u  = p_col  * mpunits.hPa
                 T_u  = T_arr  * mpunits.kelvin
                 Td_u = Td_arr * mpunits.kelvin
+                _t_units += _time.perf_counter() - _t_units0
 
                 # ── Surface-based parcel ──────────────────────────────────────
                 # parcel_profile_with_lcl takes full atmospheric T/Td arrays;
@@ -556,10 +568,12 @@ def compute_cape_cin_lifted(
                 _t_el += _time.perf_counter() - _t0
 
                 _n_timed += 1
+                _t_loop_total += _time.perf_counter() - _t_iter_start
 
             except Exception:
                 # MetPy's lfc/el can raise on degenerate soundings — leave 0.
                 n_fail += 1
+                _t_loop_total += _time.perf_counter() - _t_iter_start
 
     # MetPy can emit NaN/inf CAPE; scrub before interpolation.
     cap_c = np.nan_to_num(cap_c, nan=0.0, posinf=0.0, neginf=0.0).reshape(cny, cnx)
@@ -584,14 +598,21 @@ def compute_cape_cin_lifted(
     eff_base_p = _upscale(eff_base_c)   # mb; 0 = no effective inflow
     eff_top_p  = _upscale(eff_top_c)    # mb
 
+    _named_total = (_t_lcl_sb + _t_virt_sb + _t_cape_sb + _t_cin_sb +
+                    _t_el + _t_lcl_ml + _t_virt_ml + _t_cape_ml +
+                    _t_prep + _t_units)
+    _gap = _t_loop_total - _named_total
     log.info(
         f'[cape] timing breakdown ({_n_timed} pts): '
+        f'prep={_t_prep:.1f}s  units={_t_units:.1f}s  '
         f'lcl_sb={_t_lcl_sb:.1f}s  virt_sb={_t_virt_sb:.1f}s  '
         f'cape_sb={_t_cape_sb:.1f}s  cin_sb={_t_cin_sb:.1f}s  '
         f'el={_t_el:.1f}s  '
         f'lcl_ml={_t_lcl_ml:.1f}s  virt_ml={_t_virt_ml:.1f}s  '
         f'cape_ml={_t_cape_ml:.1f}s  '
-        f'total={_t_lcl_sb+_t_virt_sb+_t_cape_sb+_t_cin_sb+_t_el+_t_lcl_ml+_t_virt_ml+_t_cape_ml:.1f}s'
+        f'named_total={_named_total:.1f}s  '
+        f'loop_total={_t_loop_total:.1f}s  '
+        f'UNACCOUNTED_GAP={_gap:.1f}s'
     )
     log.info(f'[cape] MetPy coarse {cny}×{cnx} (step={COARSE_STEP}) → {ny}×{nx}; '
              f'{n_fail} sounding failures')
