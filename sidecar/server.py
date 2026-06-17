@@ -72,52 +72,6 @@ async def handle_blend_meta(request: web.Request) -> web.Response:
         },
     )
 
-async def handle_blend_history(request: web.Request) -> web.Response:
-    """Return history.json — list of available archived hour keys."""
-    path = OUT_DIR / 'history.json'
-    if not path.exists():
-        raise web.HTTPServiceUnavailable(reason='history.json not ready')
-    return web.Response(
-        text=path.read_text(),
-        content_type='application/json',
-        headers={'Cache-Control':               'no-cache',
-                 'Access-Control-Allow-Origin': '*'},
-    )
-
-async def handle_blend_hour(request: web.Request) -> web.Response:
-    """Return archived blend binary for a specific hour (YYYYMMDDHH)."""
-    hour = request.match_info['hour']
-    if not (len(hour) == 10 and hour.isdigit()):
-        raise web.HTTPBadRequest(reason='Invalid hour format (expected YYYYMMDDHH)')
-    cycle_dir = OUT_DIR / hour
-    meta_path = cycle_dir / 'meta.json'
-    if not cycle_dir.exists() or not meta_path.exists():
-        raise web.HTTPNotFound(reason=f'Hour {hour} not in archive')
-    meta = json.loads(meta_path.read_text())
-    params = meta.get('params', [])
-    bpp = meta['nx'] * meta['ny'] * 4
-    chunks = []
-    for param in params:
-        bin_path = cycle_dir / f'{param}.bin'
-        if not bin_path.exists():
-            raise web.HTTPInternalServerError(
-                reason=f'Missing {param}.bin for hour {hour}')
-        chunks.append(bin_path.read_bytes())
-    body = b''.join(chunks)
-    meta['bytes_per_param'] = bpp
-    log.info(f'handle_blend_hour: serving hour={hour} params={len(params)} '
-             f'body={len(body)//1024}KB')
-    return web.Response(
-        body=body,
-        content_type='application/octet-stream',
-        headers={
-            'X-Meso-Meta':                   json.dumps(meta),
-            'Access-Control-Expose-Headers': 'X-Meso-Meta',
-            'Cache-Control':                 'public, max-age=86400',
-            'Access-Control-Allow-Origin':   '*',
-        },
-    )
-
 async def handle_health(request):
     """Lightweight liveness probe — always returns 200 immediately.
     Keeps Railway from killing the container during long IDW/blend cycles."""
@@ -146,13 +100,9 @@ async def handle_satellite_meta(request):
 
 async def start_server():
     app = web.Application()
-    # Literal routes before parameterised so aiohttp never ambiguates them.
-    app.router.add_get('/blend/history',       handle_blend_history)
     app.router.add_get('/blend/all',           handle_all)
     app.router.add_get('/blend/meta',          handle_blend_meta)
     app.router.add_get('/blend/status',        handle_status)
-    # Parameterised route last — matches any /blend/<10-digit-hour>
-    app.router.add_get('/blend/{hour}',        handle_blend_hour)
     app.router.add_get('/health',              handle_health)
     app.router.add_get('/healthz',             handle_health)
     # /satellite/meta must be registered before /satellite/{product} so the
