@@ -52,6 +52,9 @@ FIELDS_PRSLEV: list[tuple[str, str]] = [
     ('v925', ':VGRD:925 mb:'),
     ('u950', ':UGRD:950 mb:'),
     ('v950', ':VGRD:950 mb:'),
+    # 700mb winds — needed by blend.py's 0-3km SRH (srh3), which SCP requires.
+    ('u700', ':UGRD:700 mb:'),
+    ('v700', ':VGRD:700 mb:'),
     ('t700', ':TMP:700 mb:'),
     ('t925', ':TMP:925 mb:'),
     ('t850',  ':TMP:850 mb:'),

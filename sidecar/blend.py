@@ -324,7 +324,7 @@ def compute_cape_cin_lifted(
     field and the output is later downsampled+blurred, so the ~25 km effective
     resolution is visually indistinguishable (SPC mesoanalysis itself is 40 km).
 
-    Returns (sbcape, sbcin, mlcape, eff_base_p, eff_top_p) — all float32 (ny, nx).
+    Returns (sbcape, sbcin, mlcape, mlcin, eff_base_p, eff_top_p) — all float32 (ny, nx).
     CAPE >= 0, CIN <= 0. eff_base_p/eff_top_p in mb; 0 where no effective inflow.
     """
     import warnings as _w
@@ -354,7 +354,7 @@ def compute_cape_cin_lifted(
     if len(valid_levels) < 2:
         log.warning('[cape] fewer than 2 valid upper-air levels — returning zeros')
         zero = np.zeros((ny, nx), dtype=np.float32)
-        return zero, zero, zero, zero, zero
+        return zero, zero, zero, zero, zero, zero
 
     # Upper-air pressure levels (mb), descending — fixed for all gridpoints.
     # The surface pressure is per-point (P_SFC) and prepended inside the loop,
@@ -388,6 +388,7 @@ def compute_cape_cin_lifted(
     cap_c = np.zeros(cny * cnx, dtype=np.float32)
     cin_c = np.zeros(cny * cnx, dtype=np.float32)
     mlc_c = np.zeros(cny * cnx, dtype=np.float32)
+    mlc_cin_c = np.zeros(cny * cnx, dtype=np.float32)
     # Effective inflow layer bounds (pressure, mb).
     # eff_base_c: surface pressure where SBCAPE≥100 & SBCIN≥-250 (viable inflow).
     # eff_top_c:  EL pressure from the surface parcel lift.
@@ -538,6 +539,13 @@ def compute_cape_cin_lifted(
 
                 mlc_c[idx] = float(ml_cape.magnitude)
 
+                # Non-virtual ML CIN — same profile vars as SB CIN, matching SPC's
+                # non-virtual-CIN methodology.
+                _, ml_cin = mpcalc.cape_cin(
+                    ml_prof_p, ml_prof_T, ml_prof_Td, ml_prof_parcel_T
+                )
+                mlc_cin_c[idx] = float(ml_cin.magnitude)
+
                 # ── Effective inflow layer detection ──────────────────────────
                 # Effective base = surface if SBCAPE≥100 AND SBCIN≥-250.
                 # Effective top  = EL pressure from the surface parcel lift.
@@ -579,6 +587,7 @@ def compute_cape_cin_lifted(
     cap_c = np.nan_to_num(cap_c, nan=0.0, posinf=0.0, neginf=0.0).reshape(cny, cnx)
     cin_c = np.nan_to_num(cin_c, nan=0.0, posinf=0.0, neginf=0.0).reshape(cny, cnx)
     mlc_c = np.nan_to_num(mlc_c, nan=0.0, posinf=0.0, neginf=0.0).reshape(cny, cnx)
+    mlc_cin_c = np.nan_to_num(mlc_cin_c, nan=0.0, posinf=0.0, neginf=0.0).reshape(cny, cnx)
     eff_base_c = np.nan_to_num(eff_base_c, nan=0.0).reshape(cny, cnx)
     eff_top_c  = np.nan_to_num(eff_top_c,  nan=0.0).reshape(cny, cnx)
 
@@ -600,10 +609,11 @@ def compute_cape_cin_lifted(
     sbcape     = np.maximum(0.0, _upscale(cap_c)).astype(np.float32)
     sbcin      = np.clip(_upscale(cin_c), -300.0, 0.0).astype(np.float32)
     mlcape     = np.maximum(0.0, _upscale(mlc_c)).astype(np.float32)
+    mlcin      = np.clip(_upscale(mlc_cin_c), -300.0, 0.0).astype(np.float32)
     eff_base_p = _upscale(eff_base_c)
     eff_top_p  = _upscale(eff_top_c)
     _t_upscale = _time.perf_counter() - _t_upscale0
-    log.info(f'[cape] upscale timing: {_t_upscale:.1f}s for 5 fields')
+    log.info(f'[cape] upscale timing: {_t_upscale:.1f}s for 6 fields')
 
     _named_total = (_t_lcl_sb + _t_virt_sb + _t_cape_sb + _t_cin_sb +
                     _t_el + _t_lcl_ml + _t_virt_ml + _t_cape_ml +
@@ -626,6 +636,7 @@ def compute_cape_cin_lifted(
     log.info(f'[sbcape] MetPy: max={float(sbcape.max()):.0f} J/kg '
              f'active={int((sbcape > 0).sum())} cells')
     log.info(f'[sbcin]  MetPy: min={float(sbcin.min()):.0f} J/kg')
+    log.info(f'[mlcin] MetPy: min={float(mlcin.min()):.0f} J/kg')
     log.info(f'[mlcape] MetPy: max={float(mlcape.max()):.0f} J/kg '
              f'active={int((mlcape > 0).sum())} cells')
     n_eff = int((eff_base_p > 0).sum())
@@ -637,7 +648,7 @@ def compute_cape_cin_lifted(
              f'{float(eff_top_p[eff_top_p>0].min()) if n_eff else 0:.0f}'
              f'–{float(eff_top_p.max()):.0f} mb')
 
-    return sbcape, sbcin, mlcape, eff_base_p, eff_top_p
+    return sbcape, sbcin, mlcape, mlcin, eff_base_p, eff_top_p
 
 
 def _apply_bl_thermal_correction(
@@ -753,6 +764,8 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
     v500_i   = interp(upper_air.get('v500'),     'v500')
     u850_i   = interp(upper_air.get('u850'),     'u850')
     v850_i   = interp(upper_air.get('v850'),     'v850')
+    u700_i   = interp(upper_air.get('u700'),     'u700')
+    v700_i   = interp(upper_air.get('v700'),     'v700')
     u10_rap  = interp(upper_air.get('u10'),      'u10_rap')
     v10_rap  = interp(upper_air.get('v10'),      'v10_rap')
     u925_i   = interp(upper_air.get('u925'),     'u925')
@@ -929,7 +942,7 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
 
     if len(lift_levels) >= 2:
         _psfc_grid = rtma.get('psfc', None)
-        sbcape_lifted, sbcin_lifted, mlcape_lifted, eff_base_p, eff_top_p = (
+        sbcape_lifted, sbcin_lifted, mlcape_lifted, mlcin_lifted, eff_base_p, eff_top_p = (
             compute_cape_cin_lifted(t2m, td2m, lift_levels, psfc=_psfc_grid)
         )
         out['eff_base_p'] = eff_base_p   # mb; used internally for ESTP
@@ -942,6 +955,7 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
         out['mlcape_lifted'] = np.where(
             mlcape_lifted >= SBCAPE_MIN, mlcape_lifted, 0.0
         ).astype(np.float32)
+        out['mlcin'] = mlcin_lifted   # already clipped [-300,0]; STP CIN term
         log.info(f'[sbcape] lifted-parcel: raw_max={float(raw_sbcape.max()):.0f} '
                  f'gated_max={float(out["sbcape"].max()):.0f} '
                  f'active={int((out["sbcape"] > 0).sum())} cells '
@@ -1183,6 +1197,51 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
         except Exception as _e:
             log.warning(f'[srh1] VAD overlay skipped: {_e}')
 
+    # --- 0-3km SRH: extends the SRH1 integral through 850→700mb -----------
+    # 700mb ≈ 3000m AGL. No BL correction applied above 850mb — the RTMA
+    # surface anomaly has decayed to near-zero by 3km (same assumption used
+    # in eff_srh's fallback). Required by SCP per SPC's published formula
+    # (MUCAPE/1000) × (0-3km SRH/50) × (BRN shear/40).
+    if (u850_i is not None and v850_i is not None and
+            u700_i is not None and v700_i is not None and
+            ustm_i is not None and vstm_i is not None):
+        z0_3 = np.clip(lcl, 400.0, 1200.0)
+        du_anom3 = u10 - u10_rap if u10_rap is not None else np.zeros_like(u10)
+        dv_anom3 = v10 - v10_rap if v10_rap is not None else np.zeros_like(v10)
+        u850_corr3 = u850_i + du_anom3 * np.exp(-1500.0 / z0_3)
+        v850_corr3 = v850_i + dv_anom3 * np.exp(-1500.0 / z0_3)
+
+        if (u950_i is not None and v950_i is not None and
+                u925_i is not None and v925_i is not None):
+            u950_corr3 = u950_i + du_anom3 * np.exp(-500.0 / z0_3)
+            v950_corr3 = v950_i + dv_anom3 * np.exp(-500.0 / z0_3)
+            u925_corr3 = u925_i + du_anom3 * np.exp(-750.0 / z0_3)
+            v925_corr3 = v925_i + dv_anom3 * np.exp(-750.0 / z0_3)
+
+            srh3_l1 = ((u10        - ustm_i) * (v950_corr3 - v10)        -
+                       (v10        - vstm_i) * (u950_corr3 - u10))
+            srh3_l2 = ((u950_corr3 - ustm_i) * (v925_corr3 - v950_corr3) -
+                       (v950_corr3 - vstm_i) * (u925_corr3 - u950_corr3))
+            srh3_l3 = ((u925_corr3 - ustm_i) * (v850_corr3 - v925_corr3) -
+                       (v925_corr3 - vstm_i) * (u850_corr3 - u925_corr3))
+            srh3_l4 = ((u850_corr3 - ustm_i) * (v700_i      - v850_corr3) -
+                       (v850_corr3 - vstm_i) * (u700_i      - u850_corr3))
+            out['srh3'] = np.clip(
+                np.abs(srh3_l1 + srh3_l2 + srh3_l3 + srh3_l4), 0.0, 1500.0
+            ).astype(np.float32)
+            log.info(f'[srh3] 4-layer+700mb: max={float(out["srh3"].max()):.0f}')
+        else:
+            srh3_l1 = ((u10        - ustm_i) * (v850_corr3 - v10) -
+                       (v10        - vstm_i) * (u850_corr3 - u10))
+            srh3_l2 = ((u850_corr3 - ustm_i) * (v700_i      - v850_corr3) -
+                       (v850_corr3 - vstm_i) * (u700_i      - u850_corr3))
+            out['srh3'] = np.clip(
+                np.abs(srh3_l1 + srh3_l2), 0.0, 1500.0
+            ).astype(np.float32)
+            log.info(f'[srh3] 2-layer fallback: max={float(out["srh3"].max()):.0f}')
+    else:
+        log.warning('blend: srh3 skipped (u700/v700, u850/v850, or ustm/vstm missing)')
+
     # --- Effective-layer SRH (ESTP prerequisite) ---------------------------
     # Hodograph integral from the effective inflow base to the effective top.
     # Wind levels used:
@@ -1341,39 +1400,72 @@ def blend(rtma: dict, upper_air: dict, tpw_data: dict | None = None,
     else:
         log.warning('blend: bwd6 skipped (u500/v500 missing)')
 
-    # --- CIN-gated STP (Thompson et al. 2003 + 2012 CIN gate) -----------
-    # CIN gate removed temporarily for diagnostic purposes.
-    if 'sbcape' in out and 'srh1' in out and 'bwd6' in out:
-        cape_term  = out['sbcape'] / 1500.0
-        lcl_term   = np.clip((2000.0 - lcl) / 1000.0, 0.0, 1.0).astype(np.float32)
-        srh_term   = out['srh1'] / 150.0
-        shear_term = np.minimum(1.5, out['bwd6'] / 20.0)
+    # --- STP (fixed-layer) — SPC's exact published formula ---------------
+    # STP = (MLCAPE/1000) × clip(0-6km shear/20, 0, 1.5) × (0-1km SRH/100)
+    #     × clip((2000−MLLCL)/1500, 0, 1) × clip((150−|MLCIN|)/125, 0, 1)
+    # Shear term also gated to 0 below 12.5 m/s (SPC operational definition —
+    # insufficient shear for organized deep convection regardless of the ratio).
+    if ('mlcape_lifted' in out and 'srh1' in out and 'bwd6' in out
+            and 'mlcin' in out):
+        cape_term  = out['mlcape_lifted'] / 1000.0
+        lcl_term   = np.clip((2000.0 - lcl) / 1500.0, 0.0, 1.0).astype(np.float32)
+        srh_term   = out['srh1'] / 100.0
+        shear_term = np.where(out['bwd6'] < 12.5, 0.0,
+                              np.minimum(1.5, out['bwd6'] / 20.0))
+        cin_term   = np.clip((150.0 - np.abs(out['mlcin'])) / 125.0, 0.0, 1.0).astype(np.float32)
 
-        raw_stp = cape_term * lcl_term * srh_term * shear_term
+        raw_stp = cape_term * lcl_term * srh_term * shear_term * cin_term
         out['stp'] = np.nan_to_num(
             np.maximum(0, raw_stp), nan=0.0, posinf=0.0, neginf=0.0,
         ).astype(np.float32)
-        log.info(f'[stp] max={float(out["stp"].max()):.2f} (no CIN gate)')
+        log.info(f'[stp] max={float(out["stp"].max()):.2f} (MLCAPE+MLCIN, SPC formula)')
     else:
-        log.warning('blend: stp skipped (sbcape, srh1, or bwd6 missing)')
+        log.warning('blend: stp skipped (mlcape_lifted, srh1, bwd6, or mlcin missing)')
 
-    # --- Supercell Composite Parameter (SCP) ----------------------------
-    # SCP = (SBCAPE/1000) * (SRH1/50) * (BWD6/20)
-    # Gate: BWD6 < 10 m/s → SCP = 0 (no kinematic organization)
-    # Gate: SBCAPE < 100 J/kg → SCP = 0 (no thermodynamic support)
-    # Normalizations per SPC operational SCP documentation.
-    # SCP highlights where rotating storms are favored BEFORE tornado
-    # potential — complements STP which focuses on tornado environments.
-    if 'sbcape' in out and 'srh1' in out and 'bwd6' in out:
-        scp_raw = (out['sbcape'] / 1000.0) * (out['srh1'] / 50.0) * (out['bwd6'] / 20.0)
-        scp_raw = np.where(out['bwd6']   <  10.0, 0.0, scp_raw)
-        scp_raw = np.where(out['sbcape'] < 100.0, 0.0, scp_raw)
+    # --- Supercell Composite Parameter (SCP) — SPC's exact published formula ---
+    # SCP = (MUCAPE/1000) × (0-3km SRH/50) × (BRN shear term/40)
+    # BRN shear = 0.5 × |V_mean(500-5500m) − V_mean(0-500m)|²  (Weisman & Klemp
+    # 1982) — NOT a simple bulk 0-6km vector magnitude, which is what this used
+    # to compute.
+    #
+    # APPROXIMATION: true SPC BRN shear needs height-integrated mean winds over
+    # 0-500m and 500-5500m. We only have geopotential heights at 925/950/sfc
+    # right now (no gh850/700/600/500), so this uses a 2-point trapezoidal proxy:
+    #   0-500m    ≈ avg(RTMA 10m, 950mb BL-corrected)
+    #   500-5500m ≈ avg(850mb BL-corrected, 500mb)
+    # TODO: pull gh850/gh700/gh600/gh500 from fetch_rrfs.py and replace with a
+    # true height-weighted mean for full SPC fidelity.
+    if ('mucape' in out and 'srh3' in out and 'bwd6' in out
+            and u500_i is not None and v500_i is not None
+            and u950_i is not None and v950_i is not None
+            and u850_i is not None and v850_i is not None
+            and u10_rap is not None and v10_rap is not None):
+        z0_scp = np.clip(lcl, 400.0, 1200.0)
+        du_anom_scp = u10 - u10_rap
+        dv_anom_scp = v10 - v10_rap
+        u950_corr_scp = u950_i + du_anom_scp * np.exp(-500.0  / z0_scp)
+        v950_corr_scp = v950_i + dv_anom_scp * np.exp(-500.0  / z0_scp)
+        u850_corr_scp = u850_i + du_anom_scp * np.exp(-1500.0 / z0_scp)
+        v850_corr_scp = v850_i + dv_anom_scp * np.exp(-1500.0 / z0_scp)
+
+        u_low  = 0.5 * (u10 + u950_corr_scp)
+        v_low  = 0.5 * (v10 + v950_corr_scp)
+        u_high = 0.5 * (u850_corr_scp + u500_i)
+        v_high = 0.5 * (v850_corr_scp + v500_i)
+
+        brn_shear      = 0.5 * ((u_high - u_low)**2 + (v_high - v_low)**2)
+        brn_shear_term = brn_shear / 40.0
+
+        scp_raw = (out['mucape'] / 1000.0) * (out['srh3'] / 50.0) * brn_shear_term
+        scp_raw = np.where(out['bwd6']   < 10.0,  0.0, scp_raw)
+        scp_raw = np.where(out['mucape'] < 100.0, 0.0, scp_raw)
         out['scp'] = np.nan_to_num(
             np.maximum(0, scp_raw), nan=0.0, posinf=0.0, neginf=0.0,
         ).astype(np.float32)
-        log.info(f'[scp] max={float(out["scp"].max()):.2f}')
+        log.info(f'[scp] max={float(out["scp"].max()):.2f} '
+                 f'(MUCAPE+SRH3+BRN-shear-approx)')
     else:
-        log.warning('blend: scp skipped (sbcape, srh1, or bwd6 missing)')
+        log.warning('blend: scp skipped (mucape, srh3, bwd6, or wind fields missing)')
 
     # --- EHI: Energy-Helicity Index -------------------------------------
     # EHI = (SBCAPE × 0-1km SRH) / 160000  (Thompson et al. 1998).
